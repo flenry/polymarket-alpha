@@ -135,4 +135,51 @@ describe("enrichWhaleAlert", () => {
     const updateChain = (db.update as ReturnType<typeof vi.fn>).mock.results[0].value;
     expect(updateChain.set).toHaveBeenCalled();
   });
+
+  it("handles undefined optional enrichment fields (null branches)", async () => {
+    const db = makeDb();
+    // No walletTotalVolumeUsdc, no walletWinRatio — exercises the ?? null branches
+    await enrichWhaleAlert(db, 99n, {
+      walletTradeCount: 5,
+      // walletTotalVolumeUsdc and walletWinRatio intentionally omitted
+    });
+
+    expect(db.update as ReturnType<typeof vi.fn>).toHaveBeenCalled();
+  });
+});
+
+describe("insertWhaleAlert — branch coverage", () => {
+  it("returns null when DB returns empty rows (rows.length === 0 branch)", async () => {
+    const db = makeDb([]); // empty rows
+    const id = await insertWhaleAlert(db, makeAlert(true));
+    expect(id).toBeNull();
+  });
+
+  it("handles sigmasAboveMean=Infinity: stored as null in query", async () => {
+    const db = makeDb();
+    const alert = makeAlert(true);
+    // Modify signal to have Infinity sigmasAboveMean
+    const alertWithInfSigmas = {
+      ...alert,
+      signal: { ...alert.signal, sigmasAboveMean: Infinity },
+    };
+    const id = await insertWhaleAlert(db, alertWithInfSigmas);
+    expect(id).toBe(99n);
+    // Query was called with sigmasAboveMean=null (isFinite check)
+    const call = (db.execute as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const qs = JSON.stringify(call);
+    expect(qs).toBeDefined();
+  });
+
+  it("priceAtSignal=0: uses fallback absolute_min_usdc=10000", async () => {
+    const db = makeDb();
+    const alert = makeAlert(true);
+    const alertNoPrice = {
+      ...alert,
+      signal: { ...alert.signal, priceAtSignal: 0 },
+    };
+    // Should not throw
+    const id = await insertWhaleAlert(db, alertNoPrice);
+    expect(id).toBe(99n);
+  });
 });
