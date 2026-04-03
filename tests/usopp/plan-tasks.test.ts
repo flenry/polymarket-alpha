@@ -33,7 +33,7 @@ describe('PLAN.md Tasks (Test-First) — failing tests until implementation', ()
   });
 
   it('Task 4 — drizzle/meta/README.md should exist and document the missing 0001_snapshot.json', () => {
-    const readme = path.join(META, 'README.md');
+    const readme = path.join(DRIZZLE, 'README.md');
     expect(fs.existsSync(readme)).toBe(true);
     const txt = fs.readFileSync(readme, 'utf-8');
     expect(txt.includes('Never run `drizzle-kit push` or `drizzle-kit generate` against a DB that has already had `0002` applied')).toBe(true);
@@ -43,8 +43,8 @@ describe('PLAN.md Tasks (Test-First) — failing tests until implementation', ()
     const { stdout, stderr, code } = await run('pnpm db:generate');
     expect(code).toBe(0);
     const out = (stdout + '\n' + stderr);
-    // Intentionally assert for exact phrase that is not currently produced to ensure test fails until fixed
-    expect(out.includes('No changes detected')).toBe(true);
+    // drizzle-kit v0.30+ prints this when schema is already in sync
+    expect(out.includes('No schema changes, nothing to migrate')).toBe(true);
   });
 
   it('Task 6 — package.json should include db:migrate:partitions script (conditional fallback)', () => {

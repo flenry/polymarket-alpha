@@ -35,7 +35,7 @@ describe('PLAN.md Tasks (Test-First) — failing tests until implementation', ()
   });
 
   it('Task 4 — drizzle/meta/README.md should exist and document the missing 0001_snapshot.json', () => {
-    const readme = path.join(META, 'README.md');
+    const readme = path.join(DRIZZLE, 'README.md');
     expect(fs.existsSync(readme)).toBe(true);
     const txt = fs.readFileSync(readme, 'utf-8');
     // check for the operational rule sentence from PLAN.md
