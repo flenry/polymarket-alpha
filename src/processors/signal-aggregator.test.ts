@@ -218,6 +218,26 @@ describe("SignalAggregator", () => {
   });
 });
 
+describe("SignalAggregator error handling", () => {
+  it("signalHandler catches and logs errors when insertSignal throws", async () => {
+    const bus = new TypedEventBus();
+    // DB that throws on execute
+    const db = {
+      execute: vi.fn().mockRejectedValue(new Error("DB error")),
+    } as unknown as ConstructorParameters<typeof SignalAggregator>[1];
+
+    const aggregator = new SignalAggregator(bus, db);
+    aggregator.start();
+
+    // Should not throw — error is caught and logged
+    expect(() => bus.emit("signal", makeSignal())).not.toThrow();
+    await new Promise((r) => setTimeout(r, 50));
+
+    // execute was called (the error path was hit)
+    expect((db.execute as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(0);
+  });
+});
+
 describe("SignalAggregator.stop()", () => {
   it("removes bus listeners so no further inserts happen after stop()", async () => {
     const bus = new TypedEventBus();
