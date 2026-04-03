@@ -8,7 +8,7 @@ Quick-reference context for returning sessions. Read this first on every visit.
 
 Real-time Polymarket data pipeline. Ingests trade events and order book data, persists to PostgreSQL, and runs a signal engine that surfaces alpha opportunities — specifically whale trades caught before price adjusts.
 
-**Phase 1 MVP is complete and fully tested.** 251 tests passing, 92%+ coverage.
+**Phase 1 MVP is complete and fully tested.** 256 tests passing, 92%+ coverage.
 
 ---
 
@@ -42,7 +42,7 @@ polymarket-alpha/
 │   ├── pipeline.ts        # Pipeline orchestrator (wires all components)
 │   └── index.ts           # Entry point
 ├── tests/                 # Integration-style tests (top-level: GammaPoller, Snapshot, WhaleDetector, dedup, LiveDataWs, SignalAgg)
-├── drizzle/               # SQL migration files (0001_initial_schema.sql, 0002_partition_trades.sql)
+├── drizzle/               # SQL migration files + meta journal (0000_*, 0002_partition_trades.sql, README.md, meta/)
 ├── drizzle.config.ts
 ├── docker-compose.yml     # postgres + app services
 ├── Dockerfile
@@ -113,10 +113,14 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 ## Current State
 
 **Phase 1 complete.**
-- ✅ All 251 tests passing
+- ✅ All 256 tests passing (30 test files)
 - ✅ 92.3% statement coverage (100% on all processors, signals, events, alerts, queries)
 - ✅ Sources coverage lower (79.7%) — real WS/HTTP code not network-testable
 - ✅ Migration SQL generated and committed (`drizzle/`)
+- ✅ `drizzle/meta/_journal.json` registers two entries: `0000_misty_thaddeus_ross` (idx 0) and `0002_partition_trades` (idx 1)
+- ✅ `pnpm db:generate` is idempotent — reports no schema changes after migrations applied
+- ✅ `pnpm db:migrate:partitions` fallback script added to `package.json` (runs `0002` via `psql` directly)
+- ✅ `drizzle/README.md` documents migration chain and missing `0001_snapshot.json` quirk
 - ✅ Docker Compose configured
 - ✅ Pushed to `main` on `git@github.com:flenry/polymarket-alpha.git`
 
@@ -143,8 +147,9 @@ cp .env.example .env
 docker compose up -d postgres
 
 # 4. Run migrations
-psql $DATABASE_URL -f drizzle/0001_initial_schema.sql
-psql $DATABASE_URL -f drizzle/0002_partition_trades.sql
+pnpm db:migrate                   # applies 0000 + 0002 via drizzle-kit
+# If drizzle-kit can't apply partition DDL cleanly, run directly:
+pnpm db:migrate:partitions        # psql $DATABASE_URL -f drizzle/0002_partition_trades.sql
 
 # 5. Start pipeline
 pnpm start
@@ -158,9 +163,12 @@ docker compose up -d
 ## How to Test
 
 ```bash
-pnpm test              # unit tests (all 251)
-pnpm test:coverage     # with v8 coverage report
+pnpm test              # unit tests (all 256, 30 test files)
+pnpm test:coverage     # with v8 coverage report (~92%)
 pnpm typecheck         # tsc --noEmit
+pnpm db:generate       # generate drizzle migrations (idempotent after init)
+pnpm db:migrate        # apply all tracked migrations (0000 + 0002)
+pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql directly
 ```
 
 ---
@@ -176,6 +184,12 @@ pnpm typecheck         # tsc --noEmit
 | `SNAPSHOT_INTERVAL_MS` | 30000 | Order book snapshot frequency |
 | `GAMMA_POLL_INTERVAL_MS` | 60000 | Market catalog refresh frequency |
 | `LOG_LEVEL` | info | Pino log level |
+
+---
+
+## Migration Notes
+
+> **Important**: After `0002_partition_trades.sql` is applied, never run `drizzle-kit push` or `drizzle-kit generate` against a live DB. The partition DDL is invisible to drizzle-kit and it will generate a spurious diff. See `drizzle/README.md` for full operational notes.
 
 ---
 

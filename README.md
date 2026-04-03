@@ -31,8 +31,9 @@ cp .env.example .env
 # Edit .env with your DATABASE_URL
 
 # Run migrations
-psql $DATABASE_URL -f drizzle/0001_initial_schema.sql
-psql $DATABASE_URL -f drizzle/0002_partition_trades.sql
+pnpm db:migrate
+# If drizzle-kit can't apply partition DDL cleanly, use the fallback:
+pnpm db:migrate:partitions
 
 # Start pipeline
 pnpm start
@@ -47,7 +48,7 @@ docker compose up -d
 ## Testing
 
 ```bash
-# Unit tests (251 tests, 29 test files)
+# Unit tests (256 tests, 30 test files)
 pnpm test
 
 # With v8 coverage report (~92% overall, 100% on processors/signals/alerts)
