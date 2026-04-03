@@ -99,4 +99,35 @@ describe("PriceHistoryWriter", () => {
     vi.useRealTimers();
     writer.stop();
   });
+
+  it("flush() returns 0 when batch is empty", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb();
+    const writer = new PriceHistoryWriter(bus, db, 100, 500);
+    writer.start();
+    const count = await writer.flush();
+    expect(count).toBe(0);
+    writer.stop();
+  });
+
+  it("flush() catches and logs per-record errors, continues processing", async () => {
+    const bus = new TypedEventBus();
+    // First call throws, second succeeds
+    const executeFn = vi.fn()
+      .mockRejectedValueOnce(new Error("DB error"))
+      .mockResolvedValue({ rows: [] });
+    const db = { execute: executeFn } as unknown as ConstructorParameters<typeof PriceHistoryWriter>[1];
+    const writer = new PriceHistoryWriter(bus, db, 100, 500);
+    writer.start();
+
+    bus.emit("last_trade_price", { type: "last_trade_price", tokenId: "tok1", price: 0.65, side: "BUY", timestamp: Date.now() });
+    bus.emit("last_trade_price", { type: "last_trade_price", tokenId: "tok2", price: 0.66, side: "BUY", timestamp: Date.now() });
+
+    // flush: first throws (caught), second succeeds
+    const count = await writer.flush();
+    expect(count).toBe(1); // only second insert succeeded
+    expect(executeFn).toHaveBeenCalledTimes(2);
+
+    writer.stop();
+  });
 });

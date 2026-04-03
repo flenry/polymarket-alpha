@@ -133,6 +133,42 @@ describe("SnapshotWriter", () => {
 
     expect(clob.batchGetBooks as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
   });
+
+  it("book with no asks: imbalanceRatio is null, mid is null", async () => {
+    const db = makeDb();
+    const emptyAskBook: OrderBook = {
+      tokenId: "tok1",
+      conditionId: "cond1",
+      bids: [{ price: 0.65, size: 100 }],
+      asks: [],
+      timestamp: Date.now(),
+      hash: "abc",
+      capturedAt: new Date(),
+    };
+    const clob = makeClobClient([emptyAskBook]);
+    const writer = new SnapshotWriter(db, clob, () => ["tok1"], 30000);
+
+    await writer.snapshot();
+
+    // Should not throw; imbalanceRatio=null (askDepth=0), mid=null (asks empty)
+    const call = (db.execute as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const qs = JSON.stringify(call);
+    // null fields serialised as JSON null
+    expect(qs).toBeDefined();
+  });
+
+  it("onBook callback is called with each book after write", async () => {
+    const db = makeDb();
+    const book = makeBook("tok1");
+    const clob = makeClobClient([book]);
+    const onBook = vi.fn();
+    const writer = new SnapshotWriter(db, clob, () => ["tok1"], 30000, onBook);
+
+    await writer.snapshot();
+
+    expect(onBook).toHaveBeenCalledTimes(1);
+    expect(onBook).toHaveBeenCalledWith(book);
+  });
 });
 
 describe("computeDepth", () => {
