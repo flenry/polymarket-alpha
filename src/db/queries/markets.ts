@@ -145,6 +145,13 @@ export async function upsertMarketStats(
     });
 }
 
+export async function markMarketClosed(db: Db, tokenId: TokenId): Promise<void> {
+  await db
+    .update(markets)
+    .set({ closed: true, updatedAt: new Date() })
+    .where(eq(markets.tokenId, tokenId));
+}
+
 export async function getMarketStats(db: Db, tokenId: TokenId) {
   const rows = await db
     .select()

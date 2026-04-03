@@ -1,18 +1,27 @@
 import { EventEmitter } from "node:events";
 import WebSocket from "ws";
+import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import * as schema from "../db/schema.js";
 import type { TokenId, OrderBook, BookUpdateEvent, PriceChangeEvent, BestBidAskEvent, LastTradePriceEvent } from "../events/types.js";
 import { ZClobBookEvent, ZClobPriceChangeEvent, ZClobBestBidAskEvent, ZClobLastTradePriceEvent } from "../validation/schemas.js";
+import { markMarketClosed } from "../db/queries/markets.js";
 import { logger } from "../logger.js";
+
+type Db = NodePgDatabase<typeof schema>;
 
 const KEEPALIVE_INTERVAL_MS = 50_000;
 const SILENT_SHARD_THRESHOLD_MS = 60_000;
 
+const DEFAULT_CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+
 export interface ClobWsPoolOptions {
+  url?: string;
   shardSize?: number;
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
   WsConstructor?: typeof WebSocket;
   silentShardThresholdMs?: number;
+  db?: Db;
 }
 
 interface Shard {
@@ -27,21 +36,25 @@ interface Shard {
 }
 
 export class ClobWsPool extends EventEmitter {
+  private readonly url: string;
   private readonly shardSize: number;
   private readonly reconnectBaseMs: number;
   private readonly reconnectMaxMs: number;
   private readonly WsConstructor: typeof WebSocket;
   private readonly silentThresholdMs: number;
+  private readonly db: Db | undefined;
   private shards: Shard[] = [];
   private stopped = false;
 
   constructor(opts: ClobWsPoolOptions = {}) {
     super();
+    this.url = opts.url ?? DEFAULT_CLOB_WS_URL;
     this.shardSize = opts.shardSize ?? 150;
     this.reconnectBaseMs = opts.reconnectBaseMs ?? 1_000;
     this.reconnectMaxMs = opts.reconnectMaxMs ?? 30_000;
     this.WsConstructor = opts.WsConstructor ?? WebSocket;
     this.silentThresholdMs = opts.silentShardThresholdMs ?? SILENT_SHARD_THRESHOLD_MS;
+    this.db = opts.db;
   }
 
   async connect(tokenIds: TokenId[]): Promise<void> {
@@ -110,7 +123,7 @@ export class ClobWsPool extends EventEmitter {
   }
 
   private openShard(shard: Shard): void {
-    const ws = new this.WsConstructor("wss://ws-subscriptions-clob.polymarket.com/ws/market");
+    const ws = new this.WsConstructor(this.url);
     shard.ws = ws;
 
     ws.on("open", () => {
@@ -184,8 +197,11 @@ export class ClobWsPool extends EventEmitter {
   }
 
   private scheduleShardReconnect(shard: Shard): void {
-    const delay = shard.reconnectDelay;
+    const rawDelay = shard.reconnectDelay;
     shard.reconnectDelay = Math.min(shard.reconnectDelay * 2, this.reconnectMaxMs);
+    // Jitter: ±20% of base delay, capped at reconnectMaxMs
+    const jittered = rawDelay * (0.8 + Math.random() * 0.4);
+    const delay = Math.min(jittered, this.reconnectMaxMs);
 
     shard.reconnectTimer = setTimeout(() => {
       if (!shard.stopped && !this.stopped) {
@@ -256,6 +272,18 @@ export class ClobWsPool extends EventEmitter {
           side: (d.side ?? "BUY") as "BUY" | "SELL",
           timestamp: d.timestamp ?? Date.now(),
         } satisfies LastTradePriceEvent);
+        break;
+      }
+      case "market_resolved": {
+        const evt = raw as { market?: string; asset_id?: string };
+        const tokenId = evt.asset_id ?? evt.market ?? "";
+        logger.info({ tokenId }, "ClobWsPool: market resolved");
+        this.emit("market_resolved", { tokenId });
+        if (this.db) {
+          markMarketClosed(this.db, tokenId).catch((err) => {
+            logger.error({ err, tokenId }, "ClobWsPool: failed to mark market closed");
+          });
+        }
         break;
       }
     }

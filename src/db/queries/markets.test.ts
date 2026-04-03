@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { upsertMarket, upsertMarketStats, getWatchlistedTokenIds, getNegRiskTokenIds, getMarketStats } from "./markets.js";
+import { upsertMarket, upsertMarketStats, getWatchlistedTokenIds, getNegRiskTokenIds, getMarketStats, markMarketClosed } from "./markets.js";
 
 function makeInsertDb() {
   const onConflictDoUpdate = vi.fn().mockResolvedValue(undefined);
@@ -206,5 +206,23 @@ describe("upsertMarket — parseOutcome branches", () => {
     expect(call.slug).toBeNull();
     expect(call.active).toBe(true); // default from ?? true
     expect(call.closed).toBe(false); // default from ?? false
+  });
+});
+
+describe("markMarketClosed", () => {
+  it("calls db.update with closed=true and correct tokenId", async () => {
+    const where = vi.fn().mockResolvedValue(undefined);
+    const set = vi.fn().mockReturnValue({ where });
+    const update = vi.fn().mockReturnValue({ set });
+    const db = { update: update } as unknown as Parameters<typeof markMarketClosed>[0];
+
+    await markMarketClosed(db, "tok1");
+
+    expect(update).toHaveBeenCalledOnce();
+    expect(set).toHaveBeenCalledOnce();
+    const setArg = set.mock.calls[0][0];
+    expect(setArg.closed).toBe(true);
+    expect(setArg.updatedAt).toBeInstanceOf(Date);
+    expect(where).toHaveBeenCalledOnce();
   });
 });

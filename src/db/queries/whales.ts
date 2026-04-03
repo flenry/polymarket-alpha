@@ -76,6 +76,7 @@ export async function enrichWhaleAlert(
     walletTotalVolumeUsdc?: number;
     walletTradeCount?: number;
     walletWinRatio?: number;
+    walletFirstSeenAt?: Date;
   }
 ): Promise<void> {
   await db
@@ -84,6 +85,7 @@ export async function enrichWhaleAlert(
       walletTotalVolumeUsdc: enrichment.walletTotalVolumeUsdc?.toString() ?? null,
       walletTradeCount: enrichment.walletTradeCount ?? null,
       walletWinRatio: enrichment.walletWinRatio?.toString() ?? null,
+      walletFirstSeenAt: enrichment.walletFirstSeenAt ?? null,
       enrichedAt: new Date(),
     })
     .where(eq(whaleAlerts.id, Number(id)));
