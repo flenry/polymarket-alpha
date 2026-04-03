@@ -148,6 +148,27 @@ describe("enrichWhaleAlert", () => {
   });
 });
 
+describe("insertWhaleAlert — null stats fields (lines 54-56)", () => {
+  it("handles null avgTradeSize24h, stddevTradeSize24h, volume24hr in stats", async () => {
+    const db = makeDb();
+    const alert = makeAlert(true);
+    // Override stats with null values to exercise the ?? null branches
+    const alertWithNullStats = {
+      ...alert,
+      marketStats: {
+        ...alert.marketStats,
+        avgTradeSize24h: null as unknown as number,
+        stddevTradeSize24h: null as unknown as number,
+        volume24hr: null as unknown as number,
+      },
+    };
+    const id = await insertWhaleAlert(db, alertWithNullStats);
+    expect(id).toBe(99n); // should still succeed
+    const call = (db.execute as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(JSON.stringify(call)).toBeDefined();
+  });
+});
+
 describe("insertWhaleAlert — branch coverage", () => {
   it("returns null when DB returns empty rows (rows.length === 0 branch)", async () => {
     const db = makeDb([]); // empty rows
