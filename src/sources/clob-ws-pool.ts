@@ -21,6 +21,7 @@ export interface ClobWsPoolOptions {
   reconnectMaxMs?: number;
   WsConstructor?: typeof WebSocket;
   silentShardThresholdMs?: number;
+  keepaliveIntervalMs?: number;
   db?: Db;
 }
 
@@ -32,6 +33,7 @@ interface Shard {
   lastEventTs: number;
   stopped: boolean;
   keepaliveTimer: ReturnType<typeof setInterval> | null;
+  silentCheckTimer: ReturnType<typeof setInterval> | null;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -42,6 +44,7 @@ export class ClobWsPool extends EventEmitter {
   private readonly reconnectMaxMs: number;
   private readonly WsConstructor: typeof WebSocket;
   private readonly silentThresholdMs: number;
+  private readonly keepaliveIntervalMs: number;
   private readonly db: Db | undefined;
   private shards: Shard[] = [];
   private stopped = false;
@@ -54,6 +57,7 @@ export class ClobWsPool extends EventEmitter {
     this.reconnectMaxMs = opts.reconnectMaxMs ?? 30_000;
     this.WsConstructor = opts.WsConstructor ?? WebSocket;
     this.silentThresholdMs = opts.silentShardThresholdMs ?? SILENT_SHARD_THRESHOLD_MS;
+    this.keepaliveIntervalMs = opts.keepaliveIntervalMs ?? KEEPALIVE_INTERVAL_MS;
     this.db = opts.db;
   }
 
@@ -95,6 +99,10 @@ export class ClobWsPool extends EventEmitter {
         clearInterval(shard.keepaliveTimer);
         shard.keepaliveTimer = null;
       }
+      if (shard.silentCheckTimer) {
+        clearInterval(shard.silentCheckTimer);
+        shard.silentCheckTimer = null;
+      }
       if (shard.reconnectTimer) {
         clearTimeout(shard.reconnectTimer);
         shard.reconnectTimer = null;
@@ -118,6 +126,7 @@ export class ClobWsPool extends EventEmitter {
       lastEventTs: Date.now(),
       stopped: false,
       keepaliveTimer: null,
+      silentCheckTimer: null,
       reconnectTimer: null,
     };
   }
@@ -151,6 +160,10 @@ export class ClobWsPool extends EventEmitter {
         clearInterval(shard.keepaliveTimer);
         shard.keepaliveTimer = null;
       }
+      if (shard.silentCheckTimer) {
+        clearInterval(shard.silentCheckTimer);
+        shard.silentCheckTimer = null;
+      }
       if (!shard.stopped && !this.stopped) {
         logger.warn({ shardIndex: shard.index, nextMs: shard.reconnectDelay }, "ClobWsPool: shard disconnected");
         this.scheduleShardReconnect(shard);
@@ -162,16 +175,14 @@ export class ClobWsPool extends EventEmitter {
       this.emit("error", err, shard.index);
     });
 
-    // Silent shard detection
-    const silentCheck = setInterval(() => {
+    // Silent shard detection — separate from keepalive timer
+    if (shard.silentCheckTimer) clearInterval(shard.silentCheckTimer);
+    shard.silentCheckTimer = setInterval(() => {
       if (Date.now() - shard.lastEventTs > this.silentThresholdMs) {
         logger.warn({ shardIndex: shard.index }, "ClobWsPool: shard silent > threshold");
         this.emit("error", new Error("shard_silent"), shard.index);
       }
     }, this.silentThresholdMs);
-
-    // Store alongside keepalive
-    shard.keepaliveTimer = silentCheck;
   }
 
   private subscribe(shard: Shard): void {
@@ -193,7 +204,7 @@ export class ClobWsPool extends EventEmitter {
       if (shard.ws?.readyState === WebSocket.OPEN) {
         shard.ws.send("PING");
       }
-    }, KEEPALIVE_INTERVAL_MS);
+    }, this.keepaliveIntervalMs);
   }
 
   private scheduleShardReconnect(shard: Shard): void {

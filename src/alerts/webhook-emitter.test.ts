@@ -229,6 +229,38 @@ describe("WebhookEmitter", () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
+  it("rate limit: with rps=2, 3 sends are spaced apart by token refill", async () => {
+    // Use rps=2 (one token per 500ms). With 1 pre-filled token, the second send
+    // should be near-instant, and the third should be delayed ~500ms.
+    const timings: number[] = [];
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      timings.push(Date.now());
+      callCount++;
+      return Promise.resolve({ ok: true, status: 200, headers: { get: () => null } });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const emitter = new WebhookEmitter({
+      discordUrl: "https://discord.com/api/webhooks/test",
+      slackUrl: "",
+      rps: 2,
+    });
+
+    const start = Date.now();
+    // Fire 3 sends concurrently
+    await Promise.all([
+      emitter.send(makeWhaleAlert()),
+      emitter.send(makeWhaleAlert()),
+      emitter.send(makeWhaleAlert()),
+    ]);
+
+    const elapsed = Date.now() - start;
+    // 3 sends at 2 rps = at least 1 token-refill wait (~500ms) for the third send
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(elapsed).toBeGreaterThanOrEqual(400); // at least one refill period
+  });
+
   it("wallet truncated to 12 chars + ellipsis in Discord embed", async () => {
     const mockFetch = makeMockFetch([{ status: 200 }]);
     vi.stubGlobal("fetch", mockFetch);

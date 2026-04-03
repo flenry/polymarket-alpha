@@ -225,6 +225,30 @@ describe("ClobWsPool Phase 2 additions", () => {
     pool.disconnect();
   });
 
+  it("keepalive PING sent at configured interval", async () => {
+    // Use a short keepalive interval so the test doesn't need fake timers
+    const pool = new ClobWsPool({
+      shardSize: 150,
+      reconnectBaseMs: 50,
+      reconnectMaxMs: 200,
+      keepaliveIntervalMs: 30, // very short for test — spec default is 50s
+      WsConstructor: MockWs as unknown as typeof import("ws").default,
+    });
+    MockWs.instances = [];
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r)); // let 'open' event fire
+
+    const ws = MockWs.instances[0];
+    expect(ws.sent.length).toBeGreaterThan(0); // subscription message sent
+    ws.sent = []; // clear to capture only pings
+
+    // Wait longer than the 30ms keepalive interval
+    await new Promise((r) => setTimeout(r, 80));
+
+    expect(ws.sent).toContain("PING");
+    pool.disconnect();
+  });
+
   it("market_resolved event: emits 'market_resolved' with tokenId", async () => {
     const pool = makePool({ shardSize: 150 });
     const resolved: { tokenId: string }[] = [];
@@ -259,39 +283,178 @@ describe("ClobWsPool Phase 2 additions", () => {
     pool.disconnect();
   });
 
-  it("market_resolved with db: calls markMarketClosed", async () => {
-    const markClosed = vi.fn().mockResolvedValue(undefined);
-    // Build a minimal db mock that satisfies markMarketClosed's signature
-    const mockDb = {
-      update: vi.fn().mockReturnValue({
-        set: vi.fn().mockReturnValue({
-          where: vi.fn().mockResolvedValue(undefined),
-        }),
-      }),
-    };
+  it("market_resolved with db: calls markMarketClosed via db.update chain", async () => {
+    // Build a minimal drizzle-compatible db mock
+    const whereMock = vi.fn().mockResolvedValue(undefined);
+    const setMock = vi.fn().mockReturnValue({ where: whereMock });
+    const updateMock = vi.fn().mockReturnValue({ set: setMock });
+    const mockDb = { update: updateMock };
 
+    MockWs.instances = [];
     const pool = new ClobWsPool({
       shardSize: 150,
       reconnectBaseMs: 50,
       reconnectMaxMs: 200,
       WsConstructor: MockWs as unknown as typeof import("ws").default,
-      db: mockDb as unknown as Parameters<typeof ClobWsPool.prototype.connect>[0] extends never ? never : never,
+      db: mockDb as unknown as import("drizzle-orm/node-postgres").NodePgDatabase<typeof import("../db/schema.js")>,
     });
-    // Use a simpler approach: pass mock db via options
-    // We'll verify through the emitted event since the actual markMarketClosed
-    // uses the real drizzle db. Instead spy on the markMarketClosed module.
-    MockWs.instances = [];
-    const pool2 = makePool({ shardSize: 150 });
+
     const resolved: string[] = [];
-    pool2.on("market_resolved", (evt: { tokenId: string }) => resolved.push(evt.tokenId));
-    await pool2.connect(["tok1"]);
+    pool.on("market_resolved", (evt: { tokenId: string }) => resolved.push(evt.tokenId));
+
+    await pool.connect(["tok1"]);
     await new Promise((r) => process.nextTick(r));
+
     MockWs.instances[0].emit(
       "message",
       Buffer.from(JSON.stringify({ event: "market_resolved", asset_id: "resolved_tok" }))
     );
+
+    // Event emitted synchronously
     expect(resolved).toEqual(["resolved_tok"]);
-    pool2.disconnect();
-    void markClosed; // used to suppress unused var
+
+    // Allow the async markMarketClosed promise to resolve
+    await new Promise((r) => process.nextTick(r));
+    await new Promise((r) => process.nextTick(r));
+
+    // markMarketClosed calls db.update(...).set(...).where(...)
+    expect(updateMock).toHaveBeenCalledOnce();
+    expect(setMock).toHaveBeenCalledWith(expect.objectContaining({ closed: true }));
+
+    pool.disconnect();
+  });
+
+  it("book message: emits 'book' BookUpdateEvent with parsed bids/asks", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const bookEvents: unknown[] = [];
+    pool.on("book", (evt) => bookEvents.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    const msg = JSON.stringify({
+      event: "book",
+      asset_id: "tok1",
+      market: "cond1",
+      timestamp: "1700000000",
+      hash: "0xabc",
+      bids: [{ price: "0.65", size: "100" }, { price: "0.64", size: "200" }],
+      asks: [{ price: "0.66", size: "150" }, { price: "0.67", size: "50" }],
+    });
+    ws.emit("message", Buffer.from(msg));
+
+    expect(bookEvents).toHaveLength(1);
+    const evt = bookEvents[0] as { type: string; book: { tokenId: string; bids: { price: number }[]; asks: { price: number }[] } };
+    expect(evt.type).toBe("book");
+    expect(evt.book.tokenId).toBe("tok1");
+    // bids sorted descending by price
+    expect(evt.book.bids[0].price).toBe(0.65);
+    expect(evt.book.bids[1].price).toBe(0.64);
+    // asks sorted ascending by price
+    expect(evt.book.asks[0].price).toBe(0.66);
+    expect(evt.book.asks[1].price).toBe(0.67);
+
+    pool.disconnect();
+  });
+
+  it("price_change message: emits 'price_change' PriceChangeEvent", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const events: unknown[] = [];
+    pool.on("price_change", (evt) => events.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "price_change",
+      asset_id: "tok1",
+      price: "0.72",
+      side: "BUY",
+      timestamp: "1700000001",
+    })));
+
+    expect(events).toHaveLength(1);
+    const evt = events[0] as { type: string; tokenId: string; price: number; side: string };
+    expect(evt.type).toBe("price_change");
+    expect(evt.tokenId).toBe("tok1");
+    expect(evt.price).toBe(0.72);
+    expect(evt.side).toBe("BUY");
+
+    pool.disconnect();
+  });
+
+  it("best_bid_ask message: emits 'best_bid_ask' BestBidAskEvent", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const events: unknown[] = [];
+    pool.on("best_bid_ask", (evt) => events.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "best_bid_ask",
+      asset_id: "tok1",
+      bid: "0.64",
+      ask: "0.66",
+      timestamp: "1700000002",
+    })));
+
+    expect(events).toHaveLength(1);
+    const evt = events[0] as { type: string; tokenId: string; bid: number; ask: number };
+    expect(evt.type).toBe("best_bid_ask");
+    expect(evt.tokenId).toBe("tok1");
+    expect(evt.bid).toBe(0.64);
+    expect(evt.ask).toBe(0.66);
+
+    pool.disconnect();
+  });
+
+  it("last_trade_price message: emits 'last_trade_price' LastTradePriceEvent", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const events: unknown[] = [];
+    pool.on("last_trade_price", (evt) => events.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "last_trade_price",
+      asset_id: "tok1",
+      price: "0.68",
+      side: "SELL",
+      timestamp: "1700000003",
+    })));
+
+    expect(events).toHaveLength(1);
+    const evt = events[0] as { type: string; tokenId: string; price: number; side: string };
+    expect(evt.type).toBe("last_trade_price");
+    expect(evt.tokenId).toBe("tok1");
+    expect(evt.price).toBe(0.68);
+    expect(evt.side).toBe("SELL");
+
+    pool.disconnect();
+  });
+
+  it("array of events in one message: all events processed", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const priceEvents: unknown[] = [];
+    pool.on("price_change", (evt) => priceEvents.push(evt));
+
+    await pool.connect(["tok1", "tok2"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    ws.emit("message", Buffer.from(JSON.stringify([
+      { event: "price_change", asset_id: "tok1", price: "0.71", side: "BUY", timestamp: "1700000004" },
+      { event: "price_change", asset_id: "tok2", price: "0.42", side: "SELL", timestamp: "1700000005" },
+    ])));
+
+    expect(priceEvents).toHaveLength(2);
+
+    pool.disconnect();
   });
 });

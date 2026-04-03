@@ -269,6 +269,94 @@ describe("WalletEnricher", () => {
     expect(enrichWhaleAlert).toHaveBeenCalledOnce();
   });
 
+  it("429 retry: retry fetch throws network error → _enrich resolves, no DB writes", async () => {
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.resolve({
+          ok: false,
+          status: 429,
+          headers: { get: (k: string) => (k === "Retry-After" ? "0" : null) },
+          json: () => Promise.resolve([]),
+        });
+      }
+      // retry throws a network error
+      return Promise.reject(new Error("network failure"));
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const db = makeDb();
+    const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });
+    await enricher._enrich(makeAlert(), 99n);
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(upsertWalletProfile).not.toHaveBeenCalled();
+    expect(enrichWhaleAlert).not.toHaveBeenCalled();
+  });
+
+  it("429 retry: retry fetch times out (AbortError on retry) → _enrich resolves, no DB writes", async () => {
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation((_url: string, opts?: { signal?: AbortSignal }) => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.resolve({
+          ok: false,
+          status: 429,
+          headers: { get: (k: string) => (k === "Retry-After" ? "0" : null) },
+        });
+      }
+      // retry hangs then AbortError fires via signal
+      return new Promise((_resolve, reject) => {
+        if (opts?.signal) {
+          opts.signal.addEventListener("abort", () => {
+            reject(Object.assign(new Error("AbortError"), { name: "AbortError" }));
+          });
+        }
+      });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const db = makeDb();
+    const enricher = new WalletEnricher(db as never, { timeoutMs: 50, rps: 100, recencyHours: 24 });
+    await enricher._enrich(makeAlert(), 99n);
+
+    expect(upsertWalletProfile).not.toHaveBeenCalled();
+    expect(enrichWhaleAlert).not.toHaveBeenCalled();
+  });
+
+  it("outer fetch error (non-abort network error): _enrich resolves, no DB writes", async () => {
+    const mockFetch = vi.fn().mockRejectedValue(new Error("connection refused"));
+    vi.stubGlobal("fetch", mockFetch);
+
+    const db = makeDb();
+    const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });
+    await enricher._enrich(makeAlert(), 99n);
+
+    expect(upsertWalletProfile).not.toHaveBeenCalled();
+    expect(enrichWhaleAlert).not.toHaveBeenCalled();
+  });
+
+  it("wallet address > 42 chars: truncated to 42, enrichment proceeds", async () => {
+    const longWallet = "0x" + "a".repeat(50); // 52 chars
+    const trades = makeTrades([{ size: 100, price: 0.5, timestamp: 1_700_000_000 }]);
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: () => Promise.resolve(trades),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const db = makeDb();
+    const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });
+    await enricher._enrich(makeAlert(longWallet), 99n);
+
+    expect(upsertWalletProfile).toHaveBeenCalledOnce();
+    const upsertArg = vi.mocked(upsertWalletProfile).mock.calls[0][1];
+    expect(upsertArg.proxyWallet.length).toBe(42);
+  });
+
   it("enrich() never throws even if _enrich rejects", async () => {
     const db = makeDb();
     const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });
