@@ -68,6 +68,24 @@ describe("insertTrade", () => {
   });
 });
 
+describe("insertTrade - optional null fields", () => {
+  it("handles trade with undefined optional fields (marketSlug, eventSlug, etc.) — ?? null branches", async () => {
+    const db = makeDb(1);
+    // Override to unset optional string fields so ?? null branches are exercised
+    const trade = makeTrade({
+      marketSlug: undefined as unknown as string,
+      eventSlug: undefined as unknown as string,
+      marketTitle: undefined as unknown as string,
+      traderName: undefined,
+      traderPseudonym: undefined,
+    });
+    const result = await insertTrade(db, trade);
+    expect(result.inserted).toBe(true);
+    // Verify the query was called (not thrown)
+    expect(db.execute as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("insertTrade - rowCount null branch", () => {
   it("returns { inserted: false } when rowCount is null (null coalescence branch)", async () => {
     // Some DB drivers return rowCount=null; should be treated as 0 (not inserted)
