@@ -164,4 +164,56 @@ describe("SignalAggregator", () => {
     // No throw, insert called
     expect((db.execute as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(0);
   });
+
+  it("uses DB transaction when db.transaction() is available", async () => {
+    const bus = new TypedEventBus();
+
+    // Provide a mock that has a transaction() method
+    const txMock = {
+      execute: vi.fn().mockResolvedValue({ rows: [{ id: "42" }] }),
+    };
+    const transactionFn = vi.fn().mockImplementation(async (fn: (tx: typeof txMock) => Promise<void>) => {
+      await fn(txMock);
+    });
+    const db = {
+      ...makeDb(),
+      transaction: transactionFn,
+    } as unknown as ConstructorParameters<typeof SignalAggregator>[1];
+
+    const aggregator = new SignalAggregator(bus, db);
+    aggregator.start();
+
+    bus.emit("whale_alert", makeAlert(true));
+    await new Promise((r) => setTimeout(r, 50));
+
+    // transaction() should have been called
+    expect(transactionFn).toHaveBeenCalledTimes(1);
+    // Both insertWhaleAlert and insertSignal ran inside the tx
+    expect(txMock.execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("transaction: emitSignal=false skips both inserts inside tx", async () => {
+    const bus = new TypedEventBus();
+
+    const txMock = {
+      execute: vi.fn().mockResolvedValue({ rows: [] }),
+    };
+    const transactionFn = vi.fn().mockImplementation(async (fn: (tx: typeof txMock) => Promise<void>) => {
+      await fn(txMock);
+    });
+    const db = {
+      ...makeDb(null),
+      transaction: transactionFn,
+    } as unknown as ConstructorParameters<typeof SignalAggregator>[1];
+
+    const aggregator = new SignalAggregator(bus, db);
+    aggregator.start();
+
+    bus.emit("whale_alert", makeAlert(false));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(transactionFn).toHaveBeenCalledTimes(1);
+    // insertWhaleAlert returns null (emitSignal=false) → 0 execute calls inside tx
+    expect(txMock.execute).toHaveBeenCalledTimes(0);
+  });
 });
