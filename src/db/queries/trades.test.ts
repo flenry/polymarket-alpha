@@ -68,6 +68,17 @@ describe("insertTrade", () => {
   });
 });
 
+describe("insertTrade - rowCount null branch", () => {
+  it("returns { inserted: false } when rowCount is null (null coalescence branch)", async () => {
+    // Some DB drivers return rowCount=null; should be treated as 0 (not inserted)
+    const db = {
+      execute: vi.fn().mockResolvedValue({ rowCount: null }),
+    } as unknown as Parameters<typeof insertTrade>[0];
+    const result = await insertTrade(db, makeTrade());
+    expect(result.inserted).toBe(false);
+  });
+});
+
 describe("insertTrades (batch)", () => {
   it("returns count of inserted rows", async () => {
     const db = makeDb(1);
