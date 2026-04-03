@@ -47,11 +47,14 @@ docker compose up -d
 ## Testing
 
 ```bash
-# Unit tests
+# Unit tests (251 tests, 29 test files)
 pnpm test
 
-# With coverage
+# With v8 coverage report (~92% overall, 100% on processors/signals/alerts)
 pnpm test:coverage
+
+# Type-check only
+pnpm typecheck
 ```
 
 ## Architecture
@@ -98,6 +101,10 @@ See `.env.example` for all configurable parameters.
 | `WHALE_PCT_VOLUME_THRESHOLD` | 0.02 | % of daily volume threshold |
 | `SNAPSHOT_INTERVAL_MS` | 30000 | Order book snapshot interval |
 | `GAMMA_POLL_INTERVAL_MS` | 60000 | Market catalog poll interval |
+
+## Developer Reference
+
+See [CLAUDE.md](./CLAUDE.md) for full architecture notes, component descriptions, conventions, and current state — formatted for AI-assisted development sessions.
 
 ## Database Partitioning
 
