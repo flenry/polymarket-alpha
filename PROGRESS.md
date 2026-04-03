@@ -29,3 +29,27 @@
 - Wallet enrichment approach is feasible, but repeated-alert re-enrichment should be deduped/cached to avoid waste and soft rate-limit pressure.
 
 **Next step**: Amend `PLAN.md` before Zoro starts implementation so the build target matches the spec and avoids hidden rework.
+
+## 2026-04-03 — Zoro: Phase 2 implementation complete
+
+**Workflow**: Implementation  
+**Status**: DONE ✅  
+**Branch**: `feat/phase-2` — pushed to origin, PR open
+
+**Results:**
+- **303 tests passing** (34 test files, +47 new tests vs Phase 1's 256)
+- **0 type errors** (`tsc --noEmit` clean)
+- All 256 Phase 1 tests continue to pass
+
+**Modules implemented (one commit each):**
+1. `feat: ClobWsPool sharded WS` — url option, jitter `(0.8–1.2x)` reconnect, `market_resolved` → `markMarketClosed`, new `wallets.ts` queries, `markMarketClosed`, `walletFirstSeenAt` in `enrichWhaleAlert`, Phase 2 config fields
+2. `feat: WsBookImbalanceEvaluator` — WS-path evaluator, confidence = `min(1, (ratio-threshold)/threshold)`, strength = total depth, 60s cooldown, `ws_event` snapshot insert on every evaluate
+3. `feat: WebhookEmitter` — Discord (color 0xFF4444/0xFFAA00) + Slack Block Kit, 5 req/s token-bucket, 429 retry once, network errors swallowed, AlertEmitter wired (optional, backward-compatible)
+4. `feat: WalletEnricher` — async wallet profiling, 24h recency guard, 2 req/s bucket, 5s AbortController timeout, upserts `wallet_profiles`, enriches `whale_alerts`, `SignalAggregator.onWhaleInserted` callback
+5. `feat: phase-2 pipeline wiring` — ClobWsPool + WsBookImbalanceEvaluator + WebhookEmitter + WalletEnricher wired; ClobWsPool events forwarded to bus; `book_update` → evaluator; `ORDER_BOOK_IMBALANCE` → webhooks
+6. `chore: update docs for Phase 2`
+
+**Architecture notes:**
+- Two separate imbalance evaluators with independent `lastEmits` maps — no shared cooldown state between REST and WS paths
+- Policy: wallet enrichment only for `emitSignal=true` alerts (persisted alerts only)
+- No new npm packages added (token-bucket implemented inline)
