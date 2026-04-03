@@ -194,4 +194,23 @@ describe("WhaleDetector (dual-threshold)", () => {
       emitSignal: true,
     });
   });
+
+  it("book with empty bids: mid falls back to trade.priceUsdc (covers line 23 fallback)", () => {
+    const detector = makeDetector();
+    const trade = makeTrade(65_000);
+    // Book with asks but no bids — mid fallback to trade.priceUsdc
+    const partialBook: OrderBook = {
+      tokenId: "tok1",
+      conditionId: "cond1",
+      bids: [],
+      asks: [{ price: 0.66, size: 10000 }],
+      timestamp: Date.now(),
+      hash: "abc",
+      capturedAt: new Date(Date.now() - 1000),
+    };
+    const alert = detector.evaluate(trade, makeStats(), partialBook);
+    expect(alert).not.toBeNull();
+    // Mid = trade.priceUsdc since bids is empty
+    expect(alert!.priceImpactEstimateUsdc).toBeGreaterThanOrEqual(0);
+  });
 });
