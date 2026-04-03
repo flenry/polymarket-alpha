@@ -127,6 +127,18 @@ describe("formatWhaleAlert", () => {
     expect(output).toContain("5.2σ above mean");
     expect(output).toContain("3.10% of daily vol");
   });
+
+  it("uses 'pct-of-vol only' when sigmasAboveMean <= 0 (line 12 branch)", () => {
+    const alert = makeAlert();
+    // Override signal to have sigmasAboveMean = 0 (uncalibrated — pct-of-vol only path)
+    const alertNegSigma = {
+      ...alert,
+      signal: { ...alert.signal, sigmasAboveMean: 0 },
+    };
+    const output = formatWhaleAlert(alertNegSigma);
+    expect(output).toContain("pct-of-vol only");
+    expect(output).not.toContain("σ above mean");
+  });
 });
 
 describe("AlertEmitter latency warning", () => {
