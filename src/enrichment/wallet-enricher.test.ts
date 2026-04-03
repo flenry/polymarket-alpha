@@ -507,6 +507,27 @@ describe("WalletEnricher", () => {
     expect(elapsed).toBeGreaterThanOrEqual(900); // at least one 1s refill cycle
   });
 
+  it("constructor without opts: uses config defaults for timeoutMs/recencyHours/rps", async () => {
+    // Covers lines 63-65: `opts?.timeoutMs ?? config.*` defaults when opts is undefined
+    const trades = makeTrades([{ size: 100, price: 0.5, timestamp: 1_700_000_000 }]);
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: () => Promise.resolve(trades),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const db = makeDb();
+    // No opts — uses config defaults (timeoutMs=5000, recencyHours=24, rps=2)
+    const enricher = new WalletEnricher(db as never);
+    // _enrich should work with config defaults
+    await enricher._enrich(makeAlert(), 99n);
+
+    expect(upsertWalletProfile).toHaveBeenCalledOnce();
+    expect(enrichWhaleAlert).toHaveBeenCalledOnce();
+  });
+
   it("enrich() never throws even if _enrich rejects", async () => {
     const db = makeDb();
     const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });

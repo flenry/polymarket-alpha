@@ -427,6 +427,53 @@ describe("WebhookEmitter", () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
+  it("truncateWallet: short wallet (≤12 chars) returned unchanged — no truncation", async () => {
+    // Covers the `else` branch of `wallet.length > len ? ... : wallet` (line 16)
+    const mockFetch = makeMockFetch([{ status: 200 }]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const alert = makeWhaleAlert();
+    // Set a short wallet (≤12 chars) so truncation does NOT apply
+    (alert.trade as { proxyWallet: string }).proxyWallet = "0xshort";
+    (alert.signal as { proxyWallet: string }).proxyWallet = "0xshort";
+
+    const emitter = new WebhookEmitter({
+      discordUrl: "https://discord.com/api/webhooks/test",
+      slackUrl: "",
+    });
+    await emitter.send(alert);
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body) as {
+      embeds: Array<{ fields: Array<{ name: string; value: string }> }>;
+    };
+    const walletField = body.embeds[0].fields.find((f) => f.name === "Wallet");
+    // Short wallet — returned unchanged, no ellipsis
+    expect(walletField?.value).toBe("0xshort");
+    expect(walletField?.value).not.toContain("…");
+  });
+
+  it("Discord description falls back to tokenId when both marketTitle and marketSlug empty", async () => {
+    // Covers: `trade.marketTitle || trade.marketSlug || trade.tokenId` (line 70)
+    // Both marketTitle="" and marketSlug="" → falls back to tokenId
+    const mockFetch = makeMockFetch([{ status: 200 }]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const alert = makeWhaleAlert();
+    (alert.trade as { marketTitle: string }).marketTitle = "";
+    (alert.trade as { marketSlug: string }).marketSlug = "";
+
+    const emitter = new WebhookEmitter({
+      discordUrl: "https://discord.com/api/webhooks/test",
+      slackUrl: "",
+    });
+    await emitter.send(alert);
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body) as {
+      embeds: Array<{ description: string }>;
+    };
+    expect(body.embeds[0].description).toBe(alert.trade.tokenId);
+  });
+
   it("wallet truncated to 12 chars + ellipsis in Discord embed", async () => {
     const mockFetch = makeMockFetch([{ status: 200 }]);
     vi.stubGlobal("fetch", mockFetch);
