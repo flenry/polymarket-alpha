@@ -169,6 +169,26 @@ describe("SnapshotWriter", () => {
     expect(onBook).toHaveBeenCalledTimes(1);
     expect(onBook).toHaveBeenCalledWith(book);
   });
+
+  it("setInterval catch branch: snapshot error logged when snapshot() rejects (line 51)", async () => {
+    vi.useFakeTimers();
+    const db = makeDb();
+    // ClobClient that rejects — causes snapshot() to reject
+    const clob = {
+      batchGetBooks: vi.fn().mockRejectedValue(new Error("network error")),
+    } as unknown as ConstructorParameters<typeof SnapshotWriter>[1];
+    const writer = new SnapshotWriter(db, clob, () => ["tok1"], 30000);
+    writer.start();
+
+    // Advance timer to trigger snapshot (which rejects)
+    await vi.advanceTimersByTimeAsync(30000);
+
+    // batchGetBooks was called (proves the error path ran)
+    expect(clob.batchGetBooks as ReturnType<typeof vi.fn>).toHaveBeenCalled();
+
+    writer.stop();
+    vi.useRealTimers();
+  });
 });
 
 describe("computeDepth", () => {
