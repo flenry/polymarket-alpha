@@ -213,4 +213,44 @@ describe("WhaleDetector (dual-threshold)", () => {
     // Mid = trade.priceUsdc since bids is empty
     expect(alert!.priceImpactEstimateUsdc).toBeGreaterThanOrEqual(0);
   });
+
+  it("SELL trade: walks bids side of book (line 19 SELL branch)", () => {
+    const detector = makeDetector();
+    const trade = makeTrade(65_000, "SELL");
+    const book = makeBook();
+    const alert = detector.evaluate(trade, makeStats(), book);
+    expect(alert).not.toBeNull();
+    expect(alert!.signal.direction).toBe("BEARISH");
+    // SELL uses bids side — should have depth consumed
+    expect(alert!.bookDepthConsumedPct).toBeGreaterThanOrEqual(0);
+  });
+
+  it("volume24hr=0: pctOfDailyVolume=0 (line 79 zero-volume branch)", () => {
+    const detector = makeDetector();
+    // volume=0 → pctOfDailyVolume=0, but sigma passes
+    const trade = makeTrade(65_000);
+    const stats = makeStats({ volume24hr: 0 });
+    // sigma = (65000-5000)/8000 = 7.5 ≥ 3 → fires
+    const alert = detector.evaluate(trade, stats, null);
+    expect(alert).not.toBeNull();
+    expect(alert!.signal.pctOfDailyVolume).toBe(0);
+  });
+
+  it("totalDepth=0: bookDepthConsumedPct=0 (zero-depth book branch)", () => {
+    const detector = makeDetector();
+    const trade = makeTrade(65_000);
+    // Book with zero-size levels → totalDepth=0
+    const zeroDepthBook: OrderBook = {
+      tokenId: "tok1",
+      conditionId: "cond1",
+      bids: [{ price: 0.65, size: 0 }],
+      asks: [{ price: 0.66, size: 0 }],
+      timestamp: Date.now(),
+      hash: "abc",
+      capturedAt: new Date(),
+    };
+    const alert = detector.evaluate(trade, makeStats(), zeroDepthBook);
+    expect(alert).not.toBeNull();
+    expect(alert!.bookDepthConsumedPct).toBe(0);
+  });
 });
