@@ -20,7 +20,7 @@ import { getMarketStats, getWatchlistedTokenIds } from "./db/queries/markets.js"
 import { RollingStatsBuffer } from "./sources/stats-bootstrap.js";
 import { evaluatePriceImpact } from "./signals/price-impact-signal.js";
 import { evaluateVelocity } from "./signals/velocity-signal.js";
-import type { MarketStats, TradeEvent, OrderBook, TokenId, BookUpdateEvent, Signal } from "./events/types.js";
+import type { MarketStats, TradeEvent, OrderBook, TokenId, BookUpdateEvent, PriceChangeEvent, BestBidAskEvent, LastTradePriceEvent, Signal } from "./events/types.js";
 import { logger } from "./logger.js";
 
 const PRICE_WINDOW_MS = 120_000; // keep 2 min of recent price history per token
@@ -270,9 +270,9 @@ export async function startPipeline(): Promise<() => Promise<void>> {
 
   // Wire ClobWsPool local events → bus
   const clobBookHandler = (evt: BookUpdateEvent) => bus.emit("book_update", evt);
-  const clobPriceChangeHandler = (evt: unknown) => bus.emit("price_change", evt as never);
-  const clobBestBidAskHandler = (evt: unknown) => bus.emit("best_bid_ask", evt as never);
-  const clobLastTradePriceHandler = (evt: unknown) => bus.emit("last_trade_price", evt as never);
+  const clobPriceChangeHandler = (evt: PriceChangeEvent) => bus.emit("price_change", evt);
+  const clobBestBidAskHandler = (evt: BestBidAskEvent) => bus.emit("best_bid_ask", evt);
+  const clobLastTradePriceHandler = (evt: LastTradePriceEvent) => bus.emit("last_trade_price", evt);
 
   clobWsPool.on("book", clobBookHandler);
   clobWsPool.on("price_change", clobPriceChangeHandler);
@@ -350,6 +350,10 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     bus.off("last_trade_price", lastTradeHandler);
     bus.off("book_update", bookUpdateHandler);
     bus.off("signal", imbalanceWebhookHandler);
+    clobWsPool.off("book", clobBookHandler);
+    clobWsPool.off("price_change", clobPriceChangeHandler);
+    clobWsPool.off("best_bid_ask", clobBestBidAskHandler);
+    clobWsPool.off("last_trade_price", clobLastTradePriceHandler);
 
     // 5. Clear in-memory price state
     recentPrices.clear();

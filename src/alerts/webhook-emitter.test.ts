@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { WebhookEmitter } from "./webhook-emitter.js";
-import type { WhaleAlert, TradeEvent, WhaleSignal, ImbalanceSignal } from "../events/types.js";
+import type { WhaleAlert, TradeEvent, WhaleSignal, ImbalanceSignal, VelocitySignal, Signal } from "../events/types.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -259,6 +259,102 @@ describe("WebhookEmitter", () => {
     // 3 sends at 2 rps = at least 1 token-refill wait (~500ms) for the third send
     expect(mockFetch).toHaveBeenCalledTimes(3);
     expect(elapsed).toBeGreaterThanOrEqual(400); // at least one refill period
+  });
+
+  it("429 retry response non-OK (not 204): send() still resolves", async () => {
+    // First call: 429 with Retry-After:0, second call: 500 → should log warn but not throw
+    const mockFetch = makeMockFetch([
+      { status: 429, headers: { "Retry-After": "0" } },
+      { status: 500 },
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const emitter = new WebhookEmitter({
+      discordUrl: "https://discord.com/api/webhooks/test",
+      slackUrl: "",
+    });
+    await expect(emitter.send(makeWhaleAlert())).resolves.toBeUndefined();
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("non-OK response (not 204) on first call: send() resolves", async () => {
+    // Covers the logger.warn branch for non-OK, non-204 on first response (lines 208-209)
+    const mockFetch = makeMockFetch([{ status: 403 }]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const emitter = new WebhookEmitter({
+      discordUrl: "https://discord.com/api/webhooks/test",
+      slackUrl: "",
+    });
+    await expect(emitter.send(makeWhaleAlert())).resolves.toBeUndefined();
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it("fallback Discord payload for non-whale non-imbalance signal: title='Signal'", async () => {
+    // Covers the third branch in buildDiscordPayload (line 172)
+    const mockFetch = makeMockFetch([{ status: 200 }]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const velocitySignal: VelocitySignal = {
+      signalType: "SENTIMENT_VELOCITY",
+      tokenId: "tok3",
+      conditionId: "cond3",
+      direction: "BULLISH",
+      confidence: 0.6,
+      strength: 100,
+      priceAtSignal: 0.5,
+      createdAt: new Date(),
+      payload: {},
+      velocityZScore: 3.1,
+      hourlyPriceChangePct: 5.2,
+      baselineStdDev: 1.7,
+    };
+
+    const emitter = new WebhookEmitter({
+      discordUrl: "https://discord.com/api/webhooks/test",
+      slackUrl: "",
+    });
+    await emitter.send(velocitySignal as Signal);
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body) as {
+      embeds: Array<{ title: string; color: number }>;
+    };
+    expect(body.embeds[0].title).toBe("Signal");
+    expect(body.embeds[0].color).toBe(0x888888);
+  });
+
+  it("fallback Slack payload for non-whale non-imbalance signal: block text is JSON", async () => {
+    // Covers lines 178-180
+    const mockFetch = makeMockFetch([{ status: 200 }]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const velocitySignal: VelocitySignal = {
+      signalType: "SENTIMENT_VELOCITY",
+      tokenId: "tok3",
+      conditionId: "cond3",
+      direction: "BULLISH",
+      confidence: 0.6,
+      strength: 100,
+      priceAtSignal: 0.5,
+      createdAt: new Date(),
+      payload: {},
+      velocityZScore: 3.1,
+      hourlyPriceChangePct: 5.2,
+      baselineStdDev: 1.7,
+    };
+
+    const emitter = new WebhookEmitter({
+      discordUrl: "",
+      slackUrl: "https://hooks.slack.com/services/test",
+    });
+    await emitter.send(velocitySignal as Signal);
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body) as {
+      blocks: Array<{ type: string; text: { text: string } }>;
+    };
+    expect(body.blocks[0].type).toBe("section");
+    // Should JSON.stringify the signal
+    expect(body.blocks[0].text.text).toContain("SENTIMENT_VELOCITY");
   });
 
   it("wallet truncated to 12 chars + ellipsis in Discord embed", async () => {

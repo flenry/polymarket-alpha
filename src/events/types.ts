@@ -195,7 +195,6 @@ export interface PipelineConfig {
   tradeBatchFlushMs: number;
   reconnectBaseMs: number;
   reconnectMaxMs: number;
-  walletEnrichRps: number;
   minLiquidityUsdc: number;
   imbalanceRatioThreshold: number;
   priceImpactWindowSec: number;

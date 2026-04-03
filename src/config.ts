@@ -22,8 +22,6 @@ export const config = Object.freeze({
   tradeBatchFlushMs: envNumber("TRADE_BATCH_FLUSH_MS", 500),
   reconnectBaseMs: envNumber("RECONNECT_BASE_MS", 1_000),
   reconnectMaxMs: envNumber("RECONNECT_MAX_MS", 30_000),
-  // walletEnrichRps is superseded by walletEnrichmentRateLimitRps (Phase 2) — kept for backward compat
-  walletEnrichRps: envNumber("WALLET_ENRICH_RPS", 2),
   minLiquidityUsdc: envNumber("MIN_LIQUIDITY_USDC", 50_000),
   imbalanceRatioThreshold: envNumber("IMBALANCE_RATIO_THRESHOLD", 3.0),
   // Phase 2

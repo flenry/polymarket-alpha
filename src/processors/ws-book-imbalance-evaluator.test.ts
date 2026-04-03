@@ -255,4 +255,47 @@ describe("WsBookImbalanceEvaluator", () => {
     const signal = bus.emit.mock.calls[0][1] as { priceAtSignal: number };
     expect(signal.priceAtSignal).toBeCloseTo((0.70 + 0.72) / 2, 6);
   });
+
+  it("priceAtSignal = 0 when bids empty (BEAR signal with no bid side)", async () => {
+    // bids=[], asks=[4.0] → ratio=0 < 1/3.0 → BEAR. bids.length===0 → priceAtSignal=0
+    const evaluator = new WsBookImbalanceEvaluator(
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
+      { threshold: THRESHOLD, cooldownMs: 60_000 }
+    );
+
+    // Empty bids but has asks
+    const book = makeBook([], [{ price: 0.8, size: 4.0 }]);
+    evaluator.evaluate(book);
+
+    expect(bus.emit).toHaveBeenCalledOnce();
+    const sig = bus.emit.mock.calls[0][1] as { direction: string; priceAtSignal: number };
+    expect(sig.direction).toBe("BEARISH");
+    expect(sig.priceAtSignal).toBe(0);
+  });
+
+  it("snapshot insert failure: evaluate() does not throw, signal still emitted", async () => {
+    // Cover the .catch() branch on insertBookSnapshot (line 49)
+    vi.mocked(insertBookSnapshot).mockRejectedValueOnce(new Error("DB write failed"));
+
+    const evaluator = new WsBookImbalanceEvaluator(
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
+      { threshold: THRESHOLD, cooldownMs: 60_000 }
+    );
+
+    const bids = [{ price: 1.0, size: 4.0 }];
+    const asks = [{ price: 1.0, size: 1.0 }];
+    const book = makeBook(bids, asks);
+
+    // Should not throw despite DB failure
+    expect(() => evaluator.evaluate(book)).not.toThrow();
+    // Signal still emitted (fire-and-forget snapshot)
+    expect(bus.emit).toHaveBeenCalledOnce();
+    const sig = bus.emit.mock.calls[0][1] as { signalType: string };
+    expect(sig.signalType).toBe("ORDER_BOOK_IMBALANCE");
+
+    // Wait for the rejected promise to settle (covers the catch log)
+    await new Promise((r) => setTimeout(r, 10));
+  });
 });

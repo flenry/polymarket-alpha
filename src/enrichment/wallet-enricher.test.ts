@@ -357,6 +357,28 @@ describe("WalletEnricher", () => {
     expect(upsertArg.proxyWallet.length).toBe(42);
   });
 
+  it("429 double: both first and retry return 429 → gives up, no DB writes", async () => {
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      return Promise.resolve({
+        ok: false,
+        status: 429,
+        headers: { get: (k: string) => (k === "Retry-After" ? "0" : null) },
+        json: () => Promise.resolve([]),
+      });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const db = makeDb();
+    const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });
+    await enricher._enrich(makeAlert(), 99n);
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(upsertWalletProfile).not.toHaveBeenCalled();
+    expect(enrichWhaleAlert).not.toHaveBeenCalled();
+  });
+
   it("enrich() never throws even if _enrich rejects", async () => {
     const db = makeDb();
     const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });
