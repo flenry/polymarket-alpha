@@ -1,5 +1,6 @@
 import type { WhaleAlert } from "../events/types.js";
 import type { TypedEventBus } from "../events/bus.js";
+import type { WebhookEmitter } from "./webhook-emitter.js";
 import { logger } from "../logger.js";
 
 const LATENCY_WARN_THRESHOLD_MS = 1000;
@@ -26,7 +27,10 @@ export function formatWhaleAlert(alert: WhaleAlert): string {
 export class AlertEmitter {
   private readonly whaleHandler: (alert: WhaleAlert) => void;
 
-  constructor(private readonly bus: TypedEventBus) {
+  constructor(
+    private readonly bus: TypedEventBus,
+    private readonly webhookEmitter?: WebhookEmitter
+  ) {
     this.whaleHandler = (alert) => this.emit(alert);
   }
 
@@ -71,5 +75,8 @@ export class AlertEmitter {
 
     // Human-readable stdout
     console.log(formatWhaleAlert(alert));
+
+    // Fire-and-forget webhook delivery
+    this.webhookEmitter?.send(alert);
   }
 }

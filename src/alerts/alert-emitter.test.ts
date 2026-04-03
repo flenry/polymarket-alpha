@@ -202,3 +202,37 @@ describe("AlertEmitter.stop()", () => {
     consoleSpy.mockRestore();
   });
 });
+
+describe("AlertEmitter with WebhookEmitter", () => {
+  it("calls webhookEmitter.send() after emit() when webhookEmitter is provided", () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const bus = new TypedEventBus();
+    const mockSend = vi.fn().mockResolvedValue(undefined);
+    const mockWebhook = { send: mockSend } as unknown as import("./webhook-emitter.js").WebhookEmitter;
+
+    const emitter = new AlertEmitter(bus, mockWebhook);
+    emitter.start();
+
+    bus.emit("whale_alert", makeAlert());
+
+    expect(consoleSpy).toHaveBeenCalledOnce();
+    expect(mockSend).toHaveBeenCalledOnce();
+
+    emitter.stop();
+    consoleSpy.mockRestore();
+  });
+
+  it("no-op when webhookEmitter is not provided (backward compatible)", () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const bus = new TypedEventBus();
+
+    const emitter = new AlertEmitter(bus); // no webhook
+    emitter.start();
+
+    expect(() => bus.emit("whale_alert", makeAlert())).not.toThrow();
+    expect(consoleSpy).toHaveBeenCalledOnce();
+
+    emitter.stop();
+    consoleSpy.mockRestore();
+  });
+});
