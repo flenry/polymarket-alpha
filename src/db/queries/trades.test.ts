@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { insertTrade } from "./trades.js";
+import { insertTrade, insertTrades } from "./trades.js";
 import type { TradeEvent } from "../../events/types.js";
 
 function makeTrade(overrides: Partial<TradeEvent> = {}): TradeEvent {
@@ -65,5 +65,33 @@ describe("insertTrade", () => {
 
     expect(r1.inserted).toBe(true);
     expect(r2.inserted).toBe(true);
+  });
+});
+
+describe("insertTrades (batch)", () => {
+  it("returns count of inserted rows", async () => {
+    const db = makeDb(1);
+    const trades = [makeTrade(), makeTrade({ tokenId: "tok2" }), makeTrade({ tokenId: "tok3" })];
+    const count = await insertTrades(db, trades);
+    expect(count).toBe(3);
+  });
+
+  it("returns 0 when all are duplicates", async () => {
+    const db = makeDb(0);
+    const trades = [makeTrade(), makeTrade()];
+    const count = await insertTrades(db, trades);
+    expect(count).toBe(0);
+  });
+
+  it("counts only non-duplicate inserts", async () => {
+    // First call: rowCount=1, second: rowCount=0
+    const db = {
+      execute: vi.fn()
+        .mockResolvedValueOnce({ rowCount: 1 })
+        .mockResolvedValueOnce({ rowCount: 0 }),
+    } as unknown as Parameters<typeof insertTrade>[0];
+
+    const count = await insertTrades(db, [makeTrade(), makeTrade()]);
+    expect(count).toBe(1);
   });
 });

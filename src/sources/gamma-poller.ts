@@ -92,10 +92,10 @@ export class GammaPoller extends EventEmitter {
         await upsertMarket(db, {
           ...m,
           tokenId,
+          outcomeIndex: i,
           watchlisted,
           negRisk: isNegRisk,
           question: m.question ?? "",
-          outcomes: null,
         });
 
         if (isNegRisk) {

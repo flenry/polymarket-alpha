@@ -1,4 +1,4 @@
-import { eq, and, inArray, sql } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as schema from "../schema.js";
 import { markets, marketStats } from "../schema.js";
@@ -7,7 +7,35 @@ import type { TokenId } from "../../events/types.js";
 
 type Db = NodePgDatabase<typeof schema>;
 
-export async function upsertMarket(db: Db, market: GammaMarket & { tokenId: string; watchlisted: boolean; negRisk: boolean }): Promise<void> {
+/**
+ * Parse the outcome label for a given token index from the Gamma `outcomes` JSON string.
+ * `outcomes` is a JSON array string like '["Yes","No"]'.
+ * Returns "" if parsing fails or index is out of range.
+ */
+function parseOutcome(outcomesJson: string | null | undefined, index: number): string {
+  if (!outcomesJson) return "";
+  try {
+    const arr = JSON.parse(outcomesJson) as unknown[];
+    const val = arr[index];
+    return typeof val === "string" ? val : "";
+  } catch {
+    return "";
+  }
+}
+
+export async function upsertMarket(
+  db: Db,
+  market: GammaMarket & {
+    tokenId: string;
+    watchlisted: boolean;
+    negRisk: boolean;
+    /** Index of this token in the clobTokenIds array — used to derive outcome label */
+    outcomeIndex?: number;
+  }
+): Promise<void> {
+  const idx = market.outcomeIndex ?? 0;
+  const outcome = parseOutcome(market.outcomes, idx);
+
   await db
     .insert(markets)
     .values({
@@ -17,7 +45,8 @@ export async function upsertMarket(db: Db, market: GammaMarket & { tokenId: stri
       slug: market.slug ?? null,
       eventSlug: market.eventSlug ?? null,
       category: market.category ?? null,
-      outcome: "",
+      outcome,
+      outcomeIndex: idx,
       negRisk: market.negRisk,
       watchlisted: market.watchlisted,
       active: market.active ?? true,
@@ -33,6 +62,8 @@ export async function upsertMarket(db: Db, market: GammaMarket & { tokenId: stri
         slug: market.slug ?? null,
         eventSlug: market.eventSlug ?? null,
         category: market.category ?? null,
+        outcome,
+        outcomeIndex: idx,
         negRisk: market.negRisk,
         watchlisted: market.watchlisted,
         active: market.active ?? true,

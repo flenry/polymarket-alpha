@@ -1,4 +1,4 @@
-import { sql, desc } from "drizzle-orm";
+import { sql, desc, gt } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as schema from "../schema.js";
 import { signals } from "../schema.js";
@@ -47,10 +47,15 @@ export async function insertSignal(
   return { id: BigInt(rows[0].id) };
 }
 
-export async function getRecentSignals(db: Db, limitHours = 1): Promise<typeof signals.$inferSelect[]> {
+export async function getRecentSignals(
+  db: Db,
+  limitHours = 1
+): Promise<typeof signals.$inferSelect[]> {
+  const cutoff = new Date(Date.now() - limitHours * 60 * 60 * 1000);
   return db
     .select()
     .from(signals)
+    .where(gt(signals.createdAt, cutoff))
     .orderBy(desc(signals.createdAt))
     .limit(100);
 }

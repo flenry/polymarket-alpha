@@ -32,13 +32,18 @@ function computeBookHash(book: OrderBook): string {
 export class SnapshotWriter {
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly bookCache = new Map<TokenId, BookCacheEntry>();
+  /** Called after each book is written — used by OrderBookImbalanceEngine */
+  private readonly onBook: ((book: OrderBook) => void) | null;
 
   constructor(
     private readonly db: Db,
     private readonly clobClient: ClobRestClient,
     private readonly getWatchlist: () => TokenId[],
-    private readonly intervalMs: number
-  ) {}
+    private readonly intervalMs: number,
+    onBook?: (book: OrderBook) => void
+  ) {
+    this.onBook = onBook ?? null;
+  }
 
   start(): void {
     this.timer = setInterval(() => {
@@ -96,6 +101,9 @@ export class SnapshotWriter {
         snapshotTrigger: "rest_timer",
         capturedAt: now,
       });
+
+      // Notify imbalance engine (or any subscriber) after each book is persisted
+      this.onBook?.(book);
     }
   }
 

@@ -13,7 +13,8 @@ import { OrderBookImbalanceEngine } from "./processors/book-imbalance-engine.js"
 import { PriceHistoryWriter } from "./processors/price-history-writer.js";
 import { insertTrade } from "./db/queries/trades.js";
 import { getMarketStats } from "./db/queries/markets.js";
-import type { MarketStats } from "./events/types.js";
+import { RollingStatsBuffer } from "./sources/stats-bootstrap.js";
+import type { MarketStats, TradeEvent } from "./events/types.js";
 import { logger } from "./logger.js";
 
 export async function startPipeline(): Promise<() => Promise<void>> {
@@ -29,6 +30,9 @@ export async function startPipeline(): Promise<() => Promise<void>> {
   // 2. Create negRisk set and market stats cache (will be populated by GammaPoller)
   const negRiskSet = new Set<string>();
   const statsCache = new Map<string, MarketStats>();
+
+  // Rolling 24h stats buffer — updated on every live trade, recomputed every 60s
+  const rollingBuffer = new RollingStatsBuffer();
 
   // 3. Start GammaPoller
   const gammaPoller = new GammaPoller({
@@ -53,35 +57,68 @@ export async function startPipeline(): Promise<() => Promise<void>> {
 
   liveDataWs.connect();
 
-  // 5. Wire trade persistence
+  // 5. Wire trade persistence with batching
+  const tradeBatch: TradeEvent[] = [];
+  let flushTimer: ReturnType<typeof setInterval> | null = null;
+
+  async function flushTradeBatch(): Promise<void> {
+    if (tradeBatch.length === 0) return;
+    const batch = tradeBatch.splice(0, tradeBatch.length);
+    for (const trade of batch) {
+      try {
+        await insertTrade(db, trade);
+      } catch (err) {
+        logger.error({ err, tokenId: trade.tokenId }, "Pipeline: trade insert failed");
+      }
+    }
+  }
+
+  flushTimer = setInterval(() => {
+    flushTradeBatch().catch((err) =>
+      logger.error({ err }, "Pipeline: batch flush error")
+    );
+  }, config.tradeBatchFlushMs);
+
   bus.on("trade", async (trade) => {
-    try {
-      await insertTrade(db, trade);
-    } catch (err) {
-      logger.error({ err, tokenId: trade.tokenId }, "Pipeline: trade insert failed");
+    // Feed rolling buffer for live stats accumulation
+    rollingBuffer.addTrade(trade.tokenId, trade.valueUsdc, trade.tradedAt);
+
+    tradeBatch.push(trade);
+    if (tradeBatch.length >= config.tradeBatchSize) {
+      await flushTradeBatch();
     }
   });
 
   // 6. Start ClobRestClient + SnapshotWriter
   const clobClient = new ClobRestClient();
-  const snapshotWriter = new SnapshotWriter(
-    db,
-    clobClient,
-    () => gammaPoller.getWatchlist(),
-    config.snapshotIntervalMs
-  );
-  snapshotWriter.start();
 
-  // 7. WhaleDetector + AlertEmitter
+  // 7. WhaleDetector + AlertEmitter (wire before SnapshotWriter so onBook is available)
   const detector = new WhaleDetector();
   const alertEmitter = new AlertEmitter(bus);
   alertEmitter.start();
 
+  // 8. OrderBookImbalanceEngine — called after each book snapshot (PLAN Task 2.5)
+  const imbalanceEngine = new OrderBookImbalanceEngine(bus);
+
+  const snapshotWriter = new SnapshotWriter(
+    db,
+    clobClient,
+    () => gammaPoller.getWatchlist(),
+    config.snapshotIntervalMs,
+    (book) => {
+      // Evaluate imbalance after each book snapshot is persisted
+      imbalanceEngine.evaluate(book);
+    }
+  );
+  snapshotWriter.start();
+
   bus.on("trade", async (trade) => {
     const book = snapshotWriter.getLatestBook(trade.tokenId)?.book ?? null;
 
-    // Fetch calibrated stats from cache, falling back to DB lookup
+    // Use rolling buffer stats if available (live accumulation), else fall back to DB cache
+    const rollingStats = rollingBuffer.getStats(trade.tokenId);
     let stats = statsCache.get(trade.tokenId);
+
     if (!stats) {
       try {
         const row = await getMarketStats(db, trade.tokenId);
@@ -102,16 +139,27 @@ export async function startPipeline(): Promise<() => Promise<void>> {
       }
     }
 
-    // Use calibrated stats or uncalibrated default (absolute-threshold-only)
-    const effectiveStats: MarketStats = stats ?? {
-      tokenId: trade.tokenId,
-      volume24hr: 0,
-      avgTradeSize24h: 0,
-      stddevTradeSize24h: 0,
-      liquidityUsdc: 0,
-      tradeCount24h: 0,
-      calibrated: false,
-    };
+    // Blend rolling buffer into stats if we have enough live trades (>= 30 in buffer)
+    const effectiveStats: MarketStats =
+      rollingStats.count >= 30
+        ? {
+            tokenId: trade.tokenId,
+            volume24hr: rollingStats.volume,
+            avgTradeSize24h: rollingStats.avg,
+            stddevTradeSize24h: rollingStats.stddev,
+            liquidityUsdc: stats?.liquidityUsdc ?? 0,
+            tradeCount24h: rollingStats.count,
+            calibrated: true,
+          }
+        : stats ?? {
+            tokenId: trade.tokenId,
+            volume24hr: 0,
+            avgTradeSize24h: 0,
+            stddevTradeSize24h: 0,
+            liquidityUsdc: 0,
+            tradeCount24h: 0,
+            calibrated: false,
+          };
 
     const alert = detector.evaluate(trade, effectiveStats, book);
     if (alert) {
@@ -125,12 +173,9 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     for (const id of tokenIds) statsCache.delete(id);
   });
 
-  // 8. SignalAggregator
+  // 9. SignalAggregator
   const signalAggregator = new SignalAggregator(bus, db);
   signalAggregator.start();
-
-  // 9. OrderBookImbalanceEngine — called after each snapshot
-  const imbalanceEngine = new OrderBookImbalanceEngine(bus);
 
   // 10. PriceHistoryWriter
   const priceHistoryWriter = new PriceHistoryWriter(bus, db);
@@ -145,20 +190,27 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     // 1. Stop accepting new events
     liveDataWs.disconnect();
 
-    // 2. Flush pending price history
+    // 2. Flush trade batch
+    if (flushTimer) {
+      clearInterval(flushTimer);
+      flushTimer = null;
+    }
+    await flushTradeBatch();
+
+    // 3. Flush pending price history
     await priceHistoryWriter.flush();
     priceHistoryWriter.stop();
 
-    // 3. Stop snapshot writer
+    // 4. Stop snapshot writer
     snapshotWriter.stop();
 
-    // 4. Stop gamma poller
+    // 5. Stop gamma poller
     gammaPoller.stop();
 
-    // 5. Stop partition manager
+    // 6. Stop partition manager
     partitionManager.stop();
 
-    // 6. Close DB
+    // 7. Close DB
     await closeDb();
 
     logger.info("Pipeline: shutdown complete");

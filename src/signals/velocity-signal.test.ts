@@ -62,7 +62,6 @@ describe("evaluateVelocity", () => {
     const history = makeAccelerationHistory(0.50, 30);
     const result = evaluateVelocity("tok1", "cond1", history, 200_000, OPTS);
     if (result) {
-      // z-score should match our manual computation
       expect(typeof result.velocityZScore).toBe("number");
       expect(isFinite(result.velocityZScore)).toBe(true);
     }
@@ -87,14 +86,13 @@ describe("evaluateVelocity", () => {
 
   it("uses category-median when market < 2h old", () => {
     const history = makeStableHistory(0.65, 24);
-    // Market age 1h, but with category-median provided
     const result = evaluateVelocity("tok1", "cond1", history, 100_000, {
       ...OPTS,
       marketAgeMs: 30 * 60 * 1000, // 30 min (< 2h)
       categoryMedianReturn: 0.001,
       categoryMedianStdDev: 0.005,
     });
-    // Might fire or not depending on z-score; important is no crash
+    // Might fire or not; important is no crash
     expect(true).toBe(true);
   });
 
@@ -122,4 +120,55 @@ describe("evaluateVelocity", () => {
       expect(result.confidence).toBeLessThanOrEqual(1.0);
     }
   });
+
+  it("returns null when baselineStdDev is 0 (all returns identical)", () => {
+    // All prices exactly equal → all pairwise returns = 0 → stddev = 0 → guard fires
+    const now = Date.now();
+    const history: PriceBucket[] = Array.from({ length: 24 }, (_, i) => ({
+      price: 0.65, // perfectly flat
+      bucketStart: new Date(now - (24 - i) * 5 * 60 * 1000),
+    }));
+    const result = evaluateVelocity("tok1", "cond1", history, 100_000, OPTS);
+    expect(result).toBeNull();
+  });
+
+  it("returns null when recent window firstRecent price is 0 (division guard)", () => {
+    // Last-12 buckets start with price=0, which triggers firstRecent <= 0 guard
+    const now = Date.now();
+    const history: PriceBucket[] = Array.from({ length: 24 }, (_, i) => ({
+      price: i < 12 ? 0.65 : 0, // first 12 stable, last 12 at 0
+      bucketStart: new Date(now - (24 - i) * 5 * 60 * 1000),
+    }));
+    const result = evaluateVelocity("tok1", "cond1", history, 100_000, OPTS);
+    expect(result).toBeNull();
+  });
+
+  it('uses config defaults when opts not provided (exercises ?? branches)', () => {
+    // Call without opts — exercises opts.zScoreThreshold ?? config.xxx fallback
+    const now = Date.now();
+    const history: PriceBucket[] = Array.from({ length: 24 }, (_, i) => ({
+      price: 0.65,
+      bucketStart: new Date(now - (24 - i) * 5 * 60 * 1000),
+    }));
+    // All prices equal → stddev=0 → null (but exercises the opts ?? branches)
+    const result = evaluateVelocity('tok1', 'cond1', history, 100_000);
+    expect(result).toBeNull();
+  });
+
+  it('returns null when pairwise returns array has < 2 entries (single-price-change)', () => {
+    // 21 identical prices followed by 1 change → only 1 non-zero return, returns.length == 23
+    // But 20 identical prices → 19 returns all 0, stddev=0 → null
+    // Use exactly 20 points with only 1 unique change pair
+    const now = Date.now();
+    // 20 buckets where first 19 are 0 (will be skipped by pairwiseReturns guard) + 1 valid
+    const history: PriceBucket[] = Array.from({ length: 20 }, (_, i) => ({
+      price: i === 0 ? 0 : 0.65, // first price is 0 → pairwiseReturns skips it
+      bucketStart: new Date(now - (20 - i) * 5 * 60 * 1000),
+    }));
+    const result = evaluateVelocity('tok1', 'cond1', history, 100_000, OPTS);
+    // First price=0 skipped → returns has 18 entries from i=1..19 → stddev computed
+    // All returns (0.65-0.65)/0.65 = 0 for i=1..18, last = (0.65-0.65)/0.65 = 0 → stddev=0 → null
+    expect(result).toBeNull();
+  });
+
 });

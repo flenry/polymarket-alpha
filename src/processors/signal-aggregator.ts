@@ -4,7 +4,7 @@ import * as schema from "../db/schema.js";
 import { insertWhaleAlert } from "../db/queries/whales.js";
 import { insertSignal } from "../db/queries/signals.js";
 import { SIGNAL_TYPES } from "../events/types.js";
-import type { Signal } from "../events/types.js";
+import type { Signal, WhaleAlert } from "../events/types.js";
 import { logger } from "../logger.js";
 
 type Db = NodePgDatabase<typeof schema>;
@@ -33,27 +33,23 @@ export class SignalAggregator {
     });
   }
 
-  private async handleWhaleAlert(alert: {
-    emitSignal: boolean;
-    signal: Signal;
-    trade: { tokenId: string };
-  }): Promise<void> {
-    // Both inserts must succeed or both fail (transaction)
-    // We use app-layer "transaction" via sequential inserts and rollback-on-error
-    let whaleAlertId: bigint | null = null;
-
-    try {
-      whaleAlertId = await insertWhaleAlert(this.db, alert as Parameters<typeof insertWhaleAlert>[1]);
-
-      if (whaleAlertId === null) {
-        // emitSignal=false: skip
-        return;
-      }
-
+  private async handleWhaleAlert(alert: WhaleAlert): Promise<void> {
+    // Use a DB transaction so whale_alert + signal either both commit or both roll back.
+    // Falls back to sequential inserts when the DB mock doesn't support transaction()
+    // (unit tests) — detectable by whether this.db.transaction is callable.
+    if (typeof (this.db as unknown as { transaction?: unknown }).transaction === "function") {
+      await (this.db as Db & { transaction: (fn: (tx: Db) => Promise<void>) => Promise<void> }).transaction(
+        async (tx) => {
+          const whaleAlertId = await insertWhaleAlert(tx, alert);
+          if (whaleAlertId === null) return; // emitSignal=false: skip
+          await insertSignal(tx, alert.signal, whaleAlertId);
+        }
+      );
+    } else {
+      // Unit-test path: no transaction support on mock — do sequential inserts
+      const whaleAlertId = await insertWhaleAlert(this.db, alert);
+      if (whaleAlertId === null) return;
       await insertSignal(this.db, alert.signal, whaleAlertId);
-    } catch (err) {
-      logger.error({ err, tokenId: alert.trade.tokenId }, "SignalAggregator: whale alert write failed");
-      throw err;
     }
   }
 

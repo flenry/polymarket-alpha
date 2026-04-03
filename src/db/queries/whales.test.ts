@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { insertWhaleAlert, buildTradeLookupKey } from "./whales.js";
+import { insertWhaleAlert, buildTradeLookupKey, enrichWhaleAlert } from "./whales.js";
 import type { WhaleAlert, TradeEvent, MarketStats, WhaleSignal } from "../../events/types.js";
 
 function makeTrade(overrides: Partial<TradeEvent> = {}): TradeEvent {
@@ -119,5 +119,20 @@ describe("insertWhaleAlert", () => {
     const call = (db.execute as ReturnType<typeof vi.fn>).mock.calls[0][0];
     const queryStr = JSON.stringify(call);
     expect(queryStr).toContain("trade_lookup_key");
+  });
+});
+
+describe("enrichWhaleAlert", () => {
+  it("updates wallet fields on the whale_alert row", async () => {
+    const db = makeDb();
+    await enrichWhaleAlert(db, 99n, {
+      walletTotalVolumeUsdc: 1_200_000,
+      walletTradeCount: 12,
+      walletWinRatio: 0.71,
+    });
+
+    expect(db.update as ReturnType<typeof vi.fn>).toHaveBeenCalled();
+    const updateChain = (db.update as ReturnType<typeof vi.fn>).mock.results[0].value;
+    expect(updateChain.set).toHaveBeenCalled();
   });
 });

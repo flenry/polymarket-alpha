@@ -74,3 +74,37 @@ describe("insertSignal", () => {
     expect(result).toBeNull();
   });
 });
+
+
+import { getRecentSignals } from "./signals.js";
+
+describe("getRecentSignals", () => {
+  it("queries with a time filter when limitHours=2", async () => {
+    const limit = vi.fn().mockResolvedValue([]);
+    const orderBy = vi.fn().mockReturnValue({ limit });
+    const where = vi.fn().mockReturnValue({ orderBy });
+    const from = vi.fn().mockReturnValue({ where });
+    const select = vi.fn().mockReturnValue({ from });
+    const db = { execute: vi.fn(), select } as unknown as Parameters<typeof insertSignal>[0];
+
+    const result = await getRecentSignals(db, 2);
+
+    expect(result).toEqual([]);
+    expect(select).toHaveBeenCalled();
+    // where() called means the time filter was applied
+    expect(where).toHaveBeenCalled();
+  });
+
+  it("defaults to 1-hour window when limitHours not specified", async () => {
+    const limit = vi.fn().mockResolvedValue([]);
+    const orderBy = vi.fn().mockReturnValue({ limit });
+    const where = vi.fn().mockReturnValue({ orderBy });
+    const from = vi.fn().mockReturnValue({ where });
+    const select = vi.fn().mockReturnValue({ from });
+    const db = { execute: vi.fn(), select } as unknown as Parameters<typeof insertSignal>[0];
+
+    await getRecentSignals(db);
+
+    expect(where).toHaveBeenCalled();
+  });
+});
