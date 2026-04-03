@@ -152,6 +152,49 @@ describe("PriceHistoryWriter", () => {
     writer.stop();
   });
 
+  it("best_bid_ask with no timestamp: uses Date.now() fallback (lines 51, 59 ?? branch)", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb();
+    const writer = new PriceHistoryWriter(bus, db, 100, 500);
+    writer.start();
+
+    // No timestamp field — exercises evt.timestamp ?? Date.now() fallback
+    bus.emit("best_bid_ask", {
+      type: "best_bid_ask",
+      tokenId: "tok1",
+      bid: 0.64,
+      ask: 0.66,
+      // timestamp intentionally omitted
+    } as unknown as { type: "best_bid_ask"; tokenId: string; bid: number; ask: number; timestamp: number });
+
+    await writer.flush();
+
+    expect((db.execute as ReturnType<typeof vi.fn>).mock.calls.length).toBe(2);
+    writer.stop();
+  });
+
+  it("flush() handles null side (line 98 r.side ?? null branch)", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb();
+    const writer = new PriceHistoryWriter(bus, db, 100, 500);
+    writer.start();
+
+    // Emit a last_trade_price with no side to get a record with side=undefined
+    bus.emit("last_trade_price", {
+      type: "last_trade_price",
+      tokenId: "tok1",
+      price: 0.65,
+      side: undefined as unknown as "BUY",
+      timestamp: Date.now(),
+    });
+
+    await writer.flush();
+
+    const call = (db.execute as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(call).toBeDefined(); // no throw
+    writer.stop();
+  });
+
   it("setInterval catch branch: flush error logged when timer fires and flush rejects (line 67)", async () => {
     vi.useFakeTimers();
     const bus = new TypedEventBus();
