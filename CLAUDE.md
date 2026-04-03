@@ -9,6 +9,7 @@ Quick-reference context for returning sessions. Read this first on every visit.
 Real-time Polymarket data pipeline. Ingests trade events and order book data, persists to PostgreSQL, and runs a signal engine that surfaces alpha opportunities — specifically whale trades caught before price adjusts.
 
 **Phase 1 MVP is complete and fully tested.** 256 tests passing, 92%+ coverage.
+**Phase 2 is complete and fully tested.** 357 tests passing, 97.33% stmt / 95.91% branch coverage.
 
 ---
 
@@ -115,7 +116,7 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 - **Logging**: Pino structured JSON. `LOG_LEVEL` env var controls verbosity.
 - **Tests**: all unit tests use mocked DB clients and HTTP/WS — no real network calls. Fixtures live in `tests/fixtures/`.
 - **Test colocatio**: processor/signal/source tests live next to source files (`src/**/*.test.ts`). Integration-style tests live in `tests/`.
-- **No Phase 2 code yet**: `ClobWsPool` stub exists but is not wired into the pipeline.
+- **Phase 2 fully wired**: `ClobWsPool`, `WsBookImbalanceEvaluator`, `WebhookEmitter`, and `WalletEnricher` are all live in `pipeline.ts`.
 
 ---
 
@@ -130,7 +131,7 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 - ✅ Pushed to `main` on `git@github.com:flenry/polymarket-alpha.git`
 
 **Phase 2 complete (branch: `feat/phase-2`).**
-- ✅ All 303 tests passing (34 test files, +47 new tests)
+- ✅ All 357 tests passing (34 test files, +101 tests over Phase 1)
 - ✅ `ClobWsPool` — url option, jitter reconnect, `market_resolved` → `markMarketClosed` DB update
 - ✅ `WsBookImbalanceEvaluator` — WS-path evaluator with spec-correct confidence formula, snapshot insert on every evaluate
 - ✅ `WebhookEmitter` — Discord + Slack webhooks, 5 req/s token-bucket, 429 retry, network error swallow
@@ -188,8 +189,8 @@ docker compose up -d
 ## How to Test
 
 ```bash
-pnpm test              # unit tests (all 256, 30 test files)
-pnpm test:coverage     # with v8 coverage report (~92%)
+pnpm test              # unit tests (all 357, 34 test files)
+pnpm test:coverage     # with v8 coverage report (97.33% stmt, 95.91% branch)
 pnpm typecheck         # tsc --noEmit
 pnpm db:generate       # generate drizzle migrations (idempotent after init)
 pnpm db:migrate        # apply all tracked migrations (0000 + 0002)
@@ -228,4 +229,4 @@ pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql direct
 
 ---
 
-Last updated: 2026-04-03 (Phase 2 complete)
+Last updated: 2026-04-03 (Phase 2 final — 357 tests, 97.33% coverage)
