@@ -130,4 +130,47 @@ describe("PriceHistoryWriter", () => {
 
     writer.stop();
   });
+
+  it("maybeFlush catch branch: flush error logged when batchSize hit and flush rejects (line 83)", async () => {
+    const bus = new TypedEventBus();
+    // DB that always rejects
+    const executeFn = vi.fn().mockRejectedValue(new Error("DB error"));
+    const db = { execute: executeFn } as unknown as ConstructorParameters<typeof PriceHistoryWriter>[1];
+    // batchSize=2 — third event triggers maybeFlush
+    const writer = new PriceHistoryWriter(bus, db, 2, 60_000);
+    writer.start();
+
+    bus.emit("last_trade_price", { type: "last_trade_price", tokenId: "tok1", price: 0.65, side: "BUY", timestamp: Date.now() });
+    bus.emit("last_trade_price", { type: "last_trade_price", tokenId: "tok2", price: 0.66, side: "BUY", timestamp: Date.now() });
+
+    // Allow the async .catch() to run
+    await new Promise((r) => setTimeout(r, 50));
+
+    // execute was called (the error path in flush was hit via maybeFlush)
+    expect(executeFn).toHaveBeenCalled();
+
+    writer.stop();
+  });
+
+  it("setInterval catch branch: flush error logged when timer fires and flush rejects (line 67)", async () => {
+    vi.useFakeTimers();
+    const bus = new TypedEventBus();
+    const executeFn = vi.fn().mockRejectedValue(new Error("DB error"));
+    const db = { execute: executeFn } as unknown as ConstructorParameters<typeof PriceHistoryWriter>[1];
+    const writer = new PriceHistoryWriter(bus, db, 100, 500);
+    writer.start();
+
+    // Put an item in the batch without triggering batchSize flush
+    bus.emit("last_trade_price", { type: "last_trade_price", tokenId: "tok1", price: 0.65, side: "BUY", timestamp: Date.now() });
+    expect(writer.getBatchSize()).toBe(1);
+
+    // Advance timer to trigger setInterval flush (which rejects via executeFn)
+    await vi.advanceTimersByTimeAsync(500);
+
+    // execute was called (the .catch error path in setInterval was hit)
+    expect(executeFn).toHaveBeenCalled();
+
+    vi.useRealTimers();
+    writer.stop();
+  });
 });
