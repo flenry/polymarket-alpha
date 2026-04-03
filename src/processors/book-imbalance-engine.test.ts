@@ -150,4 +150,82 @@ describe("OrderBookImbalanceEngine", () => {
 
     expect(signal!.bidDepthUsdc).toBeCloseTo(expectedBidDepth, 2);
   });
+
+  it("liquidity guard: returns null when liquidityUsdc < minLiquidityUsdc", () => {
+    const bus = new TypedEventBus();
+    const signals: unknown[] = [];
+    bus.on("signal", (s) => signals.push(s));
+
+    const engine = new OrderBookImbalanceEngine(bus, 3.0);
+    const book = makeBook(400, 30); // ratio >> 3 → would normally fire BULLISH
+
+    // Provide low liquidity stats — engine should skip
+    const result = engine.evaluate(book, { liquidityUsdc: 10_000 }); // < minLiquidityUsdc (50k)
+
+    expect(result).toBeNull();
+    expect(signals).toHaveLength(0);
+  });
+
+  it("mid is 0 when book has no bids or asks", () => {
+    const bus = new TypedEventBus();
+    const engine = new OrderBookImbalanceEngine(bus, 3.0);
+
+    // Book with bids but no asks — askDepth=0 → returns null (askDepthUsdc===0 guard)
+    const emptyAskBook: OrderBook = {
+      tokenId: "tok1",
+      conditionId: "cond1",
+      bids: [{ price: 0.65, size: 100 }],
+      asks: [],
+      timestamp: Date.now(),
+      hash: "abc",
+      capturedAt: new Date(),
+    };
+    const result = engine.evaluate(emptyAskBook);
+    expect(result).toBeNull(); // askDepth=0 → early return
+  });
+
+  it("priceAtSignal is 0 when bids array is empty (mid fallback)", () => {
+    // Imbalance with no bids — ratio=0 → bearish if below threshold
+    const bus = new TypedEventBus();
+    const signals: unknown[] = [];
+    bus.on("signal", (s) => signals.push(s));
+
+    const engine = new OrderBookImbalanceEngine(bus, 3.0);
+
+    // asks only, no bids → ratio=0 → bearish
+    const noBidBook: OrderBook = {
+      tokenId: "tok2",
+      conditionId: "cond2",
+      bids: [],
+      asks: Array.from({ length: 10 }, (_, i) => ({ price: 0.66 + i * 0.01, size: 100 })),
+      timestamp: Date.now(),
+      hash: "abc",
+      capturedAt: new Date(),
+    };
+
+    const result = engine.evaluate(noBidBook);
+    if (result) {
+      expect(result.priceAtSignal).toBe(0); // mid = 0 when bids is empty
+    }
+  });
+
+  it("resetDebounce clears debounce state for a token", () => {
+    const bus = new TypedEventBus();
+    const signals: unknown[] = [];
+    bus.on("signal", (s) => signals.push(s));
+
+    const engine = new OrderBookImbalanceEngine(bus, 3.0);
+    const book = makeBook(400, 30);
+
+    engine.evaluate(book); // fires
+    expect(signals).toHaveLength(1);
+
+    engine.evaluate(book); // debounced
+    expect(signals).toHaveLength(1);
+
+    engine.resetDebounce("tok1");
+
+    engine.evaluate(book); // fires again after reset
+    expect(signals).toHaveLength(2);
+  });
 });
