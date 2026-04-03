@@ -83,4 +83,11 @@ describe("TypedEventBus", () => {
     expect(tradeFn).toHaveBeenCalledTimes(1);
     expect(signalFn).not.toHaveBeenCalled();
   });
+
+  it("setMaxListeners() does not throw", () => {
+    const bus = new TypedEventBus();
+    expect(() => bus.setMaxListeners(50)).not.toThrow();
+    // Verify it returns `this` for chaining
+    expect(bus.setMaxListeners(10)).toBe(bus);
+  });
 });
