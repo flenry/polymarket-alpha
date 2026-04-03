@@ -29,7 +29,7 @@ class MockWs extends EventEmitter {
 // WebSocket.OPEN constant
 (MockWs as unknown as { OPEN: number }).OPEN = 1;
 
-function makePool(opts: Parameters<typeof ClobWsPool>[0] = {}) {
+function makePool(opts: ConstructorParameters<typeof ClobWsPool>[0] = {}) {
   MockWs.instances = [];
   return new ClobWsPool({
     shardSize: 150,

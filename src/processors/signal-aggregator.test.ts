@@ -67,11 +67,17 @@ function makeAlert(emitSignal = true): WhaleAlert {
   };
 }
 
+type MockDb = {
+  execute: ReturnType<typeof vi.fn>;
+  insert: ReturnType<typeof vi.fn>;
+  update: ReturnType<typeof vi.fn>;
+};
+
 function makeDb(
   whaleAlertId: bigint | null = 99n,
-  signalId: { id: bigint } | null = { id: 1n }
+  _signalId: { id: bigint } | null = { id: 1n }
 ) {
-  return {
+  const m: MockDb = {
     execute: vi.fn().mockResolvedValue({ rows: [{ id: whaleAlertId ? String(whaleAlertId) : "" }] }),
     insert: vi.fn().mockReturnValue({
       values: vi.fn().mockReturnValue({
@@ -83,7 +89,8 @@ function makeDb(
         where: vi.fn().mockResolvedValue(undefined),
       }),
     }),
-  } as unknown as Parameters<typeof SignalAggregator>[1];
+  };
+  return m as unknown as ConstructorParameters<typeof SignalAggregator>[1];
 }
 
 describe("SignalAggregator", () => {

@@ -34,7 +34,7 @@ describe("TypedEventBus", () => {
     bus.emit("trade", trade);
 
     expect(received).not.toBeNull();
-    expect((received as TradeEvent).tokenId).toBe("tok-test");
+    expect((received as unknown as TradeEvent).tokenId).toBe("tok-test");
   });
 
   it("multiple handlers on same event all called", () => {

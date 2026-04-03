@@ -13,7 +13,7 @@ function makeDb() {
   const from = vi.fn().mockReturnValue({ where, orderBy });
   const select = vi.fn().mockReturnValue({ from });
 
-  return { insert, select } as unknown as Parameters<typeof GammaPoller>[0]["db"];
+  return { insert, select } as unknown as ConstructorParameters<typeof GammaPoller>[0]["db"];
 }
 
 function makeNegRiskMarket(tokenId: string) {

@@ -90,7 +90,7 @@ describe("ClobRestClient.batchGetBooks", () => {
     const books = await client.batchGetBooks(["tok1"]);
 
     expect(books).toHaveLength(1);
-    expect((books[0] as Record<string, unknown>).unknownField).toBeUndefined();
+    expect((books[0] as unknown as Record<string, unknown>).unknownField).toBeUndefined();
   });
 
   it("bids sorted descending, asks sorted ascending", async () => {

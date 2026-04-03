@@ -21,8 +21,17 @@ function makeBook(tokenId: string): OrderBook {
   };
 }
 
+type MockDb = {
+  execute: ReturnType<typeof vi.fn>;
+  select: ReturnType<typeof vi.fn>;
+};
+
+type MockClobClient = {
+  batchGetBooks: ReturnType<typeof vi.fn>;
+};
+
 function makeDb() {
-  return {
+  const m: MockDb = {
     execute: vi.fn().mockResolvedValue({ rows: [] }),
     select: vi.fn().mockReturnValue({
       from: vi.fn().mockReturnValue({
@@ -33,13 +42,15 @@ function makeDb() {
         }),
       }),
     }),
-  } as unknown as Parameters<typeof SnapshotWriter>[0];
+  };
+  return m as unknown as ConstructorParameters<typeof SnapshotWriter>[0];
 }
 
 function makeClobClient(books: OrderBook[]) {
-  return {
+  const m: MockClobClient = {
     batchGetBooks: vi.fn().mockResolvedValue(books),
-  } as unknown as Parameters<typeof SnapshotWriter>[1];
+  };
+  return m as unknown as ConstructorParameters<typeof SnapshotWriter>[1];
 }
 
 describe("SnapshotWriter", () => {

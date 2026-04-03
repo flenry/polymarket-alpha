@@ -2,10 +2,11 @@ import { describe, it, expect, vi } from "vitest";
 import { PriceHistoryWriter } from "./price-history-writer.js";
 import { TypedEventBus } from "../events/bus.js";
 
+type MockDb = { execute: ReturnType<typeof vi.fn> };
+
 function makeDb() {
-  return {
-    execute: vi.fn().mockResolvedValue({ rows: [] }),
-  } as unknown as Parameters<typeof PriceHistoryWriter>[1];
+  const m: MockDb = { execute: vi.fn().mockResolvedValue({ rows: [] }) };
+  return m as unknown as ConstructorParameters<typeof PriceHistoryWriter>[1];
 }
 
 describe("PriceHistoryWriter", () => {
