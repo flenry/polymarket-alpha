@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { upsertMarketStats, getWatchlistedTokenIds, getNegRiskTokenIds, getMarketStats } from "./markets.js";
+import { upsertMarket, upsertMarketStats, getWatchlistedTokenIds, getNegRiskTokenIds, getMarketStats } from "./markets.js";
 
 function makeInsertDb() {
   const onConflictDoUpdate = vi.fn().mockResolvedValue(undefined);
@@ -127,5 +127,64 @@ describe("getMarketStats", () => {
     const db = makeSelectDb([]);
     const result = await getMarketStats(db, "tok-unknown");
     expect(result).toBeNull();
+  });
+});
+
+describe("upsertMarket — parseOutcome branches", () => {
+  type UpsertDbMock = { insert: ReturnType<typeof vi.fn>; _values: ReturnType<typeof vi.fn> };
+
+  function makeUpsertDb(): UpsertDbMock {
+    const onConflictDoUpdate = vi.fn().mockResolvedValue(undefined);
+    const values = vi.fn().mockReturnValue({ onConflictDoUpdate });
+    const insert = vi.fn().mockReturnValue({ values });
+    return { insert, _values: values };
+  }
+
+  function asDb(m: UpsertDbMock): ConstructorParameters<typeof import('../../sources/gamma-poller.js').GammaPoller>[0]["db"] {
+    return m as unknown as ConstructorParameters<typeof import('../../sources/gamma-poller.js').GammaPoller>[0]["db"];
+  }
+
+  const baseMarket = {
+    conditionId: "0xcond1",
+    negRisk: false,
+    watchlisted: true,
+    question: "Will X happen?",
+    active: true,
+    closed: false,
+  };
+
+  it("outcome is empty string when outcomes is null (null branch)", async () => {
+    const m = makeUpsertDb();
+    await upsertMarket(asDb(m), { ...baseMarket, tokenId: "tok1", outcomes: null });
+    const call = m._values.mock.calls[0][0];
+    expect(call.outcome).toBe("");
+  });
+
+  it("outcome is empty string when outcomes is undefined (undefined branch)", async () => {
+    const m = makeUpsertDb();
+    await upsertMarket(asDb(m), { ...baseMarket, tokenId: "tok1", outcomes: undefined });
+    const call = m._values.mock.calls[0][0];
+    expect(call.outcome).toBe("");
+  });
+
+  it("outcome is empty string when outcomes JSON is invalid (catch branch)", async () => {
+    const m = makeUpsertDb();
+    await upsertMarket(asDb(m), { ...baseMarket, tokenId: "tok1", outcomes: "not-valid-json{" });
+    const call = m._values.mock.calls[0][0];
+    expect(call.outcome).toBe("");
+  });
+
+  it("outcome is empty string when arr[index] is not a string (non-string branch)", async () => {
+    const m = makeUpsertDb();
+    await upsertMarket(asDb(m), { ...baseMarket, tokenId: "tok1", outcomes: "[42, 99]", outcomeIndex: 0 });
+    const call = m._values.mock.calls[0][0];
+    expect(call.outcome).toBe("");
+  });
+
+  it("outcome derived correctly when outcomes JSON is valid", async () => {
+    const m = makeUpsertDb();
+    await upsertMarket(asDb(m), { ...baseMarket, tokenId: "tok1", outcomes: '["Yes","No"]', outcomeIndex: 1 });
+    const call = m._values.mock.calls[0][0];
+    expect(call.outcome).toBe("No");
   });
 });
