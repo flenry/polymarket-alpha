@@ -1,0 +1,15 @@
+{
+  "asset": "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+  "conditionId": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+  "side": "BUY",
+  "size": 18500.5,
+  "price": 0.66,
+  "proxyWallet": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+  "transactionHash": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "timestamp": 1775218800,
+  "outcome": "Yes",
+  "slug": "fed-rate-cut-march-2026",
+  "eventSlug": "fed-decisions-2026",
+  "title": "Will the US Federal Reserve cut rates in March 2026?",
+  "pseudonym": "CryptoWhale42"
+}

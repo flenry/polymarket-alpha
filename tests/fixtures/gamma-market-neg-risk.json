@@ -1,0 +1,22 @@
+{
+  "conditionId": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+  "clobTokenIds": [
+    "neg_risk_token_1_abcdef123456789012345678901234567890123456789012345678901234",
+    "neg_risk_token_2_abcdef123456789012345678901234567890123456789012345678901234"
+  ],
+  "question": "Which country wins the 2026 FIFA World Cup?",
+  "slug": "fifa-world-cup-2026-winner",
+  "eventSlug": "fifa-world-cup-2026",
+  "category": "Sports",
+  "negRisk": true,
+  "bestBid": 0.12,
+  "bestAsk": 0.14,
+  "spread": 0.02,
+  "lastTradePrice": 0.13,
+  "volume": 5820000,
+  "volume24hr": 482000,
+  "liquidity": 1200000,
+  "active": true,
+  "closed": false,
+  "acceptingOrders": true
+}

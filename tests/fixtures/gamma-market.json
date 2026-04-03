@@ -1,0 +1,21 @@
+{
+  "conditionId": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12",
+  "clobTokenIds": ["71321045679252212594626385532706912750332728571942532289631379312455583992563"],
+  "question": "Will the US Federal Reserve cut rates in March 2026?",
+  "slug": "fed-rate-cut-march-2026",
+  "eventSlug": "fed-decisions-2026",
+  "category": "Economics",
+  "negRisk": false,
+  "bestBid": 0.65,
+  "bestAsk": 0.67,
+  "spread": 0.02,
+  "lastTradePrice": 0.66,
+  "volume": 1250000,
+  "volume24hr": 89500,
+  "volume1wk": 420000,
+  "liquidity": 320000,
+  "oneDayPriceChange": 0.03,
+  "active": true,
+  "closed": false,
+  "acceptingOrders": true
+}
