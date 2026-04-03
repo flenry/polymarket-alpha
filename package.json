@@ -13,7 +13,8 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "typecheck:all": "tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "drizzle-orm": "^0.40.0",
