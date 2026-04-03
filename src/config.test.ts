@@ -33,10 +33,8 @@ describe("config", () => {
     expect(typeof config.snapshotIntervalMs).toBe("number");
   });
 
-  it("databaseUrl is accessible", async () => {
-    process.env.DATABASE_URL = "postgres://localhost:5432/test_db";
+  it("databaseUrl is a string (possibly empty if not set)", async () => {
     const { config } = await import("./config.js");
-    // Config is already initialized from module load, just verify type
     expect(typeof config.databaseUrl).toBe("string");
   });
 

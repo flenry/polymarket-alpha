@@ -7,6 +7,9 @@ let _pool: pg.Pool | null = null;
 
 function getPool(): pg.Pool {
   if (!_pool) {
+    if (!config.databaseUrl) {
+      throw new Error("Required environment variable DATABASE_URL is not set");
+    }
     _pool = new pg.Pool({ connectionString: config.databaseUrl });
   }
   return _pool;

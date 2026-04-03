@@ -15,9 +15,7 @@ function envNumber(key: string, defaultVal: number): number {
 }
 
 export const config = Object.freeze({
-  databaseUrl: process.env.DATABASE_URL ?? ((): string => {
-    throw new Error("Required environment variable DATABASE_URL is not set");
-  })(),
+  databaseUrl: process.env.DATABASE_URL ?? "",
   absoluteMinUsdc: envNumber("WHALE_ABSOLUTE_MIN_USDC", 10_000),
   sigmaThreshold: envNumber("WHALE_SIGMA_THRESHOLD", 3.0),
   pctVolumeThreshold: envNumber("WHALE_PCT_VOLUME_THRESHOLD", 0.02),
