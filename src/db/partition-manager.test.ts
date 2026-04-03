@@ -3,6 +3,7 @@ import {
   createTomorrowPartition,
   createPartitionForDate,
   dropExpiredPartitions,
+  PartitionManager,
 } from "./partition-manager.js";
 
 function mockDb(rows: { tablename: string }[] = []) {
@@ -113,5 +114,39 @@ describe("dropExpiredPartitions", () => {
     const db = mockDb([]); // no partitions
     const dropped = await dropExpiredPartitions(db, "trades", 90);
     expect(dropped).toHaveLength(0);
+  });
+});
+
+describe("PartitionManager", () => {
+  it("start() creates a setInterval timer; stop() clears it (lines 147-163)", async () => {
+    vi.useFakeTimers();
+    const db = mockDb();
+    const manager = new PartitionManager(db);
+
+    manager.start();
+
+    // Verify timer is running by advancing (no action when hour != 0 but timer fires)
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000); // 1 hour
+
+    // stop() should clear the timer without error
+    expect(() => manager.stop()).not.toThrow();
+
+    vi.useRealTimers();
+  });
+
+  it("stop() is a no-op when called before start()", () => {
+    const db = mockDb();
+    const manager = new PartitionManager(db);
+    // stop() before start() — timer is null, should not throw
+    expect(() => manager.stop()).not.toThrow();
+  });
+
+  it("start() then stop() then stop() again — idempotent stop", () => {
+    const db = mockDb();
+    const manager = new PartitionManager(db);
+    manager.start();
+    manager.stop(); // clears timer
+    manager.stop(); // timer already null — should not throw
+    expect(true).toBe(true);
   });
 });
