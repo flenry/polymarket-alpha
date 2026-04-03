@@ -117,6 +117,15 @@ describe("dropExpiredPartitions", () => {
   });
 });
 
+describe("validateTable (via createTomorrowPartition)", () => {
+  it("throws for unknown partition table (line 22-23)", async () => {
+    const db = mockDb();
+    await expect(
+      createTomorrowPartition(db, "unknown_table" as "trades")
+    ).rejects.toThrow("Unknown partition table: unknown_table");
+  });
+});
+
 describe("PartitionManager", () => {
   it("ensureCurrentPartitions() calls createPartitionForDate + createTomorrowPartition for both tables", async () => {
     const db = mockDb();
