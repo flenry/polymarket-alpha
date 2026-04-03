@@ -379,6 +379,35 @@ describe("WalletEnricher", () => {
     expect(enrichWhaleAlert).not.toHaveBeenCalled();
   });
 
+  it("token bucket: when bucket empty, acquire() waits for refill before resolving", async () => {
+    // Use rps=1 (one token per 1000ms). Fire 2 concurrent _enrich calls.
+    // The second must wait for the token bucket to refill (≥1s gap).
+    const trades = makeTrades([{ size: 100, price: 0.5, timestamp: 1_700_000_000 }]);
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: () => Promise.resolve(trades),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const db = makeDb();
+    // rps=1: one token available immediately, second must wait ~1000ms
+    const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 1, recencyHours: 24 });
+
+    const start = Date.now();
+    // Fire two concurrent _enrich calls (each needs one bucket token)
+    await Promise.all([
+      enricher._enrich(makeAlert("0xwallet1"), 1n),
+      enricher._enrich(makeAlert("0xwallet2"), 2n),
+    ]);
+    const elapsed = Date.now() - start;
+
+    // First call takes token immediately; second must wait for refill (~1000ms)
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(elapsed).toBeGreaterThanOrEqual(900); // at least one 1s refill cycle
+  });
+
   it("enrich() never throws even if _enrich rejects", async () => {
     const db = makeDb();
     const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });

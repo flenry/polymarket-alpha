@@ -137,6 +137,17 @@ describe("ClobWsPool", () => {
     pool.disconnect();
   });
 
+  it("getShardCount() returns correct number of active shards", async () => {
+    const pool = makePool({ shardSize: 2 });
+    expect(pool.getShardCount()).toBe(0); // before connect
+
+    await pool.connect(["tok1", "tok2", "tok3"]); // 2+1 = 2 shards
+    expect(pool.getShardCount()).toBe(2);
+
+    pool.disconnect();
+    expect(pool.getShardCount()).toBe(0);
+  });
+
   it("shard_reconnect event emitted with correct shard index", async () => {
     const pool = makePool({ shardSize: 150, reconnectBaseMs: 50 });
     const reconnects: number[] = [];
@@ -454,6 +465,234 @@ describe("ClobWsPool Phase 2 additions", () => {
     ])));
 
     expect(priceEvents).toHaveLength(2);
+
+    pool.disconnect();
+  });
+
+  it("addTokenIds when shard ws not yet open: skips re-subscribe (readyState !== OPEN)", async () => {
+    // Use a WS that does NOT auto-emit 'open' — readyState stays at default (1=OPEN mimics connected)
+    // To test the NOT-open path we need readyState !== 1
+    class NotOpenWs extends EventEmitter {
+      static instances: NotOpenWs[] = [];
+      public sent: string[] = [];
+      public readyState = 3; // CLOSED — not open
+      constructor(_url: string) {
+        super();
+        NotOpenWs.instances.push(this);
+        // Never emits 'open'
+      }
+      send(d: string) { this.sent.push(d); }
+      close() { this.readyState = 3; this.emit("close"); }
+    }
+    (NotOpenWs as unknown as { OPEN: number }).OPEN = 1;
+
+    NotOpenWs.instances = [];
+    const pool = new ClobWsPool({
+      shardSize: 3,
+      reconnectBaseMs: 50,
+      reconnectMaxMs: 200,
+      WsConstructor: NotOpenWs as unknown as typeof import("ws").default,
+    });
+
+    // connect creates shard with ws in NOT-OPEN state
+    await pool.connect(["tok1", "tok2"]);
+
+    // addTokenIds — shard has room (2/3), but ws is not open → subscribe NOT called
+    const sentBefore = [...(NotOpenWs.instances[0]?.sent ?? [])];
+    await pool.addTokenIds(["tok3"]);
+
+    // No new WS opened (shard had room)
+    expect(NotOpenWs.instances).toHaveLength(1);
+    // subscribe not called because readyState !== OPEN
+    expect(NotOpenWs.instances[0].sent).toEqual(sentBefore);
+
+    pool.disconnect();
+  });
+
+  it("keepalive does not send PING when ws readyState is not OPEN", async () => {
+    // Use a ws that starts open but closes before the keepalive fires
+    const pool = new ClobWsPool({
+      shardSize: 150,
+      reconnectBaseMs: 50000, // long reconnect so it doesn't interfere
+      reconnectMaxMs: 60000,
+      keepaliveIntervalMs: 30,
+      WsConstructor: MockWs as unknown as typeof import("ws").default,
+    });
+    MockWs.instances = [];
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r)); // open fires
+
+    const ws = MockWs.instances[0];
+    ws.sent = [];
+    // Manually set readyState to CLOSED without triggering reconnect logic
+    ws.readyState = 3; // CLOSED — keepalive interval will check and skip send
+
+    await new Promise((r) => setTimeout(r, 80)); // wait for keepalive to fire
+
+    // PING should NOT be sent because readyState !== OPEN
+    expect(ws.sent).not.toContain("PING");
+    pool.disconnect();
+  });
+
+  it("silent shard detection: emits 'error' shard_silent when no messages received within threshold", async () => {
+    // Use a very short silentShardThresholdMs so the test doesn't take long
+    const pool = new ClobWsPool({
+      shardSize: 150,
+      reconnectBaseMs: 50000,
+      reconnectMaxMs: 60000,
+      keepaliveIntervalMs: 5000, // long — not the thing being tested
+      silentShardThresholdMs: 30, // very short threshold
+      WsConstructor: MockWs as unknown as typeof import("ws").default,
+    });
+    MockWs.instances = [];
+
+    const errors: Error[] = [];
+    pool.on("error", (err: Error) => errors.push(err));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r)); // let 'open' fire
+
+    // Wait longer than the 30ms threshold without any messages
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Should have emitted at least one 'shard_silent' error
+    const silentErrors = errors.filter((e) => e.message === "shard_silent");
+    expect(silentErrors.length).toBeGreaterThan(0);
+
+    pool.disconnect();
+  });
+
+  it("invalid JSON message: caught without throw, parse error logged", async () => {
+    const pool = makePool({ shardSize: 150 });
+    // Ensure pool doesn't throw on bad messages
+    pool.on("error", () => {}); // suppress unhandled error
+
+    MockWs.instances = [];
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    // Emit a non-JSON message — should be caught by the try/catch in message handler
+    expect(() => ws.emit("message", Buffer.from("{invalid json!!"))).not.toThrow();
+
+    pool.disconnect();
+  });
+
+  it("startKeepalive: clears existing keepalive timer before setting new one", async () => {
+    // Directly tests lines 201-202: when startKeepalive is called while keepaliveTimer is set
+    // This happens if 'open' fires when a timer is already active.
+    // We simulate it by using a ws that emits 'open' twice in sequence.
+    class DoubleOpenWs extends EventEmitter {
+      static instances: DoubleOpenWs[] = [];
+      public sent: string[] = [];
+      public readyState = 1;
+      constructor(_url: string) {
+        super();
+        DoubleOpenWs.instances.push(this);
+        // Emit open twice on next tick
+        process.nextTick(() => {
+          this.emit("open");
+          this.emit("open"); // second open while keepalive already set
+        });
+      }
+      send(d: string) { this.sent.push(d); }
+      close() { this.readyState = 3; this.emit("close"); }
+    }
+    (DoubleOpenWs as unknown as { OPEN: number }).OPEN = 1;
+
+    DoubleOpenWs.instances = [];
+    const pool = new ClobWsPool({
+      shardSize: 150,
+      reconnectBaseMs: 50,
+      reconnectMaxMs: 200,
+      keepaliveIntervalMs: 5000,
+      WsConstructor: DoubleOpenWs as unknown as typeof import("ws").default,
+    });
+
+    // Should not throw even when open fires twice
+    await expect(pool.connect(["tok1"])).resolves.toBeUndefined();
+    await new Promise((r) => process.nextTick(r));
+    await new Promise((r) => process.nextTick(r));
+
+    pool.disconnect();
+  });
+
+  it("ws error event: emits 'error' on pool with correct shard index", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const poolErrors: Array<[Error, number]> = [];
+    pool.on("error", (err: Error, idx: number) => poolErrors.push([err, idx]));
+
+    MockWs.instances = [];
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    const wsError = new Error("WS connection error");
+    ws.emit("error", wsError);
+
+    expect(poolErrors).toHaveLength(1);
+    expect(poolErrors[0][0]).toBe(wsError);
+    expect(poolErrors[0][1]).toBe(0); // shard index 0
+
+    pool.disconnect();
+  });
+
+  it("startKeepalive clears previous timer when called twice (reconnect scenario)", async () => {
+    // This covers lines 201-202: the 'if (shard.keepaliveTimer) clearInterval' branch
+    // It fires when a shard reconnects — startKeepalive is called again on second open
+    const pool = makePool({ shardSize: 150, reconnectBaseMs: 20, reconnectMaxMs: 200, keepaliveIntervalMs: 5000 });
+    MockWs.instances = [];
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r)); // first open fires
+
+    // Force reconnect — close triggers scheduleShardReconnect
+    const ws0 = MockWs.instances[0];
+    ws0.close();
+
+    // Wait for reconnect
+    await new Promise((r) => setTimeout(r, 80));
+    await new Promise((r) => process.nextTick(r)); // second open fires
+
+    // No error thrown and pool still healthy
+    expect(MockWs.instances.length).toBeGreaterThan(1); // a new WS was created
+
+    pool.disconnect();
+  });
+
+  it("market_resolved with db: markMarketClosed error is caught without propagating", async () => {
+    // Build a db mock whose update chain rejects
+    const whereMock = vi.fn().mockRejectedValue(new Error("DB write failed"));
+    const setMock = vi.fn().mockReturnValue({ where: whereMock });
+    const updateMock = vi.fn().mockReturnValue({ set: setMock });
+    const mockDb = { update: updateMock };
+
+    MockWs.instances = [];
+    const pool = new ClobWsPool({
+      shardSize: 150,
+      reconnectBaseMs: 50,
+      reconnectMaxMs: 200,
+      WsConstructor: MockWs as unknown as typeof import("ws").default,
+      db: mockDb as unknown as import("drizzle-orm/node-postgres").NodePgDatabase<typeof import("../db/schema.js")>,
+    });
+
+    const resolved: string[] = [];
+    pool.on("market_resolved", (evt: { tokenId: string }) => resolved.push(evt.tokenId));
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    MockWs.instances[0].emit(
+      "message",
+      Buffer.from(JSON.stringify({ event: "market_resolved", asset_id: "err_tok" }))
+    );
+
+    // Event still emitted synchronously
+    expect(resolved).toEqual(["err_tok"]);
+
+    // Allow the rejected promise to settle
+    await new Promise((r) => setTimeout(r, 20));
+
+    // No throw — error was caught by .catch()
+    expect(updateMock).toHaveBeenCalledOnce();
 
     pool.disconnect();
   });

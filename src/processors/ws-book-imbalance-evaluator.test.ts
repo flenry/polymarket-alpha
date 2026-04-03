@@ -274,6 +274,25 @@ describe("WsBookImbalanceEvaluator", () => {
     expect(sig.priceAtSignal).toBe(0);
   });
 
+  it("uses config defaults when no opts passed: threshold=3.0, cooldown=60000", () => {
+    // Constructs without opts — covers lines 21-22 (config.imbalanceRatioThreshold / config.imbalanceCooldownMs)
+    const evaluator = new WsBookImbalanceEvaluator(
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1]
+      // no opts — defaults from config
+    );
+
+    // ratio = 4.0/1.0 = 4.0 > 3.0 threshold — should still fire
+    const bids = [{ price: 1.0, size: 4.0 }];
+    const asks = [{ price: 1.0, size: 1.0 }];
+    evaluator.evaluate(makeBook(bids, asks));
+
+    expect(bus.emit).toHaveBeenCalledOnce();
+    const sig = bus.emit.mock.calls[0][1] as { signalType: string; direction: string };
+    expect(sig.signalType).toBe("ORDER_BOOK_IMBALANCE");
+    expect(sig.direction).toBe("BULLISH");
+  });
+
   it("snapshot insert failure: evaluate() does not throw, signal still emitted", async () => {
     // Cover the .catch() branch on insertBookSnapshot (line 49)
     vi.mocked(insertBookSnapshot).mockRejectedValueOnce(new Error("DB write failed"));

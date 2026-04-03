@@ -357,6 +357,37 @@ describe("WebhookEmitter", () => {
     expect(body.blocks[0].text.text).toContain("SENTIMENT_VELOCITY");
   });
 
+  it("429 without Retry-After header: uses 10s fallback wait then retries", async () => {
+    // Mock setTimeout to instantly fire when waitMs=10_000 (no Retry-After header)
+    // This covers the `retryAfter ? ... : 10_000` branch (line 193 in webhook-emitter.ts)
+    const origSetTimeout = globalThis.setTimeout;
+    const fastSetTimeout = vi.fn().mockImplementation(
+      (fn: () => void, ms: number, ...args: unknown[]) => {
+        if (ms >= 10_000) {
+          // Skip the long wait — call immediately
+          fn();
+          return 0 as unknown as ReturnType<typeof setTimeout>;
+        }
+        return origSetTimeout(fn as Parameters<typeof origSetTimeout>[0], ms);
+      }
+    );
+    vi.stubGlobal("setTimeout", fastSetTimeout);
+
+    const mockFetch = makeMockFetch([
+      { status: 429 }, // no Retry-After header — triggers 10_000ms fallback
+      { status: 200 },
+    ]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const emitter = new WebhookEmitter({
+      discordUrl: "https://discord.com/api/webhooks/test",
+      slackUrl: "",
+    });
+    await emitter.send(makeWhaleAlert());
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+
   it("wallet truncated to 12 chars + ellipsis in Discord embed", async () => {
     const mockFetch = makeMockFetch([{ status: 200 }]);
     vi.stubGlobal("fetch", mockFetch);
