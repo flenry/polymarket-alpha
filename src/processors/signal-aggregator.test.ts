@@ -217,3 +217,28 @@ describe("SignalAggregator", () => {
     expect(txMock.execute).toHaveBeenCalledTimes(0);
   });
 });
+
+describe("SignalAggregator.stop()", () => {
+  it("removes bus listeners so no further inserts happen after stop()", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb();
+    const aggregator = new SignalAggregator(bus, db);
+    aggregator.start();
+
+    // Verify listener is active
+    bus.emit("signal", makeSignal());
+    await new Promise((r) => setTimeout(r, 50));
+    const callsBefore = (db.execute as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(callsBefore).toBeGreaterThan(0);
+
+    // Stop — listeners removed
+    aggregator.stop();
+
+    // Emit again — should be ignored
+    bus.emit("signal", makeSignal());
+    await new Promise((r) => setTimeout(r, 50));
+
+    const callsAfter = (db.execute as ReturnType<typeof vi.fn>).mock.calls.length;
+    expect(callsAfter).toBe(callsBefore); // no new calls
+  });
+});

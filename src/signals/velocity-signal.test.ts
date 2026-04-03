@@ -7,11 +7,15 @@ const OPTS = {
   minLiquidityUsdc: 50_000,
 };
 
-/** Create 24h of 5-min buckets with a stable price (no velocity) */
+/** Create 24h of 5-min buckets with a stable price (no velocity).
+ *  Prices are deterministic — no Math.random() to avoid flaky z-score failures.
+ *  A tiny deterministic noise (alternating ±0.0001) keeps stddev non-zero
+ *  but z-score stays near 0 across the whole window.
+ */
 function makeStableHistory(basePrice: number, count = 24): PriceBucket[] {
   const now = Date.now();
   return Array.from({ length: count }, (_, i) => ({
-    price: basePrice + (Math.random() - 0.5) * 0.001, // tiny noise
+    price: basePrice + (i % 2 === 0 ? 0.0001 : -0.0001), // deterministic tiny alternating noise
     bucketStart: new Date(now - (count - i) * 5 * 60 * 1000),
   }));
 }

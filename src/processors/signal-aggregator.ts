@@ -10,27 +10,40 @@ import { logger } from "../logger.js";
 type Db = NodePgDatabase<typeof schema>;
 
 export class SignalAggregator {
+  private readonly whaleHandler: (alert: WhaleAlert) => Promise<void>;
+  private readonly signalHandler: (signal: Signal) => Promise<void>;
+
   constructor(
     private readonly bus: TypedEventBus,
     private readonly db: Db
-  ) {}
-
-  start(): void {
-    this.bus.on("whale_alert", async (alert) => {
+  ) {
+    // Bind handlers as named references so they can be removed by stop()
+    this.whaleHandler = async (alert) => {
       try {
         await this.handleWhaleAlert(alert);
       } catch (err) {
         logger.error({ err }, "SignalAggregator: error handling whale_alert");
       }
-    });
+    };
 
-    this.bus.on("signal", async (signal) => {
+    this.signalHandler = async (signal) => {
       try {
         await this.handleSignal(signal);
       } catch (err) {
         logger.error({ err }, "SignalAggregator: error handling signal");
       }
-    });
+    };
+  }
+
+  start(): void {
+    this.bus.on("whale_alert", this.whaleHandler);
+    this.bus.on("signal", this.signalHandler);
+  }
+
+  /** Remove all bus listeners registered by this aggregator. */
+  stop(): void {
+    this.bus.off("whale_alert", this.whaleHandler);
+    this.bus.off("signal", this.signalHandler);
   }
 
   private async handleWhaleAlert(alert: WhaleAlert): Promise<void> {
