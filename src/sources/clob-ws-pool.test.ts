@@ -920,4 +920,118 @@ describe("ClobWsPool Phase 2 additions", () => {
 
     pool.disconnect();
   });
+
+  it("constructor with no opts: uses default shardSize=150, reconnectBase=1000, etc.", async () => {
+    // Covers lines 55-58: the ?? right-hand defaults when opts fields are omitted
+    class BareWs extends EventEmitter {
+      static instances: BareWs[] = [];
+      public sent: string[] = [];
+      public readyState = 1;
+      constructor(_url: string) {
+        super();
+        BareWs.instances.push(this);
+        process.nextTick(() => this.emit("open"));
+      }
+      send(d: string) { this.sent.push(d); }
+      close() { this.readyState = 3; this.emit("close"); }
+    }
+    (BareWs as unknown as { OPEN: number }).OPEN = 1;
+    BareWs.instances = [];
+
+    // Pass ONLY WsConstructor — all numeric/string opts use their ?? defaults
+    const pool = new ClobWsPool({
+      WsConstructor: BareWs as unknown as typeof import("ws").default,
+    });
+    const tokenIds = Array.from({ length: 100 }, (_, i) => `tok${i}`);
+    await pool.connect(tokenIds);
+    // Default shardSize=150 → 100 tokens = 1 shard
+    expect(pool.getShardCount()).toBe(1);
+    pool.disconnect();
+  });
+
+  it("constructor with empty opts {}: WsConstructor defaults to real WebSocket (no connect called)", () => {
+    // Covers line 58: `opts.WsConstructor ?? WebSocket` — the ?? WebSocket fallback
+    // We just construct it without connecting to verify no throw
+    const pool = new ClobWsPool({});
+    expect(pool.getShardCount()).toBe(0); // nothing connected
+    // No disconnect needed — no shards created
+  });
+
+  it("handleEvent: non-object raw message is silently ignored", async () => {
+    // Covers line 227: `if (typeof raw !== 'object' || raw === null) return`
+    const pool = makePool({ shardSize: 150 });
+    const bookEvents: unknown[] = [];
+    pool.on("book", (evt) => bookEvents.push(evt));
+
+    MockWs.instances = [];
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    // Emit a JSON string (non-object) — should be silently ignored
+    ws.emit("message", Buffer.from(JSON.stringify("just a string")));
+    // Emit a JSON number
+    ws.emit("message", Buffer.from(JSON.stringify(42)));
+    // Emit JSON null
+    ws.emit("message", Buffer.from("null"));
+
+    expect(bookEvents).toHaveLength(0);
+    pool.disconnect();
+  });
+
+  it("handleEvent: event dispatched via 'type' field when 'event' field absent", async () => {
+    // Covers line 230: `switch(typed.event ?? typed.type)` — the typed.type fallback
+    const pool = makePool({ shardSize: 150 });
+    const priceEvents: unknown[] = [];
+    pool.on("price_change", (evt) => priceEvents.push(evt));
+
+    MockWs.instances = [];
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    // Use 'type' field instead of 'event' field
+    ws.emit("message", Buffer.from(JSON.stringify({
+      type: "price_change",
+      asset_id: "tok1",
+      price: "0.72",
+      side: "BUY",
+      timestamp: "1700000010",
+    })));
+
+    expect(priceEvents).toHaveLength(1);
+    const evt = priceEvents[0] as { type: string; tokenId: string };
+    expect(evt.type).toBe("price_change");
+    expect(evt.tokenId).toBe("tok1");
+    pool.disconnect();
+  });
+
+  it("openShard: clears existing silentCheckTimer when called again (reconnect before first open)", async () => {
+    // Covers line 179: `if (shard.silentCheckTimer) clearInterval(...)` true branch
+    // Fires when openShard() is called on a shard that already has silentCheckTimer set
+    const pool = makePool({
+      shardSize: 150,
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 50,
+      silentShardThresholdMs: 5000,
+    });
+    const reconnects: number[] = [];
+    pool.on("shard_reconnect", (idx) => reconnects.push(idx));
+
+    MockWs.instances = [];
+    await pool.connect(["tok1"]);
+    // silentCheckTimer is set immediately when openShard() runs (before 'open' fires)
+    // Trigger close immediately — before nextTick fires the 'open' event
+    const ws = MockWs.instances[0];
+    ws.readyState = 3; // CLOSED
+    ws.emit("close"); // triggers scheduleShardReconnect
+
+    // Wait for reconnect — second openShard() will find silentCheckTimer already set
+    await new Promise((r) => setTimeout(r, 80));
+    await new Promise((r) => process.nextTick(r));
+
+    expect(reconnects).toContain(0); // reconnect happened
+    expect(pool.getShardCount()).toBe(1);
+    pool.disconnect();
+  });
 });
