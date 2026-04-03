@@ -18,13 +18,13 @@ export interface VelocityOptions {
 }
 
 /** Compute mean of an array */
-function mean(values: number[]): number {
+export function mean(values: number[]): number {
   if (values.length === 0) return 0;
   return values.reduce((a, b) => a + b, 0) / values.length;
 }
 
 /** Compute population stddev */
-function stddev(values: number[], avg: number): number {
+export function stddev(values: number[], avg: number): number {
   if (values.length < 2) return 0;
   const variance = values.reduce((s, v) => s + (v - avg) ** 2, 0) / values.length;
   return Math.sqrt(variance);

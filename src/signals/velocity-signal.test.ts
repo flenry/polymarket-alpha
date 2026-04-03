@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { evaluateVelocity } from "./velocity-signal.js";
+import { evaluateVelocity, mean, stddev } from "./velocity-signal.js";
 import type { PriceBucket } from "./velocity-signal.js";
 
 const OPTS = {
@@ -173,6 +173,18 @@ describe("evaluateVelocity", () => {
     // First price=0 skipped → returns has 18 entries from i=1..19 → stddev computed
     // All returns (0.65-0.65)/0.65 = 0 for i=1..18, last = (0.65-0.65)/0.65 = 0 → stddev=0 → null
     expect(result).toBeNull();
+  });
+
+  it("mean([]) returns 0 (line 22 empty-array guard)", () => {
+    expect(mean([])).toBe(0);
+  });
+
+  it("stddev with 1 value returns 0 (line 28 length<2 guard)", () => {
+    expect(stddev([0.65], 0.65)).toBe(0);
+  });
+
+  it("stddev with 0 values returns 0", () => {
+    expect(stddev([], 0)).toBe(0);
   });
 
   it('returns null when pairwise returns.length < 2 (only 1 valid price transition, line 68)', () => {
