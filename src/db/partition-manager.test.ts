@@ -118,6 +118,16 @@ describe("dropExpiredPartitions", () => {
 });
 
 describe("PartitionManager", () => {
+  it("ensureCurrentPartitions() calls createPartitionForDate + createTomorrowPartition for both tables", async () => {
+    const db = mockDb();
+    const manager = new PartitionManager(db);
+
+    await manager.ensureCurrentPartitions();
+
+    // 2 tables × 2 calls each (createPartitionForDate + createTomorrowPartition)
+    expect((db.execute as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(4);
+  });
+
   it("start() creates a setInterval timer; stop() clears it (lines 147-163)", async () => {
     vi.useFakeTimers();
     const db = mockDb();
@@ -132,6 +142,17 @@ describe("PartitionManager", () => {
     expect(() => manager.stop()).not.toThrow();
 
     vi.useRealTimers();
+  });
+
+  it("ensureCurrentPartitions() directly covers lines 137-142", async () => {
+    // Test ensureCurrentPartitions() directly — simpler than waiting for midnight cron
+    const db = mockDb();
+    const manager = new PartitionManager(db);
+
+    await manager.ensureCurrentPartitions();
+
+    // 2 tables × (createPartitionForDate + createTomorrowPartition) = 4 execute calls
+    expect((db.execute as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(4);
   });
 
   it("stop() is a no-op when called before start()", () => {
