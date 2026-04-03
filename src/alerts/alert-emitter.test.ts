@@ -180,3 +180,25 @@ describe("AlertEmitter latency warning", () => {
     consoleSpy.mockRestore();
   });
 });
+
+describe("AlertEmitter.stop()", () => {
+  it("removes the whale_alert listener so no further emit() calls happen", () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const bus = new TypedEventBus();
+    const emitter = new AlertEmitter(bus);
+    emitter.start();
+
+    // Verify active
+    bus.emit("whale_alert", makeAlert());
+    expect(consoleSpy).toHaveBeenCalledTimes(1);
+
+    // Stop — listener removed
+    emitter.stop();
+
+    // Emit again — should be ignored
+    bus.emit("whale_alert", makeAlert());
+    expect(consoleSpy).toHaveBeenCalledTimes(1); // still 1, not 2
+
+    consoleSpy.mockRestore();
+  });
+});

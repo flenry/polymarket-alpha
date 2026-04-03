@@ -115,6 +115,14 @@ describe("dropExpiredPartitions", () => {
     const dropped = await dropExpiredPartitions(db, "trades", 90);
     expect(dropped).toHaveLength(0);
   });
+
+  it("skips partition names with unparseable dates (isNaN branch, line 110)", async () => {
+    // Partition name matches regex (trades_NNNN_NN_NN) but has invalid date (month=99)
+    const db = mockDb([{ tablename: "trades_2026_99_01" }]);
+    const dropped = await dropExpiredPartitions(db, "trades", 90);
+    // Invalid date → isNaN → skipped → not dropped
+    expect(dropped).toHaveLength(0);
+  });
 });
 
 describe("validateTable (via createTomorrowPartition)", () => {
@@ -164,23 +172,14 @@ describe("PartitionManager", () => {
     expect((db.execute as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(4);
   });
 
-  it("midnight cron body runs ensureCurrentPartitions and dropExpiredPartitions when hour=0 (lines 150-154)", async () => {
-    // We can't easily test the async setInterval body via fake timers because
-    // advanceTimersByTimeAsync doesn't await the async callback.
-    // Instead we test the exposed components directly to cover all lines:
-    //   - ensureCurrentPartitions() covers lines 137-142 (already tested above)
-    //   - dropExpiredPartitions() covers lines 87-125 (tested in its own describe)
-    // This test calls both in sequence to simulate what the cron does:
+  it("runMaintenance() calls ensureCurrentPartitions + dropExpiredPartitions for all tables", async () => {
     const db = mockDb([]);
     const manager = new PartitionManager(db);
 
-    // Simulate the midnight cron body directly
-    await manager.ensureCurrentPartitions(); // covers lines 150: await this.ensureCurrentPartitions()
-    for (const table of ["trades", "order_book_snapshots"] as ("trades" | "order_book_snapshots")[]) {
-      await dropExpiredPartitions(db, table, table === "trades" ? 90 : 7); // covers lines 151-153
-    }
+    await manager.runMaintenance();
 
-    // 4 calls from ensureCurrentPartitions + 2 calls from dropExpiredPartitions
+    // 4 execute calls from ensureCurrentPartitions (2 tables × 2 operations)
+    // + 2 execute calls from dropExpiredPartitions (1 pg_tables query per table)
     expect((db.execute as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(6);
   });
 
@@ -200,3 +199,64 @@ describe("PartitionManager", () => {
     expect(true).toBe(true);
   });
 });
+
+
+
+  it("onHourTick() calls runMaintenance() at midnight UTC (covers lines 161-162)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-04T00:00:00.000Z")); // UTC midnight → getUTCHours() = 0
+
+    const db = mockDb([]);
+    const manager = new PartitionManager(db);
+    const runMaintenanceSpy = vi.spyOn(manager, "runMaintenance").mockResolvedValue(undefined);
+
+    // Call onHourTick directly (private — cast to any for test access)
+    (manager as unknown as { onHourTick: () => void }).onHourTick();
+
+    // runMaintenance should have been called since it's midnight UTC
+    expect(runMaintenanceSpy).toHaveBeenCalledTimes(1);
+
+    vi.useRealTimers();
+  });
+
+  it("onHourTick() does not call runMaintenance() at non-midnight hour", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-04T01:00:00.000Z")); // 1am UTC
+
+    const db = mockDb([]);
+    const manager = new PartitionManager(db);
+    const runMaintenanceSpy = vi.spyOn(manager, "runMaintenance").mockResolvedValue(undefined);
+
+    (manager as unknown as { onHourTick: () => void }).onHourTick();
+
+    expect(runMaintenanceSpy).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
+
+
+
+  it("onHourTick() logs error when runMaintenance() rejects (line 160 .catch branch)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-04T00:00:00.000Z")); // UTC midnight
+
+    const db = mockDb([]);
+    const manager = new PartitionManager(db);
+    // Make runMaintenance reject
+    vi.spyOn(manager, "runMaintenance").mockRejectedValue(new Error("maintenance failed"));
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    (manager as unknown as { onHourTick: () => void }).onHourTick();
+
+    // Flush the .catch() microtask
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      "PartitionManager: runMaintenance failed",
+      expect.any(Error)
+    );
+
+    consoleSpy.mockRestore();
+    vi.useRealTimers();
+  });

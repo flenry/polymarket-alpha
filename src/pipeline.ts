@@ -291,6 +291,7 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     await flushTradeBatch();
 
     // 4. Remove bus listeners we registered (prevent leaks if restarted)
+    alertEmitter.stop();
     signalAggregator.stop();
     bus.off("trade", tradeHandler1);
     bus.off("trade", tradeHandler2);

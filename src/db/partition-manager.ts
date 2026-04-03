@@ -141,18 +141,31 @@ export class PartitionManager {
     }
   }
 
+  /**
+   * Run partition maintenance: create today/tomorrow partitions and drop expired ones.
+   * Called automatically by the midnight cron; also callable directly for testing.
+   */
+  async runMaintenance(): Promise<void> {
+    await this.ensureCurrentPartitions();
+    for (const table of ["trades", "order_book_snapshots"] as PartitionedTable[]) {
+      await dropExpiredPartitions(this.db, table, RETENTION_DAYS[table]);
+    }
+  }
+
+  /** Called by the hourly cron; schedules maintenance when UTC hour is 0. */
+  private onHourTick(): void {
+    if (new Date().getUTCHours() === 0) {
+      this.runMaintenance().catch((err) => {
+        // Log but do not crash — next hour will retry
+        console.error("PartitionManager: runMaintenance failed", err);
+      });
+    }
+  }
+
   /** Start midnight UTC cron */
   start(): void {
-    // Check every hour; act when UTC hour === 0
-    this.timer = setInterval(async () => {
-      const hour = new Date().getUTCHours();
-      if (hour === 0) {
-        await this.ensureCurrentPartitions();
-        for (const table of ["trades", "order_book_snapshots"] as PartitionedTable[]) {
-          await dropExpiredPartitions(this.db, table, RETENTION_DAYS[table]);
-        }
-      }
-    }, 60 * 60 * 1000); // every hour
+    // Check every hour; run maintenance at midnight UTC
+    this.timer = setInterval(() => this.onHourTick(), 60 * 60 * 1000);
   }
 
   stop(): void {

@@ -217,3 +217,26 @@ describe("PriceHistoryWriter", () => {
     writer.stop();
   });
 });
+
+describe("PriceHistoryWriter.stop() listener removal", () => {
+  it("removes last_trade_price and best_bid_ask listeners after stop()", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb();
+    const writer = new PriceHistoryWriter(bus, db, 100, 500);
+    writer.start();
+
+    // Confirm active
+    bus.emit("last_trade_price", { type: "last_trade_price", tokenId: "tok1", price: 0.65, side: "BUY", timestamp: Date.now() });
+    expect(writer.getBatchSize()).toBe(1);
+
+    // Stop
+    writer.stop();
+
+    // After stop, events should not be added to batch
+    bus.emit("last_trade_price", { type: "last_trade_price", tokenId: "tok2", price: 0.66, side: "BUY", timestamp: Date.now() });
+    bus.emit("best_bid_ask", { type: "best_bid_ask", tokenId: "tok2", bid: 0.64, ask: 0.66, timestamp: Date.now() });
+
+    // Batch should still only have the 1 item from before stop
+    expect(writer.getBatchSize()).toBe(1);
+  });
+});

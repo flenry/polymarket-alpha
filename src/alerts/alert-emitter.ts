@@ -24,12 +24,19 @@ export function formatWhaleAlert(alert: WhaleAlert): string {
 }
 
 export class AlertEmitter {
-  constructor(private readonly bus: TypedEventBus) {}
+  private readonly whaleHandler: (alert: WhaleAlert) => void;
+
+  constructor(private readonly bus: TypedEventBus) {
+    this.whaleHandler = (alert) => this.emit(alert);
+  }
 
   start(): void {
-    this.bus.on("whale_alert", (alert) => {
-      this.emit(alert);
-    });
+    this.bus.on("whale_alert", this.whaleHandler);
+  }
+
+  /** Remove the whale_alert listener registered by start(). */
+  stop(): void {
+    this.bus.off("whale_alert", this.whaleHandler);
   }
 
   emit(alert: WhaleAlert): void {

@@ -4,6 +4,7 @@ import * as schema from "../db/schema.js";
 import { sql } from "drizzle-orm";
 import { logger } from "../logger.js";
 import { config } from "../config.js";
+import type { LastTradePriceEvent, BestBidAskEvent } from "../events/types.js";
 
 type Db = NodePgDatabase<typeof schema>;
 
@@ -19,16 +20,16 @@ interface PriceRecord {
 export class PriceHistoryWriter {
   private batch: PriceRecord[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly lastTradeHandler: (evt: LastTradePriceEvent) => void;
+  private readonly bidAskHandler: (evt: BestBidAskEvent) => void;
 
   constructor(
     private readonly bus: TypedEventBus,
     private readonly db: Db,
     private readonly batchSize = config.tradeBatchSize,
     private readonly flushMs = config.tradeBatchFlushMs
-  ) {}
-
-  start(): void {
-    this.bus.on("last_trade_price", (evt) => {
+  ) {
+    this.lastTradeHandler = (evt) => {
       this.batch.push({
         tokenId: evt.tokenId,
         conditionId: "",
@@ -38,9 +39,9 @@ export class PriceHistoryWriter {
         recordedAt: new Date(evt.timestamp),
       });
       this.maybeFlush();
-    });
+    };
 
-    this.bus.on("best_bid_ask", (evt) => {
+    this.bidAskHandler = (evt) => {
       // Two rows: best_bid and best_ask
       this.batch.push({
         tokenId: evt.tokenId,
@@ -59,7 +60,12 @@ export class PriceHistoryWriter {
         recordedAt: new Date(evt.timestamp ?? Date.now()),
       });
       this.maybeFlush();
-    });
+    };
+  }
+
+  start(): void {
+    this.bus.on("last_trade_price", this.lastTradeHandler);
+    this.bus.on("best_bid_ask", this.bidAskHandler);
 
     this.flushTimer = setInterval(() => {
       if (this.batch.length > 0) {
@@ -69,11 +75,14 @@ export class PriceHistoryWriter {
     }, this.flushMs);
   }
 
+  /** Remove bus listeners and clear the flush timer. */
   stop(): void {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
+    this.bus.off("last_trade_price", this.lastTradeHandler);
+    this.bus.off("best_bid_ask", this.bidAskHandler);
   }
 
   private maybeFlush(): void {
