@@ -95,7 +95,7 @@ export class GammaPoller extends EventEmitter {
           watchlisted,
           negRisk: isNegRisk,
           question: m.question ?? "",
-          outcome: "",
+          outcomes: null,
         });
 
         if (isNegRisk) {
@@ -156,6 +156,8 @@ export class GammaPoller extends EventEmitter {
         question: "",
         watchlisted: false,
         negRisk: false,
+        active: true,
+        closed: false,
         clobTokenIds: [tokenId],
       });
 
@@ -171,6 +173,8 @@ export class GammaPoller extends EventEmitter {
         question: "",
         watchlisted: true,
         negRisk: false,
+        active: true,
+        closed: false,
         clobTokenIds: [tokenId],
       });
       await bootstrapMarketStats(db, tokenId, conditionId).catch((err) =>
