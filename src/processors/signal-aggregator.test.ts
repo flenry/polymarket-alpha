@@ -262,3 +262,50 @@ describe("SignalAggregator.stop()", () => {
     expect(callsAfter).toBe(callsBefore); // no new calls
   });
 });
+
+describe("SignalAggregator — onWhaleInserted callback", () => {
+  it("onWhaleInserted called with (alert, id) after successful whale insert", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb();
+    const onWhaleInserted = vi.fn();
+    const aggregator = new SignalAggregator(bus, db, onWhaleInserted);
+    aggregator.start();
+
+    const alert = makeAlert(true);
+    bus.emit("whale_alert", alert);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(onWhaleInserted).toHaveBeenCalledOnce();
+    const [callAlert, callId] = onWhaleInserted.mock.calls[0];
+    expect(callAlert).toBe(alert);
+    expect(typeof callId).toBe("bigint");
+
+    aggregator.stop();
+  });
+
+  it("onWhaleInserted NOT called when emitSignal=false", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb(null); // null → insertWhaleAlert returns null (emitSignal=false)
+    const onWhaleInserted = vi.fn();
+    const aggregator = new SignalAggregator(bus, db, onWhaleInserted);
+    aggregator.start();
+
+    bus.emit("whale_alert", makeAlert(false));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(onWhaleInserted).not.toHaveBeenCalled();
+    aggregator.stop();
+  });
+
+  it("no onWhaleInserted provided: backward compatible, no error", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb();
+    const aggregator = new SignalAggregator(bus, db); // no callback
+    aggregator.start();
+
+    expect(() => bus.emit("whale_alert", makeAlert(true))).not.toThrow();
+    await new Promise((r) => setTimeout(r, 50));
+
+    aggregator.stop();
+  });
+});

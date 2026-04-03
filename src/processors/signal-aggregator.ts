@@ -15,7 +15,8 @@ export class SignalAggregator {
 
   constructor(
     private readonly bus: TypedEventBus,
-    private readonly db: Db
+    private readonly db: Db,
+    private readonly onWhaleInserted?: (alert: WhaleAlert, id: bigint) => void
   ) {
     // Bind handlers as named references so they can be removed by stop()
     this.whaleHandler = async (alert) => {
@@ -51,18 +52,22 @@ export class SignalAggregator {
     // Falls back to sequential inserts when the DB mock doesn't support transaction()
     // (unit tests) — detectable by whether this.db.transaction is callable.
     if (typeof (this.db as unknown as { transaction?: unknown }).transaction === "function") {
+      let insertedId: bigint | null = null;
       await (this.db as Db & { transaction: (fn: (tx: Db) => Promise<void>) => Promise<void> }).transaction(
         async (tx) => {
           const whaleAlertId = await insertWhaleAlert(tx, alert);
           if (whaleAlertId === null) return; // emitSignal=false: skip
+          insertedId = whaleAlertId;
           await insertSignal(tx, alert.signal, whaleAlertId);
         }
       );
+      if (insertedId !== null) this.onWhaleInserted?.(alert, insertedId);
     } else {
       // Unit-test path: no transaction support on mock — do sequential inserts
       const whaleAlertId = await insertWhaleAlert(this.db, alert);
       if (whaleAlertId === null) return;
       await insertSignal(this.db, alert.signal, whaleAlertId);
+      this.onWhaleInserted?.(alert, whaleAlertId);
     }
   }
 
