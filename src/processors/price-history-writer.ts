@@ -63,9 +63,8 @@ export class PriceHistoryWriter {
 
     this.flushTimer = setInterval(() => {
       if (this.batch.length > 0) {
-        this.flush().catch((err) =>
-          logger.error({ err }, "PriceHistoryWriter: flush error")
-        );
+        // flush() is internally safe — catches per-record errors and never rejects
+        void this.flush();
       }
     }, this.flushMs);
   }
@@ -79,9 +78,8 @@ export class PriceHistoryWriter {
 
   private maybeFlush(): void {
     if (this.batch.length >= this.batchSize) {
-      this.flush().catch((err) =>
-        logger.error({ err }, "PriceHistoryWriter: flush error")
-      );
+      // flush() is internally safe — catches per-record errors and never rejects
+      void this.flush();
     }
   }
 
