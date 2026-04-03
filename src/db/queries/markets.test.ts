@@ -187,4 +187,24 @@ describe("upsertMarket — parseOutcome branches", () => {
     const call = m._values.mock.calls[0][0];
     expect(call.outcome).toBe("No");
   });
+
+  it("handles null optional fields: slug, eventSlug, category, acceptingOrders (null branches)", async () => {
+    const m = makeUpsertDb();
+    await upsertMarket(asDb(m), {
+      ...baseMarket,
+      tokenId: "tok1",
+      question: undefined as unknown as string, // exercises ?? "" branch
+      slug: null,
+      eventSlug: null,
+      category: null,
+      acceptingOrders: null,
+      active: undefined as unknown as boolean, // exercises ?? true branch
+      closed: undefined as unknown as boolean, // exercises ?? false branch
+    });
+    const call = m._values.mock.calls[0][0];
+    expect(call.question).toBe("");
+    expect(call.slug).toBeNull();
+    expect(call.active).toBe(true); // default from ?? true
+    expect(call.closed).toBe(false); // default from ?? false
+  });
 });
