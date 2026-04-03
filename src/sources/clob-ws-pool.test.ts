@@ -659,6 +659,230 @@ describe("ClobWsPool Phase 2 additions", () => {
     pool.disconnect();
   });
 
+  it("best_bid_ask without timestamp: uses Date.now() fallback", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const events: unknown[] = [];
+    pool.on("best_bid_ask", (evt) => events.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    // No timestamp field → should fall back to Date.now()
+    const before = Date.now();
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "best_bid_ask",
+      asset_id: "tok1",
+      bid: "0.64",
+      ask: "0.66",
+      // no timestamp
+    })));
+    const after = Date.now();
+
+    expect(events).toHaveLength(1);
+    const evt = events[0] as { timestamp: number };
+    expect(evt.timestamp).toBeGreaterThanOrEqual(before);
+    expect(evt.timestamp).toBeLessThanOrEqual(after);
+    pool.disconnect();
+  });
+
+  it("last_trade_price without side: defaults to 'BUY'; without timestamp: uses Date.now() fallback", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const events: unknown[] = [];
+    pool.on("last_trade_price", (evt) => events.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    const before = Date.now();
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "last_trade_price",
+      asset_id: "tok1",
+      price: "0.68",
+      // no side, no timestamp
+    })));
+    const after = Date.now();
+
+    expect(events).toHaveLength(1);
+    const evt = events[0] as { side: string; timestamp: number };
+    expect(evt.side).toBe("BUY"); // default
+    expect(evt.timestamp).toBeGreaterThanOrEqual(before);
+    expect(evt.timestamp).toBeLessThanOrEqual(after);
+    pool.disconnect();
+  });
+
+  it("market_resolved using 'market' field when 'asset_id' absent", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const resolved: { tokenId: string }[] = [];
+    pool.on("market_resolved", (evt) => resolved.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    // Use 'market' instead of 'asset_id'
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "market_resolved",
+      market: "market_tok_via_market_field",
+      // no asset_id
+    })));
+
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0].tokenId).toBe("market_tok_via_market_field");
+    pool.disconnect();
+  });
+
+  it("market_resolved with neither asset_id nor market: tokenId is empty string", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const resolved: { tokenId: string }[] = [];
+    pool.on("market_resolved", (evt) => resolved.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "market_resolved",
+      // neither asset_id nor market
+    })));
+
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0].tokenId).toBe("");
+    pool.disconnect();
+  });
+
+  it("invalid book message (missing required field): silently dropped", async () => {
+    // Covers `if (!parsed.success) return` for book event (lines 227-230)
+    const pool = makePool({ shardSize: 150 });
+    const bookEvents: unknown[] = [];
+    pool.on("book", (evt) => bookEvents.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    // Missing asset_id, timestamp, hash — Zod will fail
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "book",
+      // no asset_id, no timestamp, no hash, no bids, no asks
+    })));
+
+    // No event emitted — bad book message silently dropped
+    expect(bookEvents).toHaveLength(0);
+    pool.disconnect();
+  });
+
+  it("book message without 'market' field: conditionId defaults to empty string", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const bookEvents: unknown[] = [];
+    pool.on("book", (evt) => bookEvents.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    // No 'market' field — schema has it as optional
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "book",
+      asset_id: "tok1",
+      // no 'market' field → d.market ?? "" → conditionId = ""
+      timestamp: "1700000000",
+      hash: "0xabc",
+      bids: [{ price: "0.65", size: "100" }],
+      asks: [{ price: "0.66", size: "50" }],
+    })));
+
+    expect(bookEvents).toHaveLength(1);
+    const evt = bookEvents[0] as { book: { conditionId: string } };
+    expect(evt.book.conditionId).toBe(""); // ?? "" fallback
+
+    pool.disconnect();
+  });
+
+  it("invalid price_change message (missing required field): silently dropped", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const events: unknown[] = [];
+    pool.on("price_change", (evt) => events.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    // Missing asset_id — Zod will reject → if (!parsed.success) return
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "price_change",
+      // no asset_id
+      price: "0.72",
+      side: "BUY",
+      timestamp: "1700000001",
+    })));
+
+    // No event emitted — bad message silently dropped
+    expect(events).toHaveLength(0);
+    pool.disconnect();
+  });
+
+  it("invalid best_bid_ask message (missing required field): silently dropped", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const events: unknown[] = [];
+    pool.on("best_bid_ask", (evt) => events.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    // Missing bid/ask — Zod will reject
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "best_bid_ask",
+      // no asset_id
+    })));
+
+    expect(events).toHaveLength(0);
+    pool.disconnect();
+  });
+
+  it("invalid last_trade_price message (missing required field): silently dropped", async () => {
+    const pool = makePool({ shardSize: 150 });
+    const events: unknown[] = [];
+    pool.on("last_trade_price", (evt) => events.push(evt));
+
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    const ws = MockWs.instances[0];
+    // Missing asset_id — Zod will reject
+    ws.emit("message", Buffer.from(JSON.stringify({
+      event: "last_trade_price",
+      // no asset_id
+      price: "0.68",
+    })));
+
+    expect(events).toHaveLength(0);
+    pool.disconnect();
+  });
+
+  it("close handler when pool already stopped: no reconnect scheduled", async () => {
+    // Covers the false branch of `if (!shard.stopped && !this.stopped)` in close handler
+    // This fires when disconnect() is called and internally calls ws.close()
+    const pool = makePool({ shardSize: 150, reconnectBaseMs: 50 });
+    const reconnects: number[] = [];
+    pool.on("shard_reconnect", (idx) => reconnects.push(idx));
+
+    MockWs.instances = [];
+    await pool.connect(["tok1"]);
+    await new Promise((r) => process.nextTick(r));
+
+    // Call disconnect — this sets stopped=true and calls ws.close() internally
+    pool.disconnect();
+
+    // Wait to ensure no reconnect fires
+    await new Promise((r) => setTimeout(r, 100));
+
+    // No reconnect should fire since pool was stopped before close
+    expect(reconnects).toHaveLength(0);
+  });
+
   it("market_resolved with db: markMarketClosed error is caught without propagating", async () => {
     // Build a db mock whose update chain rejects
     const whereMock = vi.fn().mockRejectedValue(new Error("DB write failed"));

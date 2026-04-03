@@ -379,6 +379,105 @@ describe("WalletEnricher", () => {
     expect(enrichWhaleAlert).not.toHaveBeenCalled();
   });
 
+  it("recency guard: cached profile with null volume/count/firstSeenAt → enrichWhaleAlert called with undefineds", async () => {
+    // Covers lines 91-93: `existing.totalVolumeUsdc ?? undefined` etc. when fields are null
+    const cachedProfile = {
+      proxyWallet: "0xabc123",
+      totalVolumeUsdc: null,   // null → ?? undefined
+      tradeCount: null,         // null → ?? undefined
+      whaleTradeCount: null,
+      firstSeenAt: null,        // null → ?? undefined
+      lastSeenAt: null,
+      lastEnrichedAt: new Date(Date.now() - 3_600_000), // 1h ago — within recency window
+    };
+    vi.mocked(getWalletProfile).mockResolvedValueOnce(cachedProfile);
+
+    const mockFetch = vi.fn();
+    vi.stubGlobal("fetch", mockFetch);
+
+    const db = makeDb();
+    const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });
+    await enricher._enrich(makeAlert(), 99n);
+
+    // Fetch NOT called (recency hit)
+    expect(mockFetch).not.toHaveBeenCalled();
+    // enrichWhaleAlert still called with undefined values (not null)
+    expect(enrichWhaleAlert).toHaveBeenCalledOnce();
+    const enrichArg = vi.mocked(enrichWhaleAlert).mock.calls[0][2];
+    expect(enrichArg.walletTotalVolumeUsdc).toBeUndefined();
+    expect(enrichArg.walletTradeCount).toBeUndefined();
+    expect(enrichArg.walletFirstSeenAt).toBeUndefined();
+  });
+
+  it("429 without Retry-After in wallet-enricher: uses 10s fallback (covered via Retry-After: null)", async () => {
+    // Covers line 114: `retryAfter ? ... : 10_000` — the 10_000ms branch when no Retry-After header
+    // We mock setTimeout to skip the 10s wait; capture only values > 9000 to distinguish from timeoutMs
+    const origSetTimeout = globalThis.setTimeout;
+    const capturedWaits: number[] = [];
+    const fastSetTimeout = vi.fn().mockImplementation(
+      (fn: () => void, ms: number) => {
+        if (ms >= 9_000) {
+          // This is the 10s Retry-After wait — capture it and call immediately
+          capturedWaits.push(ms);
+          fn();
+          return 0 as unknown as ReturnType<typeof setTimeout>;
+        }
+        return origSetTimeout(fn as Parameters<typeof origSetTimeout>[0], ms);
+      }
+    );
+    vi.stubGlobal("setTimeout", fastSetTimeout);
+
+    const trades = makeTrades([{ size: 100, price: 0.5, timestamp: 1_700_000_000 }]);
+    let callCount = 0;
+    const mockFetch = vi.fn().mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.resolve({
+          ok: false,
+          status: 429,
+          headers: { get: () => null }, // No Retry-After header → fallback to 10_000ms
+          json: () => Promise.resolve([]),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: () => Promise.resolve(trades),
+      });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const db = makeDb();
+    const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });
+    await enricher._enrich(makeAlert(), 99n);
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    // Should have captured the 10_000ms fallback wait
+    expect(capturedWaits).toContain(10_000);
+    expect(upsertWalletProfile).toHaveBeenCalledOnce();
+  });
+
+  it("parseTrades: non-array response from API → treated as empty trades list", async () => {
+    // Covers line 191: `if (!Array.isArray(raw)) return []`
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: () => Promise.resolve({ error: "not an array" }), // non-array response
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const db = makeDb();
+    const enricher = new WalletEnricher(db as never, { timeoutMs: 5000, rps: 100, recencyHours: 24 });
+    await enricher._enrich(makeAlert(), 99n);
+
+    // parseTrades returns [] for non-array → upsert called with zero counts
+    expect(upsertWalletProfile).toHaveBeenCalledOnce();
+    const upsertArg = vi.mocked(upsertWalletProfile).mock.calls[0][1];
+    expect(upsertArg.tradeCount).toBe(0);
+  });
+
   it("token bucket: when bucket empty, acquire() waits for refill before resolving", async () => {
     // Use rps=1 (one token per 1000ms). Fire 2 concurrent _enrich calls.
     // The second must wait for the token bucket to refill (≥1s gap).

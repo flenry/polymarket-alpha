@@ -263,7 +263,7 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     url: config.clobWsUrl,
     shardSize: config.clobWsShardSize,
     reconnectBaseMs: config.reconnectBaseMs,
-    reconnectMaxMs: config.reconnectMaxMs,
+    reconnectMaxMs: config.clobWsMaxReconnectDelayMs,
     db,
   });
   const wsImbalanceEvaluator = new WsBookImbalanceEvaluator(bus, db);

@@ -388,6 +388,45 @@ describe("WebhookEmitter", () => {
     expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
+  it("Discord/Slack whale payload: falls back to tokenId when marketTitle empty", async () => {
+    // Covers: `trade.marketTitle || trade.tokenId` (line 122 Slack, line ~74 Discord)
+    // when marketTitle is empty string, falls back to tokenId
+    const mockFetch = makeMockFetch([{ status: 200 }, { status: 200 }]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    const alert = makeWhaleAlert();
+    // Clear marketTitle so the || fallback triggers
+    (alert.trade as { marketTitle: string }).marketTitle = "";
+
+    const emitter = new WebhookEmitter({
+      discordUrl: "https://discord.com/api/webhooks/test",
+      slackUrl: "https://hooks.slack.com/services/test",
+    });
+    await emitter.send(alert);
+
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    // Discord description should fall back to marketSlug, then tokenId
+    const discordBody = JSON.parse(mockFetch.mock.calls[0][1].body) as {
+      embeds: Array<{ description: string }>;
+    };
+    // marketSlug is "test-market" which is truthy
+    expect(discordBody.embeds[0].description).toBe("test-market");
+  });
+
+  it("constructor without opts: reads discordUrl and slackUrl from config (branch covers ?? config.* defaults)", async () => {
+    // Covers lines 149-150: `this.discordUrl = opts?.discordUrl ?? config.discordWebhookUrl`
+    // When opts is undefined, uses config defaults (both empty strings in test env)
+    const mockFetch = makeMockFetch([]);
+    vi.stubGlobal("fetch", mockFetch);
+
+    // No opts — discordUrl and slackUrl both default to "" via config
+    const emitter = new WebhookEmitter();
+    await emitter.send(makeWhaleAlert());
+
+    // Both URLs empty from config → no-op
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("wallet truncated to 12 chars + ellipsis in Discord embed", async () => {
     const mockFetch = makeMockFetch([{ status: 200 }]);
     vi.stubGlobal("fetch", mockFetch);
