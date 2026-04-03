@@ -171,4 +171,21 @@ describe("evaluateVelocity", () => {
     expect(result).toBeNull();
   });
 
+  it('returns null when pairwise returns.length < 2 (only 1 valid price transition, line 68)', () => {
+    // To hit line 68: need >= 20 history points AND < 2 pairwise returns.
+    // pairwiseReturns skips prices[i] === 0, so use 19 zeros + 1 non-zero = only 0 usable transitions.
+    // Actually: prices = [0,0,...,0, 0.65] → pairwiseReturns:
+    //   i=0: prices[0]=0 → skip; i=1..18: prices[i]=0 → skip; only i=19: prices[19]=0.65
+    //   But pairs are (prices[i], prices[i+1]) with prices[i]>0 check.
+    //   So we need prices[0..18]=0, prices[19]=0.65 → loop checks i=0..18 as divisors: all 0 → skipped.
+    //   returns.length = 0 < 2 → return null ✓
+    const now = Date.now();
+    const history: PriceBucket[] = Array.from({ length: 20 }, (_, i) => ({
+      price: i < 19 ? 0 : 0.65, // 19 zeros, 1 non-zero (only at index 19)
+      bucketStart: new Date(now - (20 - i) * 5 * 60 * 1000),
+    }));
+    const result = evaluateVelocity('tok1', 'cond1', history, 100_000, OPTS);
+    expect(result).toBeNull();
+  });
+
 });
