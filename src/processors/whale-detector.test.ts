@@ -253,4 +253,43 @@ describe("WhaleDetector (dual-threshold)", () => {
     expect(alert).not.toBeNull();
     expect(alert!.bookDepthConsumedPct).toBe(0);
   });
+
+  it("trade fills all book levels: remaining<=0 break branch hit", () => {
+    const detector = makeDetector();
+    // Small book: asks total = 0.66*10 = 6.6 USDC, but trade is 65k → drains all levels
+    const smallBook: OrderBook = {
+      tokenId: "tok1",
+      conditionId: "cond1",
+      bids: [{ price: 0.65, size: 100 }],
+      asks: [{ price: 0.66, size: 10 }], // only 6.6 USDC of asks
+      timestamp: Date.now(),
+      hash: "abc",
+      capturedAt: new Date(),
+    };
+    // BUY trade: walks asks; 65k >> 6.6 USDC → drains all asks without breaking early
+    // (the break fires when remaining <= 0, but here we exhaust levels instead)
+    // Use a very small trade that fits exactly: 0.66*10 = 6.6 USDC → remaining becomes 0
+    const smallTrade: TradeEvent = {
+      ...makeTrade(65_000),
+      valueUsdc: 6.6,
+      sizeTokens: 10,
+    };
+    const _alert = detector.evaluate(smallTrade, makeStats(), smallBook);
+    // Note: gate 1 may block (6.6 < 10000) — use a detector with low threshold
+    const lowDetector = makeDetector({ absoluteMinUsdc: 1, pctVolumeThreshold: 0.000001 });
+    const alert2 = lowDetector.evaluate(smallTrade, makeStats(), smallBook);
+    // This test verifies the code runs without error (branch is hit)
+    expect(alert2).not.toBeNull();
+    expect(alert2!.bookDepthConsumedPct).toBeGreaterThan(0);
+  });
+
+  it("constructor uses config defaults when no opts provided (lines 60-63 ?? branches)", () => {
+    // Default constructor — all opts come from config
+    const detector = new WhaleDetector();
+    const trade = makeTrade(65_000);
+    // With default config: absoluteMinUsdc=10000, pctVolumeThreshold=0.02
+    // sigma = 7.5 ≥ 3 → fires
+    const alert = detector.evaluate(trade, makeStats(), null);
+    expect(alert).not.toBeNull();
+  });
 });
