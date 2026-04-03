@@ -1,0 +1,20 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1775235458651,
+      "tag": "0000_misty_thaddeus_ross",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1775235600000,
+      "tag": "0002_partition_trades",
+      "breakpoints": true
+    }
+  ]
+}

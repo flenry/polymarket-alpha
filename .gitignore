@@ -3,4 +3,3 @@ dist/
 .env
 *.js.map
 coverage/
-drizzle/meta/
