@@ -1,6 +1,6 @@
 import "dotenv/config";
 
-function envNumber(key: string, defaultVal: number): number {
+export function envNumber(key: string, defaultVal: number): number {
   const val = process.env[key];
   if (!val) return defaultVal;
   const parsed = Number(val);

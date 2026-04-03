@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { envNumber } from "./config.js";
 
 describe("config", () => {
   const originalEnv = process.env;
@@ -41,5 +42,26 @@ describe("config", () => {
   it("config object is frozen", async () => {
     const { config } = await import("./config.js");
     expect(Object.isFrozen(config)).toBe(true);
+  });
+});
+
+describe("envNumber", () => {
+  it("returns defaultVal when env var is not set", () => {
+    delete process.env.TEST_NUMERIC_VAR_XYZ;
+    expect(envNumber("TEST_NUMERIC_VAR_XYZ", 42)).toBe(42);
+  });
+
+  it("returns parsed number when env var is a valid number", () => {
+    process.env.TEST_NUMERIC_VAR_XYZ = "99";
+    expect(envNumber("TEST_NUMERIC_VAR_XYZ", 0)).toBe(99);
+    delete process.env.TEST_NUMERIC_VAR_XYZ;
+  });
+
+  it("throws when env var is set to a non-numeric string (isNaN branch)", () => {
+    process.env.TEST_NUMERIC_VAR_XYZ = "not-a-number";
+    expect(() => envNumber("TEST_NUMERIC_VAR_XYZ", 0)).toThrow(
+      "Environment variable TEST_NUMERIC_VAR_XYZ must be a number"
+    );
+    delete process.env.TEST_NUMERIC_VAR_XYZ;
   });
 });
