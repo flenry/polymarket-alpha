@@ -3,7 +3,7 @@ import { ZGammaMarket } from "../validation/schemas.js";
 import type { TokenId } from "../events/types.js";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as schema from "../db/schema.js";
-import { upsertMarket, upsertMarketStats, getWatchlistedTokenIds } from "../db/queries/markets.js";
+import { upsertMarket, upsertMarketStats } from "../db/queries/markets.js";
 import { bootstrapMarketStats } from "./stats-bootstrap.js";
 import { logger } from "../logger.js";
 

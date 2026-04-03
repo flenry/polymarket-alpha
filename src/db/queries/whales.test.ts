@@ -171,15 +171,15 @@ describe("insertWhaleAlert — branch coverage", () => {
     expect(qs).toBeDefined();
   });
 
-  it("priceAtSignal=0: uses fallback absolute_min_usdc=10000", async () => {
+  it("stores configured absoluteMinUsdc in the alert row", async () => {
     const db = makeDb();
     const alert = makeAlert(true);
-    const alertNoPrice = {
-      ...alert,
-      signal: { ...alert.signal, priceAtSignal: 0 },
-    };
-    // Should not throw
-    const id = await insertWhaleAlert(db, alertNoPrice);
+    // Pass explicit absoluteMinUsdc=15000
+    const id = await insertWhaleAlert(db, alert, 15000);
     expect(id).toBe(99n);
+    // Verify 15000 appears in the query
+    const call = (db.execute as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const qs = JSON.stringify(call);
+    expect(qs).toContain("15000");
   });
 });

@@ -14,8 +14,44 @@ import { PriceHistoryWriter } from "./processors/price-history-writer.js";
 import { insertTrade } from "./db/queries/trades.js";
 import { getMarketStats } from "./db/queries/markets.js";
 import { RollingStatsBuffer } from "./sources/stats-bootstrap.js";
-import type { MarketStats, TradeEvent } from "./events/types.js";
+import { evaluatePriceImpact } from "./signals/price-impact-signal.js";
+import { evaluateVelocity } from "./signals/velocity-signal.js";
+import type { MarketStats, TradeEvent, OrderBook, TokenId } from "./events/types.js";
 import { logger } from "./logger.js";
+
+/** In-memory sliding window of recent price points per token (for price-impact signal) */
+const recentPrices = new Map<TokenId, Array<{ price: number; recordedAt: Date }>>();
+const PRICE_WINDOW_MS = 120_000; // keep 2 min of history (covers 60s window + buffer)
+
+function recordPrice(tokenId: TokenId, price: number): void {
+  if (!recentPrices.has(tokenId)) recentPrices.set(tokenId, []);
+  const buf = recentPrices.get(tokenId)!;
+  buf.push({ price, recordedAt: new Date() });
+  // Evict entries older than window
+  const cutoff = new Date(Date.now() - PRICE_WINDOW_MS);
+  const fresh = buf.filter((p) => p.recordedAt >= cutoff);
+  recentPrices.set(tokenId, fresh);
+}
+
+/** 24h price bucket store per token (for velocity signal) — 5-min buckets */
+const priceBuckets = new Map<TokenId, Array<{ price: number; bucketStart: Date }>>();
+const BUCKET_MS = 5 * 60 * 1000;
+const MAX_BUCKETS = 288; // 24h / 5min
+
+function recordBucketPrice(tokenId: TokenId, price: number): void {
+  if (!priceBuckets.has(tokenId)) priceBuckets.set(tokenId, []);
+  const buf = priceBuckets.get(tokenId)!;
+  const now = Date.now();
+  const bucketStart = new Date(Math.floor(now / BUCKET_MS) * BUCKET_MS);
+
+  // Update last bucket if same time slot, else push new
+  if (buf.length > 0 && buf[buf.length - 1].bucketStart.getTime() === bucketStart.getTime()) {
+    buf[buf.length - 1].price = price;
+  } else {
+    buf.push({ price, bucketStart });
+    if (buf.length > MAX_BUCKETS) buf.shift();
+  }
+}
 
 export async function startPipeline(): Promise<() => Promise<void>> {
   logger.info("Pipeline: starting");
@@ -30,6 +66,8 @@ export async function startPipeline(): Promise<() => Promise<void>> {
   // 2. Create negRisk set and market stats cache (will be populated by GammaPoller)
   const negRiskSet = new Set<string>();
   const statsCache = new Map<string, MarketStats>();
+  /** Maps tokenId → conditionId for use in signal emission */
+  const conditionIdMap = new Map<string, string>();
 
   // Rolling 24h stats buffer — updated on every live trade, recomputed every 60s
   const rollingBuffer = new RollingStatsBuffer();
@@ -83,10 +121,26 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     // Feed rolling buffer for live stats accumulation
     rollingBuffer.addTrade(trade.tokenId, trade.valueUsdc, trade.tradedAt);
 
+    // Record price for PRICE_IMPACT_ANOMALY signal
+    recordPrice(trade.tokenId, trade.priceUsdc);
+    recordBucketPrice(trade.tokenId, trade.priceUsdc);
+
     tradeBatch.push(trade);
     if (tradeBatch.length >= config.tradeBatchSize) {
       await flushTradeBatch();
     }
+  });
+
+  // Also record price from best_bid_ask events (midpoint)
+  bus.on("best_bid_ask", (evt) => {
+    const mid = (evt.bid + evt.ask) / 2;
+    recordPrice(evt.tokenId, mid);
+    recordBucketPrice(evt.tokenId, mid);
+  });
+
+  bus.on("last_trade_price", (evt) => {
+    recordPrice(evt.tokenId, evt.price);
+    recordBucketPrice(evt.tokenId, evt.price);
   });
 
   // 6. Start ClobRestClient + SnapshotWriter
@@ -97,7 +151,7 @@ export async function startPipeline(): Promise<() => Promise<void>> {
   const alertEmitter = new AlertEmitter(bus);
   alertEmitter.start();
 
-  // 8. OrderBookImbalanceEngine — called after each book snapshot (PLAN Task 2.5)
+  // 8. OrderBookImbalanceEngine + PriceImpactSignal — called after each book snapshot
   const imbalanceEngine = new OrderBookImbalanceEngine(bus);
 
   const snapshotWriter = new SnapshotWriter(
@@ -105,9 +159,27 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     clobClient,
     () => gammaPoller.getWatchlist(),
     config.snapshotIntervalMs,
-    (book) => {
+    (book: OrderBook) => {
       // Evaluate imbalance after each book snapshot is persisted
       imbalanceEngine.evaluate(book);
+
+      // Evaluate price impact using recent in-memory price history
+      const tokenPrices = recentPrices.get(book.tokenId) ?? [];
+      const windowCutoff = new Date(Date.now() - config.priceImpactWindowSec * 1000);
+      const windowPrices = tokenPrices.filter((p) => p.recordedAt >= windowCutoff);
+
+      if (windowPrices.length >= 2) {
+        const impactSignal = evaluatePriceImpact(
+          book.tokenId,
+          book.conditionId,
+          windowPrices,
+          0, // triggeringTradeValueUsdc not available here — use 0 for book-triggered
+          statsCache.get(book.tokenId)?.liquidityUsdc ?? 0
+        );
+        if (impactSignal) {
+          bus.emit("signal", impactSignal);
+        }
+      }
     }
   );
   snapshotWriter.start();
@@ -133,6 +205,7 @@ export async function startPipeline(): Promise<() => Promise<void>> {
             calibrated: row.calibrated ?? false,
           };
           statsCache.set(trade.tokenId, stats);
+          conditionIdMap.set(trade.tokenId, row.conditionId);
         }
       } catch (err) {
         logger.warn({ err, tokenId: trade.tokenId }, "Pipeline: getMarketStats failed, using defaults");
@@ -170,7 +243,10 @@ export async function startPipeline(): Promise<() => Promise<void>> {
   // Refresh stats cache on each Gamma poll cycle
   gammaPoller.on("markets_updated", (tokenIds) => {
     // Evict stale cache entries so next trade triggers a fresh DB read
-    for (const id of tokenIds) statsCache.delete(id);
+    for (const id of tokenIds) {
+      statsCache.delete(id);
+      conditionIdMap.delete(id);
+    }
   });
 
   // 9. SignalAggregator
@@ -181,6 +257,23 @@ export async function startPipeline(): Promise<() => Promise<void>> {
   const priceHistoryWriter = new PriceHistoryWriter(bus, db);
   priceHistoryWriter.start();
 
+  // 11. Velocity signal — 5-min scheduled scan over all watchlisted tokens (PLAN Task 2.8)
+  let velocityTimer: ReturnType<typeof setInterval> | null = null;
+  velocityTimer = setInterval(() => {
+    const watchlist = gammaPoller.getWatchlist();
+    for (const tokenId of watchlist) {
+      const history = priceBuckets.get(tokenId) ?? [];
+      const stats = statsCache.get(tokenId);
+      const liquidityUsdc = stats?.liquidityUsdc ?? 0;
+      const conditionId = conditionIdMap.get(tokenId) ?? tokenId;
+
+      const velocitySignal = evaluateVelocity(tokenId, conditionId, history, liquidityUsdc);
+      if (velocitySignal) {
+        bus.emit("signal", velocitySignal);
+      }
+    }
+  }, 5 * 60 * 1000); // every 5 minutes
+
   logger.info("Pipeline: all components started");
 
   // Graceful shutdown function
@@ -190,27 +283,33 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     // 1. Stop accepting new events
     liveDataWs.disconnect();
 
-    // 2. Flush trade batch
+    // 2. Stop velocity scanner
+    if (velocityTimer) {
+      clearInterval(velocityTimer);
+      velocityTimer = null;
+    }
+
+    // 3. Flush trade batch
     if (flushTimer) {
       clearInterval(flushTimer);
       flushTimer = null;
     }
     await flushTradeBatch();
 
-    // 3. Flush pending price history
+    // 4. Flush pending price history
     await priceHistoryWriter.flush();
     priceHistoryWriter.stop();
 
-    // 4. Stop snapshot writer
+    // 5. Stop snapshot writer
     snapshotWriter.stop();
 
-    // 5. Stop gamma poller
+    // 6. Stop gamma poller
     gammaPoller.stop();
 
-    // 6. Stop partition manager
+    // 7. Stop partition manager
     partitionManager.stop();
 
-    // 7. Close DB
+    // 8. Close DB
     await closeDb();
 
     logger.info("Pipeline: shutdown complete");

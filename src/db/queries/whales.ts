@@ -3,6 +3,7 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as schema from "../schema.js";
 import { whaleAlerts } from "../schema.js";
 import type { WhaleAlert } from "../../events/types.js";
+import { config } from "../../config.js";
 
 type Db = NodePgDatabase<typeof schema>;
 
@@ -29,7 +30,8 @@ export function buildTradeLookupKey(alert: WhaleAlert): string {
  */
 export async function insertWhaleAlert(
   db: Db,
-  alert: WhaleAlert
+  alert: WhaleAlert,
+  absoluteMinUsdc: number = config.absoluteMinUsdc
 ): Promise<bigint | null> {
   if (!alert.emitSignal) return null;
 
@@ -48,7 +50,7 @@ export async function insertWhaleAlert(
       ${tradeLookupKey},
       ${trade.tokenId}, ${trade.conditionId},
       ${alert.usdcValue.toString()},
-      ${alert.signal.priceAtSignal ? Math.round(alert.usdcValue) : 10000}::integer,
+      ${absoluteMinUsdc}::integer,
       ${marketStats.avgTradeSize24h?.toString() ?? null},
       ${marketStats.stddevTradeSize24h?.toString() ?? null},
       ${marketStats.volume24hr?.toString() ?? null},

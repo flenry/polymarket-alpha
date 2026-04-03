@@ -1,11 +1,5 @@
 import "dotenv/config";
 
-function requireEnv(key: string): string {
-  const val = process.env[key];
-  if (!val) throw new Error(`Required environment variable ${key} is not set`);
-  return val;
-}
-
 function envNumber(key: string, defaultVal: number): number {
   const val = process.env[key];
   if (!val) return defaultVal;
@@ -15,6 +9,7 @@ function envNumber(key: string, defaultVal: number): number {
 }
 
 export const config = Object.freeze({
+  // databaseUrl: empty string when unset; DB client throws a clear error on connection attempt
   databaseUrl: process.env.DATABASE_URL ?? "",
   absoluteMinUsdc: envNumber("WHALE_ABSOLUTE_MIN_USDC", 10_000),
   sigmaThreshold: envNumber("WHALE_SIGMA_THRESHOLD", 3.0),
