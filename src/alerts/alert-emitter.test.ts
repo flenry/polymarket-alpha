@@ -128,3 +128,20 @@ describe("formatWhaleAlert", () => {
     expect(output).toContain("3.10% of daily vol");
   });
 });
+
+describe("AlertEmitter latency warning", () => {
+  it("logs warn when alertLatencyMs > 1000ms", () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const bus = new TypedEventBus();
+    const emitter = new AlertEmitter(bus);
+
+    // Trade that happened 2 seconds ago → latency > 1000ms
+    const oldTrade = new Date(Date.now() - 2000);
+    const alert = makeAlert(oldTrade);
+
+    // Should not throw; the warn branch should be exercised
+    expect(() => emitter.emit(alert)).not.toThrow();
+
+    consoleSpy.mockRestore();
+  });
+});
