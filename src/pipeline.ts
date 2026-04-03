@@ -12,6 +12,8 @@ import { SignalAggregator } from "./processors/signal-aggregator.js";
 import { OrderBookImbalanceEngine } from "./processors/book-imbalance-engine.js";
 import { PriceHistoryWriter } from "./processors/price-history-writer.js";
 import { insertTrade } from "./db/queries/trades.js";
+import { getMarketStats } from "./db/queries/markets.js";
+import type { MarketStats } from "./events/types.js";
 import { logger } from "./logger.js";
 
 export async function startPipeline(): Promise<() => Promise<void>> {
@@ -24,8 +26,9 @@ export async function startPipeline(): Promise<() => Promise<void>> {
   );
   partitionManager.start();
 
-  // 2. Create negRisk set (will be populated by GammaPoller)
+  // 2. Create negRisk set and market stats cache (will be populated by GammaPoller)
   const negRiskSet = new Set<string>();
+  const statsCache = new Map<string, MarketStats>();
 
   // 3. Start GammaPoller
   const gammaPoller = new GammaPoller({
@@ -74,11 +77,33 @@ export async function startPipeline(): Promise<() => Promise<void>> {
   const alertEmitter = new AlertEmitter(bus);
   alertEmitter.start();
 
-  bus.on("trade", (trade) => {
+  bus.on("trade", async (trade) => {
     const book = snapshotWriter.getLatestBook(trade.tokenId)?.book ?? null;
-    // Stats would come from market_stats in real usage
-    // For now, use minimal default (will be calibrated from DB in production)
-    const stats = {
+
+    // Fetch calibrated stats from cache, falling back to DB lookup
+    let stats = statsCache.get(trade.tokenId);
+    if (!stats) {
+      try {
+        const row = await getMarketStats(db, trade.tokenId);
+        if (row) {
+          stats = {
+            tokenId: trade.tokenId,
+            volume24hr: row.volume24hr ? Number(row.volume24hr) : 0,
+            avgTradeSize24h: row.avgTradeSize24h ? Number(row.avgTradeSize24h) : 0,
+            stddevTradeSize24h: row.stddevTradeSize24h ? Number(row.stddevTradeSize24h) : 0,
+            liquidityUsdc: row.liquidityUsdc ? Number(row.liquidityUsdc) : 0,
+            tradeCount24h: row.tradeCount24h ?? 0,
+            calibrated: row.calibrated ?? false,
+          };
+          statsCache.set(trade.tokenId, stats);
+        }
+      } catch (err) {
+        logger.warn({ err, tokenId: trade.tokenId }, "Pipeline: getMarketStats failed, using defaults");
+      }
+    }
+
+    // Use calibrated stats or uncalibrated default (absolute-threshold-only)
+    const effectiveStats: MarketStats = stats ?? {
       tokenId: trade.tokenId,
       volume24hr: 0,
       avgTradeSize24h: 0,
@@ -88,10 +113,16 @@ export async function startPipeline(): Promise<() => Promise<void>> {
       calibrated: false,
     };
 
-    const alert = detector.evaluate(trade, stats, book);
+    const alert = detector.evaluate(trade, effectiveStats, book);
     if (alert) {
       bus.emit("whale_alert", alert);
     }
+  });
+
+  // Refresh stats cache on each Gamma poll cycle
+  gammaPoller.on("markets_updated", (tokenIds) => {
+    // Evict stale cache entries so next trade triggers a fresh DB read
+    for (const id of tokenIds) statsCache.delete(id);
   });
 
   // 8. SignalAggregator
