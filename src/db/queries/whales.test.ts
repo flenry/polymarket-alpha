@@ -146,6 +146,16 @@ describe("enrichWhaleAlert", () => {
 
     expect(db.update as ReturnType<typeof vi.fn>).toHaveBeenCalled();
   });
+
+  it("handles undefined walletTradeCount (line 85 ?? null branch)", async () => {
+    const db = makeDb();
+    // All optional fields omitted — exercises walletTradeCount ?? null
+    await enrichWhaleAlert(db, 99n, {
+      // walletTradeCount intentionally omitted → exercises ?? null at line 85
+    });
+
+    expect(db.update as ReturnType<typeof vi.fn>).toHaveBeenCalled();
+  });
 });
 
 describe("insertWhaleAlert — null stats fields (lines 54-56)", () => {
