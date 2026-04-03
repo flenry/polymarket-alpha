@@ -139,6 +139,29 @@ describe("formatWhaleAlert", () => {
     expect(output).toContain("pct-of-vol only");
     expect(output).not.toContain("σ above mean");
   });
+
+  it("bookSnapshotAgeMs=0: empty book age string (line 14 false branch)", () => {
+    const alert = makeAlert();
+    const alertNoAge = { ...alert, bookSnapshotAgeMs: 0 };
+    const output = formatWhaleAlert(alertNoAge);
+    expect(output).not.toContain("book age");
+  });
+
+  it("falls back to marketSlug when marketTitle is empty (line 18 || branch)", () => {
+    const alert = makeAlert();
+    const trade = { ...alert.trade, marketTitle: "", marketSlug: "some-slug", tokenId: "tok-xyz" };
+    const alertNoTitle = { ...alert, trade };
+    const output = formatWhaleAlert(alertNoTitle);
+    expect(output).toContain("some-slug");
+  });
+
+  it("falls back to tokenId when both marketTitle and marketSlug are empty (line 18 || || branch)", () => {
+    const alert = makeAlert();
+    const trade = { ...alert.trade, marketTitle: "", marketSlug: "", tokenId: "tok-xyz" };
+    const alertNoTitle = { ...alert, trade };
+    const output = formatWhaleAlert(alertNoTitle);
+    expect(output).toContain("tok-xyz");
+  });
 });
 
 describe("AlertEmitter latency warning", () => {
