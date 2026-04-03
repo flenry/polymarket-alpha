@@ -53,8 +53,8 @@ describe("WsBookImbalanceEvaluator", () => {
   it("BULL signal: ratio > threshold → emits ORDER_BOOK_IMBALANCE with BULLISH direction", () => {
     // bids: 4 * 1.0 USDC = 4.0, asks: 1 * 1.0 USDC = 1.0 → ratio = 4.0 > 3.0
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
@@ -76,8 +76,8 @@ describe("WsBookImbalanceEvaluator", () => {
     // bids = 4, asks = 1 → ratio = 4.0, threshold = 3.0
     // confidence = (4 - 3) / 3 = 0.333...
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
@@ -97,8 +97,8 @@ describe("WsBookImbalanceEvaluator", () => {
   it("BEAR signal: ratio < 1/threshold → emits ORDER_BOOK_IMBALANCE with BEARISH direction", () => {
     // bids = 1, asks = 4 → ratio = 0.25 < 1/3.0 = 0.333
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
@@ -117,8 +117,8 @@ describe("WsBookImbalanceEvaluator", () => {
   it("no signal when ratio within band (between 1/threshold and threshold)", () => {
     // ratio = 2.0 is between 0.333 and 3.0 → no signal
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
@@ -135,8 +135,8 @@ describe("WsBookImbalanceEvaluator", () => {
 
   it("cooldown: second evaluate within cooldown window → no second signal but snapshot still inserted", () => {
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
@@ -156,8 +156,8 @@ describe("WsBookImbalanceEvaluator", () => {
 
   it("resetCooldown: after reset, second evaluate emits signal", () => {
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
@@ -175,8 +175,8 @@ describe("WsBookImbalanceEvaluator", () => {
 
   it("strength = total depth (bidDepthUsdc + askDepthUsdc)", () => {
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
@@ -194,8 +194,8 @@ describe("WsBookImbalanceEvaluator", () => {
 
   it("askDepthUsdc === 0: no snapshot insert, no signal", () => {
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
@@ -208,8 +208,8 @@ describe("WsBookImbalanceEvaluator", () => {
 
   it("snapshot always inserted with snapshotTrigger: 'ws_event'", () => {
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
@@ -227,8 +227,8 @@ describe("WsBookImbalanceEvaluator", () => {
 
   it("ORDER_BOOK_IMBALANCE signal type (not BOOK_IMBALANCE)", () => {
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
@@ -243,8 +243,8 @@ describe("WsBookImbalanceEvaluator", () => {
 
   it("priceAtSignal = mid-price when both bids and asks present", () => {
     const evaluator = new WsBookImbalanceEvaluator(
-      bus as unknown as Parameters<typeof WsBookImbalanceEvaluator>[0],
-      db as unknown as Parameters<typeof WsBookImbalanceEvaluator>[1],
+      bus as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[0],
+      db as unknown as ConstructorParameters<typeof WsBookImbalanceEvaluator>[1],
       { threshold: THRESHOLD, cooldownMs: 60_000 }
     );
 
