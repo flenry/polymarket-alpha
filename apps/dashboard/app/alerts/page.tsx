@@ -6,13 +6,18 @@ import { StatCard } from "@/components/stat-card";
 import { formatUSDC } from "@/lib/utils";
 import type { AlertRow } from "@/app/api/alerts/route";
 
+const POLL_MS = parseInt(
+  process.env.NEXT_PUBLIC_DASHBOARD_POLL_INTERVAL_MS ?? "5000",
+  10
+);
+
 const fetcher = (url: string) => fetch(url).then((r) => r.json());
 
 export default function AlertsPage() {
   const { data } = useSWR<{ alerts: AlertRow[]; total: number }>(
     "/api/alerts?hours=24&limit=100",
     fetcher,
-    { refreshInterval: 5000 }
+    { refreshInterval: POLL_MS }
   );
 
   const alerts = data?.alerts ?? [];

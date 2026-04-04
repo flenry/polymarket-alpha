@@ -4,7 +4,6 @@ const { mockQuery } = vi.hoisted(() => ({ mockQuery: vi.fn() }));
 
 vi.mock("../lib/db", () => ({
   pool: { query: mockQuery },
-  db: {},
 }));
 
 vi.mock("next/server", () => ({
@@ -117,6 +116,18 @@ describe("GET /api/markets", () => {
 
     const callParams = mockQuery.mock.calls[0][1] as unknown[];
     expect(callParams[0]).toBe(168);
+  });
+
+  it("returns 400 for hours < 1", async () => {
+    const req = makeRequest({ hours: "0" });
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for non-numeric hours", async () => {
+    const req = makeRequest({ hours: "abc" });
+    const res = await GET(req);
+    expect(res.status).toBe(400);
   });
 
   it("tie-breaking: same count, lower lexical signal_type wins", async () => {

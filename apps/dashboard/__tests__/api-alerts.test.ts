@@ -5,7 +5,6 @@ const { mockQuery } = vi.hoisted(() => ({ mockQuery: vi.fn() }));
 // Mock the db module before importing route
 vi.mock("../lib/db", () => ({
   pool: { query: mockQuery },
-  db: {},
 }));
 
 // Mock next/server
@@ -119,6 +118,18 @@ describe("GET /api/alerts", () => {
     expect(res.status).toBe(400);
   });
 
+  it("returns 400 for limit < 1", async () => {
+    const req = makeRequest({ limit: "0" });
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for negative offset", async () => {
+    const req = makeRequest({ offset: "-1" });
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+  });
+
   it("clamps limit to max 500", async () => {
     mockQuery
       .mockResolvedValueOnce({ rows: [] })
@@ -142,6 +153,18 @@ describe("GET /api/alerts", () => {
 
     const callParams = mockQuery.mock.calls[0][1] as unknown[];
     expect(callParams[0]).toBe(6); // hours is first param
+  });
+
+  it("passes offset through to query", async () => {
+    mockQuery
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ total: "0" }] });
+
+    const req = makeRequest({ offset: "50" });
+    await GET(req);
+
+    const callParams = mockQuery.mock.calls[0][1] as unknown[];
+    expect(callParams[2]).toBe(50); // offset is third param
   });
 
   it("returns 500 on DB error", async () => {

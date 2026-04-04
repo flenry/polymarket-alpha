@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
+import { X } from "lucide-react";
 import { timeAgo } from "@/lib/utils";
 import type { SignalRow, SignalType } from "@/app/api/signals/route";
 
@@ -74,8 +75,12 @@ export function SignalsTable({ initialTokenId }: Props) {
   const [selectedTypes, setSelectedTypes] = useState<SignalType[]>([]);
   const [minConfidence, setMinConfidence] = useState<number>(0); // 0-100
   const [hours, setHours] = useState<string>("24");
+  // tokenId is initialised from URL prop but can be cleared by the user
+  const [activeTokenId, setActiveTokenId] = useState<string | undefined>(
+    initialTokenId
+  );
 
-  const url = buildUrl(selectedTypes, minConfidence, hours, initialTokenId);
+  const url = buildUrl(selectedTypes, minConfidence, hours, activeTokenId);
   const { data, isLoading } = useSWR<{ signals: SignalRow[] }>(url, fetcher, {
     refreshInterval: POLL_MS,
   });
@@ -138,6 +143,23 @@ export function SignalsTable({ initialTokenId }: Props) {
           </SelectContent>
         </Select>
       </div>
+
+      {/* Active market filter pill */}
+      {activeTokenId && (
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-slate-500">Filtered to market:</span>
+          <span className="inline-flex items-center gap-1 bg-blue-50 text-blue-700 border border-blue-200 rounded-full px-2.5 py-0.5 text-xs font-medium">
+            <span className="font-mono truncate max-w-[200px]">{activeTokenId}</span>
+            <button
+              onClick={() => setActiveTokenId(undefined)}
+              className="ml-1 hover:text-blue-900"
+              aria-label="Clear market filter"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </span>
+        </div>
+      )}
 
       {/* Table */}
       <div className="bg-white border border-slate-200 rounded-lg shadow-sm overflow-hidden">

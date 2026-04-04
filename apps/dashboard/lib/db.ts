@@ -1,6 +1,4 @@
 import { Pool } from "pg";
-import { drizzle } from "drizzle-orm/node-postgres";
-import * as schema from "../../../src/db/schema";
 
 // Singleton pool — prevents connection leaks during Next.js hot reload in dev
 declare global {
@@ -18,5 +16,3 @@ function createPool(): Pool {
 
 export const pool: Pool =
   globalThis.__pgPool ?? (globalThis.__pgPool = createPool());
-
-export const db = drizzle(pool, { schema });

@@ -4,7 +4,6 @@ const { mockQuery } = vi.hoisted(() => ({ mockQuery: vi.fn() }));
 
 vi.mock("../lib/db", () => ({
   pool: { query: mockQuery },
-  db: {},
 }));
 
 vi.mock("next/server", () => ({
