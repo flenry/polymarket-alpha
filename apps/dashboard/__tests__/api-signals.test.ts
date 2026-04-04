@@ -118,6 +118,18 @@ describe("GET /api/signals", () => {
     expect(res.status).toBe(400);
   });
 
+  it("returns 400 for invalid hours (0)", async () => {
+    const req = makeRequest({ hours: "0" });
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for non-numeric hours", async () => {
+    const req = makeRequest({ hours: "abc" });
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+  });
+
   it("enforces LIMIT 200 in query", async () => {
     mockQuery.mockResolvedValueOnce({ rows: [] });
 
