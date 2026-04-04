@@ -13,7 +13,7 @@ Real-time Polymarket data pipeline. Ingests trade events and order book data, pe
 **Phase 3 is complete and fully tested.** 414 tests passing, 95.88% stmt / 94.64% branch coverage.
 **Phase 4 is complete and fully tested.** 480 tests passing.
 **Phase 5 is complete and fully tested.** 480 tests passing.
-**Phase 6 (Dashboard) is complete and fully tested.** 480 pipeline tests + 84 dashboard tests = 564 total. Branch: `feat/dashboard`.
+**Phase 6 (Dashboard) is complete and fully tested.** 480 pipeline tests + 108 dashboard tests = 588 total. Branch: `feat/dashboard`.
 
 ---
 
@@ -192,7 +192,7 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 - ✅ All CLIs: `tsc && node dist/analytics/xxx.js` pattern, bound param cutoffs, numeric arg validation
 
 **Phase 6 complete (branch: `feat/dashboard`).**
-- ✅ 84 dashboard Vitest tests passing (8 test files)
+- ✅ 108 dashboard Vitest tests passing (8 test files)
 - ✅ Next.js 14 App Router dashboard at `apps/dashboard/`
 - ✅ 5 pages: `/alerts`, `/signals`, `/markets`, `/wallets`, `/health`
 - ✅ 7 API routes with correct query logic (full-tuple join, resolved_trade_count filter, deterministic topSignalType)
@@ -304,4 +304,4 @@ pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql direct
 
 ---
 
-Last updated: 2026-04-04 (Phase 6 final — 480 pipeline + 84 dashboard = 564 tests)
+Last updated: 2026-04-04 (Phase 6 final — 480 pipeline + 108 dashboard = 588 tests)

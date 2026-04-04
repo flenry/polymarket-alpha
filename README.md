@@ -68,7 +68,7 @@ pnpm dashboard:dev
 pnpm dashboard:build
 
 # Dashboard tests
-cd apps/dashboard && pnpm test   # 84 tests, 8 test files
+cd apps/dashboard && pnpm test   # 108 tests, 8 test files
 ```
 
 Pages: `/alerts` (whale feed, 5s), `/signals` (stream + sparkline, 5s), `/markets` (heat map, 30s), `/wallets` (leaderboard, 30s), `/health` (pipeline status, 10s)
