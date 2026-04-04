@@ -1,540 +1,712 @@
-# Plan: Phase 2 — CLOB WS Pool, Imbalance Engine, Webhook Alerts, Wallet Enrichment
+# Plan: Phase 3 — Signal Intelligence & Backtesting
 
-> **Board-reviewed v2** — addresses all MAJOR and MINOR findings from Law's code review.
-> Supersedes the previous draft. Zoro must follow this version.
+> **Board-reviewed** — Robin's research brief for the full Phase 3 build.
+> Zoro implements. Usopp tests. Law approves architecture decisions.
 
 ## Goal
-Fully implement the four Phase 2 modules — `ClobWsPool` (complete), `WsBookImbalanceEvaluator` (new, WS-path only), `WebhookEmitter`, `WalletEnricher` — wire them into the live pipeline, and deliver ≥ 95% test coverage across all new code, with all existing 256 tests continuing to pass.
+Deliver two new signal evaluators (`PriceImpactSignal` v2, `SentimentVelocitySignal` v2 — fully replacing the Phase 1 stubs), composite confidence scoring in `SignalAggregator`, a four-file backtesting module (`src/backtest/`), pipeline wiring for all new components, and ≥ 95% test coverage across all new code, with all existing 357 tests continuing to pass.
 
 ## Branch
-`feat/phase-2` (already created, clean branch from `main` at 32512fc)
-
-## Project Status
-**EXISTING project.** Phase 1 is complete: 256 tests passing, 30 test files, schema and migrations locked.
+`feat/phase-3` (created from `main` at 58ed40d)
 
 ---
 
-## Codebase State (as of Phase 1)
+## Project Status
+**EXISTING project — Phase 1 + Phase 2 complete.** 357 tests, 97.33% stmt / 95.91% branch.
+
+---
+
+## Codebase State (as of Phase 2)
 
 ### What is LOCKED — must not change
-- `src/db/schema.ts` — complete. Do not touch.
-- `drizzle/` — migration files and journal. Locked.
-- All Phase 1 files **not listed below** in the allowed edit surface.
+- `src/db/schema.ts` — complete, frozen
+- `drizzle/` — migration files and journal, frozen
+- All Phase 1 and Phase 2 source files **not listed** in the allowed edit surface below
 
-### Allowed edit surface (Phase 2 may touch these files)
-The following Phase 1 source files **may** be modified in Phase 2:
+### Allowed edit surface (Phase 3 may touch these files)
 
 | File | Permitted change |
 |---|---|
-| `src/pipeline.ts` | Add ClobWsPool, WsBookImbalanceEvaluator, WebhookEmitter, WalletEnricher wiring |
-| `src/config.ts` | Add Phase 2 config fields |
-| `.env.example` | Add Phase 2 env vars |
-| `src/sources/clob-ws-pool.ts` | Add `url` option, add reconnect jitter, add `market_resolved` handler |
-| `src/db/queries/whales.ts` | Extend `enrichWhaleAlert` to include `walletFirstSeenAt` |
-| `src/alerts/alert-emitter.ts` | Accept optional `webhookEmitter` for fire-and-forget webhook delivery |
-| `src/processors/signal-aggregator.ts` | Add optional `onWhaleInserted` callback for WalletEnricher alertId handoff |
+| `src/signals/price-impact-signal.ts` | Full rewrite — replace Phase 1 stub with Phase 3 algorithm |
+| `src/signals/velocity-signal.ts` | Full rewrite — replace Phase 1 stub with Phase 3 algorithm |
+| `src/processors/signal-aggregator.ts` | Add composite confidence scoring (in-memory map + enriched payload) |
+| `src/pipeline.ts` | Wire PriceImpactSignal v2 + SentimentVelocitySignal v2 |
+| `src/config.ts` | Add 7 Phase 3 env vars |
+| `.env.example` | Add Phase 3 env vars |
+| `package.json` | Add `backtest` script |
 
-**All other Phase 1 source files are frozen.** `src/processors/book-imbalance-engine.ts` is frozen.
-
-### What's already done
-- `ClobWsPool` — fully implemented in Phase 1: sharding, per-shard reconnect, backoff, keepalive, Zod-validated parsing, emits typed local EventEmitter events. **Missing**: jitter on reconnect delay, `market_resolved` handling, `url` option (currently hardcodes WS URL).
-- `OrderBookImbalanceEngine` (Phase 1 REST path) — fully implemented, frozen. Uses 5-min debounce + ratio-shift re-emit + Phase 1 confidence formula. **Will NOT be touched or reused for the WS path.**
-- `src/config.ts` — already has `clobWsShardSize`, `imbalanceRatioThreshold`, `walletEnrichRps`, `reconnectBaseMs`, `reconnectMaxMs`. Needs Phase 2 additions.
-- `src/db/queries/snapshots.ts` — has `insertBookSnapshot()` and `getLatestBook()`. No update path. Phase 2 adds snapshot persistence via new `ws_event` insert (not update).
-
-### What needs to be built from scratch
-- `src/processors/ws-book-imbalance-evaluator.ts` — new lightweight WS-only evaluator (does NOT replace `OrderBookImbalanceEngine`)
-- `src/alerts/webhook-emitter.ts` — Discord + Slack webhook delivery with token-bucket rate limiting
-- `src/enrichment/wallet-enricher.ts` — async wallet profiling via data-api, upserts `wallet_profiles`
-- `src/db/queries/wallets.ts` — upsert function for `wallet_profiles` (not yet in queries layer)
-- `src/db/queries/markets.ts` (addition) — `markMarketClosed(db, tokenId)` for `market_resolved` handling
+### What is NEW (create from scratch)
+- `src/backtest/types.ts`
+- `src/backtest/runner.ts`
+- `src/backtest/evaluator.ts`
+- `src/backtest/report.ts`
+- `src/signals/price-impact-signal.test.ts` — **replace** existing tests (spec algorithm change)
+- `src/signals/velocity-signal.test.ts` — **replace** existing tests (spec algorithm change)
+- `src/processors/signal-aggregator.test.ts` — extend (composite scoring additions only)
+- `src/backtest/runner.test.ts`
+- `src/backtest/evaluator.test.ts`
+- `src/backtest/report.test.ts`
 
 ---
 
-## Architecture Decisions (Law-reviewed)
+## Critical Architecture Decisions
 
-### Decision 1: Two separate imbalance evaluators (NOT one reused instance)
+### Decision 1: Signal algorithm replacement, not incremental change
 
-**Law finding [MAJOR]:** The Phase 1 `OrderBookImbalanceEngine` uses a 5-min debounce + ratio-shift + different confidence formula. Reusing it for the WS path is spec drift.
+The Phase 1 stubs (`evaluatePriceImpact`, `evaluateVelocity`) have **different algorithms** from the Phase 3 spec:
 
-**Resolution:** Introduce a **second, lightweight evaluator** for the WS path:
-- New file: `src/processors/ws-book-imbalance-evaluator.ts`
-- Class: `WsBookImbalanceEvaluator`
-- Spec-correct formulas:
-  - Confidence: `min(1.0, (ratio - threshold) / threshold)`
-  - Strength: total depth (`bidDepthUsdc + askDepthUsdc`)
-  - Cooldown: `IMBALANCE_COOLDOWN_MS` (default 60s), simple per-token timestamp check
-- Emits `ORDER_BOOK_IMBALANCE` signal (canonical type — see Decision 3) onto the bus
-- Also persists a `ws_event` snapshot row via `insertBookSnapshot()` (see Decision 2)
-- Phase 1 `OrderBookImbalanceEngine` is **untouched** — continues to serve the REST-timer path
+| Property | Phase 1 stub | Phase 3 spec |
+|---|---|---|
+| `evaluatePriceImpact` trigger | Price % change window | `actualImpact / expectedImpact > threshold` (anomaly score) |
+| `evaluatePriceImpact` inputs | `priceHistory[]` + `liquidityUsdc` | `TradeEvent` + `order_book_snapshots` + `price_history` (DB) |
+| `evaluateVelocity` trigger | Z-score on 5-min buckets | `\|priceVelocity\| > threshold AND tradeCountVelocity > multiplier` |
+| `evaluateVelocity` architecture | Pure function, called every 5min | Class with in-memory rolling buffer per token, event-driven |
 
-### Decision 2: WS-driven snapshot persistence (NOT an update)
+**Resolution:** Both files are completely replaced. The existing function signatures `evaluatePriceImpact()` and `evaluateVelocity()` are abandoned. New exports are **classes**: `PriceImpactSignalEvaluator` and `SentimentVelocityEvaluator`. The old tests are entirely replaced. `pipeline.ts` call sites are updated.
 
-**Law finding [MAJOR]:** The spec requires writing `imbalanceRatio`, `bidDepthUsdc`, `askDepthUsdc` back to `order_book_snapshots`. The current plan had no task for this.
+### Decision 2: `PriceImpactSignalEvaluator` requires DB access (async)
 
-**Resolution:** After each qualifying `book_update` event, `WsBookImbalanceEvaluator.evaluate()` inserts a new `order_book_snapshots` row with `snapshotTrigger = "ws_event"` using the existing `insertBookSnapshot()`. No update path needed — the schema is append-only by design. The REST snapshot is authoritative for Phase 1 queries; the `ws_event` snapshot is supplementary for Phase 2 analytics.
+The spec requires fetching `order_book_snapshots` (max age 60s) and `price_history` (last 2 records) from the DB. This is an **async, DB-read operation** on the hot trade path.
 
-### Decision 3: Canonical signal type is `ORDER_BOOK_IMBALANCE`
+**Resolution:**
+- `PriceImpactSignalEvaluator` is a class injected with `db`
+- `evaluate(trade: TradeEvent): Promise<PriceImpactSignal | null>` — called on `trade` events
+- DB reads: `getLatestBook(db, tokenId)` for snapshot, `getRecentPriceHistory(db, tokenId, limit=2)` for price history
+- Stale snapshot guard: `if (Date.now() - snapshot.capturedAt.getTime() > 60_000)` → skip + warn
+- Insufficient history guard: `if (priceHistory.length < 2)` → skip (no warn needed, expected at startup)
+- Requires a new query function: `getRecentPriceHistory(db, tokenId, limit)` in `src/db/queries/signals.ts` or a new file
 
-**Law finding [MAJOR]:** The old plan said `BOOK_IMBALANCE` in several places. This is wrong.
+**New query needed:** `src/db/queries/price-history.ts` — `getRecentPriceHistory(db, tokenId, limit)` using `price_history` table ordered by `recorded_at DESC LIMIT limit`.
 
-**Resolution:** All code, comments, and documentation use `ORDER_BOOK_IMBALANCE` exclusively. This matches:
-- `src/events/types.ts` SignalType enum
-- `src/processors/book-imbalance-engine.ts` existing emit
-- DB signal records
+### Decision 3: `SentimentVelocityEvaluator` is a stateful class with in-memory rolling buffer
 
-### Decision 4: ClobWsPool must-have completions
+The spec states: "In-memory rolling buffer per token — no DB reads on hot path." This means it is **not a pure function** like the Phase 1 stub.
 
-**Law finding [MAJOR]:** Two behaviors required by spec are missing from Phase 1: jitter on reconnect and `market_resolved` handling.
+**Resolution:**
+- `SentimentVelocityEvaluator` is a class with `private priceBuffer: Map<TokenId, PriceRecord[]>` and `private tradeBuffer: Map<TokenId, TradeRecord[]>`
+- `recordPrice(tokenId, price, timestamp)` — called from `price_change` and `last_trade_price` events
+- `recordTrade(tokenId, timestamp)` — called from `trade` events
+- `evaluate(tokenId): SentimentVelocitySignal | null` — called when needed (on `trade` event or on a timer)
+- Rolling window: only records within `VELOCITY_WINDOW_SECONDS` (default 300s) are kept
+- Prior window: same-length window immediately preceding the current window for trade count comparison
+- Bootstrap on startup: query `price_history` table to pre-populate buffers (separate `bootstrap(tokenIds)` method)
 
-**Resolution:** As part of Task 5.1, `ClobWsPool` receives:
-- **Jitter**: `delay * (0.8 + Math.random() * 0.4)` applied in `scheduleShardReconnect()`
-- **`market_resolved`**: parsed in `handleEvent()`, logs + calls `markMarketClosed(db, tokenId)`
-- `ClobWsPool` constructor receives optional `db` reference for `market_resolved` updates
-- Tests: add assertions for jitter bounds (0.8×–1.2× base delay) and `market_resolved` → DB update
+### Decision 4: Pipeline wiring replaces old call sites
 
-### Decision 5: Wallet enrichment policy — persisted alerts only
+The old pipeline wired `evaluatePriceImpact` inside the `SnapshotWriter` callback (REST timer path) and `evaluateVelocity` inside a 5-min `setInterval`. Both are removed and replaced:
 
-**Law finding [MINOR]:** `insertWhaleAlert()` returns `null` when `emitSignal=false`. The plan's `onWhaleInserted` callback approach silently skips enrichment for non-persisted alerts.
+| Old wiring | New wiring |
+|---|---|
+| `evaluatePriceImpact()` called in `SnapshotWriter` callback | `priceImpactEvaluator.evaluate(trade)` called in `tradeHandler1` (or separate handler) — async |
+| `evaluateVelocity()` called in 5-min `setInterval` | `velocityEvaluator.evaluate(tokenId)` called in `tradeHandler1` (after `recordTrade`) |
 
-**Resolution:** Policy is **explicit**: enrichment only runs for persisted whale alerts (`emitSignal=true`). The `onWhaleInserted` callback fires only when `insertWhaleAlert` returns a non-null ID. Non-persisted alerts (below liquidity threshold) skip enrichment. This is documented in `CLAUDE.md` and in code comments.
+Both new evaluators write signals to the bus: `bus.emit("signal", signal)`. `SignalAggregator` handles persistence.
 
-### Decision 6: Wallet re-enrichment deduplication guard
+### Decision 5: Composite scoring is purely in-memory, no new signal type
 
-**Law finding [NIT]:** Repeated heavy traders will waste API calls and token-bucket budget.
+The spec explicitly states: "Do NOT create a new signal type for composite — per PRD §10 deferral note, just enrich the payload."
 
-**Resolution:** Before calling the data-api, `WalletEnricher` checks `wallet_profiles.updated_at` (or `enrichedAt` in `whale_alerts`) for a 24h recency guard. If a profile was updated within the last 24h, skip the external fetch and use the cached DB data to still fill `walletTotalVolumeUsdc` / `walletTradeCount` / `walletFirstSeenAt` on the alert row. This is a lightweight DB read before an external API call — worth the saved traffic.
+**Resolution:**
+- `SignalAggregator` maintains `private compositeMap: Map<TokenId, { signals: Array<{type: SignalType, confidence: number, createdAt: Date}>, windowStart: number }>`
+- On each `handleSignal()` call (before DB insert), check for co-occurring signals within `COMPOSITE_WINDOW_MS`
+- If 2+ co-occurring: compute `compositeConfidence = mean(confidences) * (1 + 0.15 * (count - 1))`, add `compositeScore` to `signal.payload`
+- Log: `[COMPOSITE] tokenId: <score>, signals: [<types>]`
+- Purge stale entries: remove entries where `windowStart < Date.now() - COMPOSITE_WINDOW_MS`
+- Window starts from the **first** signal of a group for that tokenId
+
+### Decision 6: Backtest module is standalone, no pipeline dependency
+
+`BacktestRunner` is a CLI entry point that creates its own `db` connection. It does **not** import or instantiate `startPipeline()`.
+
+**Resolution:**
+- `src/backtest/runner.ts` has a `main()` function that: (1) parses CLI args, (2) creates DB client via `createDb()` from `src/db/client.ts`, (3) queries `signals` + `markets` tables, (4) calls `BacktestEvaluator`, (5) calls `BacktestReport`, (6) closes DB
+- `pnpm backtest` script invokes `runner.ts` directly
+- No mocked DB in runner.ts — test with a mock DB injected via parameter
+
+### Decision 7: `getRecentPriceHistory` query placement
+
+Rather than adding to the already-complex `signals.ts` query file, add to `src/db/queries/snapshots.ts` (already handles snapshot reads) — or create a dedicated `src/db/queries/price-history.ts`. **Decision: new file `src/db/queries/price-history.ts`** to keep responsibilities clean.
 
 ---
 
-## Must-Haves (goal-backward)
+## Signal Algorithm Reference
 
-- [ ] ClobWsPool is wired into pipeline.ts (runs in parallel with LiveDataWsClient)
-- [ ] ClobWsPool has jittered reconnect and handles `market_resolved` → marks `markets.closed=true`
-- [ ] `BookUpdateEvent` from ClobWsPool flows to `WsBookImbalanceEvaluator` via bus
-- [ ] `WsBookImbalanceEvaluator` fires `ORDER_BOOK_IMBALANCE` signal with spec-correct confidence formula, strength = total depth, 60s cooldown
-- [ ] `WsBookImbalanceEvaluator` inserts `ws_event` snapshot row on qualifying book events
-- [ ] Phase 1 `OrderBookImbalanceEngine` (REST path) is untouched and all existing tests pass
-- [ ] WebhookEmitter sends correctly-shaped Discord + Slack payloads with 5 req/s token-bucket
-- [ ] WalletEnricher enriches persisted whale alerts only, async non-blocking, 24h recency guard
-- [ ] All new config env vars in `src/config.ts` and `.env.example`
-- [ ] All new and modified modules have test coverage meeting spec requirements
-- [ ] All 256 existing tests continue to pass
-- [ ] Branch `feat/phase-2` pushed to origin with one commit per module
+### PriceImpactSignalEvaluator
+
+**Inputs per trade:**
+- `TradeEvent`: `{ tokenId, side, valueUsdc, priceUsdc }`
+- DB: latest `order_book_snapshots` row for `tokenId` (max age 60s)
+- DB: 2 most recent `price_history` rows for `tokenId` (ordered by `recorded_at DESC`)
+
+**Algorithm:**
+```
+// 1. Fetch snapshot (max 60s old)
+snapshot = getLatestBook(db, tokenId)
+if (!snapshot || Date.now() - snapshot.capturedAt > 60_000) → skip + warn
+
+// 2. Fetch price history (need at least 2)
+history = getRecentPriceHistory(db, tokenId, 2)
+if (history.length < 2) → skip silently
+
+// 3. Expected impact
+depthUsdc = side=BUY ? snapshot.bidDepthUsdc : snapshot.askDepthUsdc
+if (depthUsdc === 0) → skip (division guard)
+expectedImpact = trade.valueUsdc / depthUsdc
+
+// 4. Actual impact
+priceBeforeTrade = history[1].price  (older of the two)
+priceNow = history[0].price           (newer of the two)
+actualImpact = abs(priceNow - priceBeforeTrade) / priceBeforeTrade
+
+// 5. Anomaly score
+score = actualImpact / expectedImpact
+if (score <= PRICE_IMPACT_ANOMALY_THRESHOLD) → no signal
+
+// 6. Cooldown per token
+if (Date.now() - lastEmit[tokenId] < PRICE_IMPACT_COOLDOWN_MS) → skip
+
+// 7. Direction
+direction = side=BUY ? BULL : BEAR
+
+// 8. Confidence
+confidence = min(1.0, (score - threshold) / threshold)
+```
+
+**Note on direction mapping:** The spec says `BUY → BULL`, `SELL → BEAR`. But the existing `SignalDirection` type uses `"BULLISH"` / `"BEARISH"` / `"NEUTRAL"`. Use `"BULLISH"` and `"BEARISH"` — the spec shorthand is informal.
+
+**Note on `order_book_snapshots` query:** The `getLatestBook()` function in `snapshots.ts` already does `ORDER BY captured_at DESC LIMIT 1`. We re-use it.
+
+**Note on `price_history` table schema:** `price_history` has columns `token_id`, `price`, `recorded_at`. The query returns rows ordered by `recorded_at DESC`.
+
+### SentimentVelocityEvaluator
+
+**State per token:**
+```
+priceBuffer: Array<{ price, timestamp }>  // records within [now - VELOCITY_WINDOW_SECONDS*2, now]
+tradeBuffer: Array<{ timestamp }>          // same window range (doubled for prior window)
+lastEmit: Map<tokenId, timestamp>          // cooldown
+```
+
+**Algorithm on `evaluate(tokenId)`:**
+```
+now = Date.now()
+windowMs = VELOCITY_WINDOW_SECONDS * 1000
+
+// Current window: [now - windowMs, now]
+currentPrices = priceBuffer.filter(p => p.timestamp >= now - windowMs)
+if (currentPrices.length < 2) → null
+
+latestPrice = currentPrices[last].price
+windowStartPrice = currentPrices[first].price
+if (windowStartPrice === 0) → null
+
+// Price velocity: % per minute
+priceVelocity = (latestPrice - windowStartPrice) / windowStartPrice / VELOCITY_WINDOW_SECONDS * 60
+
+if (|priceVelocity| <= VELOCITY_PRICE_THRESHOLD) → null
+
+// Trade count velocity
+currentTrades = tradeBuffer.filter(t => t.timestamp >= now - windowMs)
+priorTrades = tradeBuffer.filter(t => t.timestamp >= now - 2*windowMs AND t.timestamp < now - windowMs)
+currentTradeRate = currentTrades.length
+priorTradeRate = priorTrades.length (if 0, treat as 1 to avoid div/0)
+tradeCountVelocity = currentTradeRate / max(priorTradeRate, 1)
+
+if (tradeCountVelocity <= VELOCITY_TRADE_COUNT_MULTIPLIER) → null
+
+// Cooldown
+if (Date.now() - lastEmit[tokenId] < VELOCITY_COOLDOWN_MS) → null
+
+// Direction
+direction = priceVelocity > 0 ? "BULLISH" : "BEARISH"
+
+// Confidence
+confidence = min(1.0, |priceVelocity| / (VELOCITY_PRICE_THRESHOLD * 3))
+
+// Signal
+return VelocitySignal { signalType: "SENTIMENT_VELOCITY", ... strength: tradeCountVelocity }
+```
+
+**Buffer management:** On each `recordPrice()` / `recordTrade()`, prune entries older than `2 * VELOCITY_WINDOW_SECONDS * 1000` (double window needed for prior-window comparison).
+
+---
 
 ## Out of Scope
-- No schema changes (schema is locked)
-- No migration file changes
-- No Phase 3+ work (backtesting, neg-risk signals)
-- No new npm packages (package.json locked to existing deps: ws, zod, drizzle-orm, pg, pino, dotenv)
-- Rate limiting: token-bucket must be implemented inline (no new deps)
-
----
-
-## Critical Implementation Notes for Zoro
-
-### Note 1: Two cooldown maps — no shared state between REST and WS evaluator
-The Phase 1 `OrderBookImbalanceEngine` has its own `lastEmits` map for the 5-min REST path. The new `WsBookImbalanceEvaluator` has a separate `lastEmits` map for the 60s WS path. They do NOT share state. Per-path cooldown isolation is critical — the REST path must not suppress WS signals or vice-versa.
-
-### Note 2: `WalletEnricher.enrich()` requires alertId — use `onWhaleInserted` callback
-`SignalAggregator` gets the `alertId` from `insertWhaleAlert()`. Surface it via an optional `onWhaleInserted?: (alert: WhaleAlert, id: bigint) => void` callback in `SignalAggregator` constructor. Call it after `insertWhaleAlert` returns a non-null ID. Pipeline wires this callback to `walletEnricher.enrich(alert, id)`.
-
-### Note 3: `enrichWhaleAlert` signature extension is backward-compatible
-Add `walletFirstSeenAt?: Date` to the enrichment param type and update the `.set()` call. The field is nullable in schema, so passing `undefined` → `null` is safe. Existing test that omits the field still passes.
-
-### Note 4: WebhookEmitter uses `globalThis.fetch` — Node 22 built-in
-No `node-fetch`. No new deps. Tests mock with `vi.stubGlobal('fetch', mockFn)` and restore with `vi.unstubAllGlobals()` in afterEach.
-
-### Note 5: `WsBookImbalanceEvaluator` snapshot insert always happens on qualifying events
-Even when cooldown suppresses the signal emit, the snapshot insert still runs (it captures book state regardless). Signal is only emitted when cooldown has elapsed AND ratio is outside threshold band.
-
-### Note 6: `market_resolved` — ClobWsPool needs `db` reference
-Pass `db` as optional field in `ClobWsPoolOptions`. When `market_resolved` message arrives: log the resolution, call `markMarketClosed(db, tokenId)` if db is present. If db is absent (tests without DB), log-only fallback.
-
-### Note 7: Enrichment 24h guard implementation
-In `WalletEnricher._enrich()`: before fetching the API, query `wallet_profiles` for the proxyWallet. If a row exists and `updated_at > now - 24h`, skip the external fetch — call `enrichWhaleAlert()` directly with the cached `totalVolumeUsdc`, `tradeCount`, `firstSeenAt` from DB. If no row or stale, proceed with API fetch + upsert + enrich.
+- Neg-risk signal generation (Phase 4)
+- New DB schema changes or migrations
+- Any other Phase 1 / Phase 2 source files not listed in the edit surface
+- Deployment configuration changes
+- Backtesting UI
 
 ---
 
 ## Tasks
 
-### Chunk 1: Config & env (no deps — do first)
+### Chunk 1: Config + New Query Layer
 
-- [ ] **Task 1.1: Extend `src/config.ts` with Phase 2 fields**
-  - File: `src/config.ts`
-  - Add fields (with defaults):
-    - `clobWsUrl: string` (default `"wss://ws-subscriptions-clob.polymarket.com/ws/market"`)
-    - `clobWsMaxReconnectDelayMs: number` (default `30000`) — note: `reconnectMaxMs` may already cover this; alias or unify
-    - `imbalanceCooldownMs: number` (default `60000`)
-    - `discordWebhookUrl: string` (default `""`) — optional, empty = disabled
-    - `slackWebhookUrl: string` (default `""`) — optional, empty = disabled
-    - `walletEnrichmentTimeoutMs: number` (default `5000`)
-    - `walletEnrichmentRateLimitRps: number` (default `2`)
-    - `walletEnrichmentRecencyHours: number` (default `24`) — 24h recency guard window
-  - Already present (do not re-add): `clobWsShardSize`, `imbalanceRatioThreshold`, `walletEnrichRps`, `reconnectBaseMs`, `reconnectMaxMs`
-  - Test guidance: `src/config.test.ts` — add assertions for all new fields with default values and env override
-
-- [ ] **Task 1.2: Update `.env.example`**
-  - File: `.env.example`
-  - Add all Phase 2 env vars with comments:
+- [x] **Task 1.1: Extend `src/config.ts`**
+  - Files: `src/config.ts`
+  - Add 7 new fields (all use `envNumber()`):
+    ```typescript
+    priceImpactAnomalyThreshold: envNumber("PRICE_IMPACT_ANOMALY_THRESHOLD", 2.5),
+    priceImpactCooldownMs: envNumber("PRICE_IMPACT_COOLDOWN_MS", 30_000),
+    velocityWindowSeconds: envNumber("VELOCITY_WINDOW_SECONDS", 300),
+    velocityPriceThreshold: envNumber("VELOCITY_PRICE_THRESHOLD", 0.005),
+    velocityTradeCountMultiplier: envNumber("VELOCITY_TRADE_COUNT_MULTIPLIER", 1.5),
+    velocityCooldownMs: envNumber("VELOCITY_COOLDOWN_MS", 120_000),
+    compositeWindowMs: envNumber("COMPOSITE_WINDOW_MS", 60_000),
     ```
-    # Phase 2 — CLOB WS Pool
-    CLOB_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/market
-    CLOB_WS_SHARD_SIZE=150
-    CLOB_WS_MAX_RECONNECT_DELAY_MS=30000
+  - **Also add** to `PipelineConfig` interface in `src/events/types.ts` — but wait: `PipelineConfig` is in `types.ts` which is not in the edit surface. Check: these new fields don't need to be in `PipelineConfig` because the new evaluators read directly from `config` (not from the `PipelineConfig` interface injected into pipeline). **Resolution: do NOT add to `PipelineConfig` unless needed for pipeline unit tests.** The evaluators use `config` directly.
+  - Input: existing config shape
+  - Output: 7 new fields on frozen config object
+  - Test guidance: `src/config.test.ts` — add assertions for each new env var default and override
+  - Edge cases: `envNumber()` throws on NaN — don't set invalid defaults
 
-    # Phase 2 — Book Imbalance (WS path)
-    IMBALANCE_RATIO_THRESHOLD=3.0
-    IMBALANCE_COOLDOWN_MS=60000
-
-    # Phase 2 — Webhook Alerts
-    DISCORD_WEBHOOK_URL=
-    SLACK_WEBHOOK_URL=
-
-    # Phase 2 — Wallet Enrichment
-    WALLET_ENRICHMENT_TIMEOUT_MS=5000
-    WALLET_ENRICHMENT_RATE_LIMIT_RPS=2
-    WALLET_ENRICHMENT_RECENCY_HOURS=24
-    ```
+- [x] **Task 1.2: Update `.env.example`**
+  - Files: `.env.example`
+  - Add Phase 3 section with all 7 vars and defaults
   - No test needed
 
-### Chunk 2: DB queries — wallet profiles + market close (no deps)
+- [x] **Task 1.3: Create `src/db/queries/price-history.ts`**
+  - Files: `src/db/queries/price-history.ts` (new)
+  - Export: `getRecentPriceHistory(db: Db, tokenId: TokenId, limit: number): Promise<Array<{ price: number; recordedAt: Date }>>`
+  - Query: `SELECT price, recorded_at FROM price_history WHERE token_id = $1 ORDER BY recorded_at DESC LIMIT $2`
+  - Use `sql` template or drizzle select — look at how `snapshots.ts` uses `db.select()` as the pattern
+  - Input: `db`, `tokenId`, `limit`
+  - Output: array of `{ price: number, recordedAt: Date }` newest-first
+  - Test guidance: `src/db/queries/price-history.test.ts` — mock `db.select()` chain, assert row mapping (numeric → number), empty result returns `[]`
+  - Edge cases: `price` column is `numeric` (string in JS) — must `Number(row.price)`
 
-- [ ] **Task 2.1: Create `src/db/queries/wallets.ts`**
-  - File: `src/db/queries/wallets.ts`
-  - Export: `upsertWalletProfile(db, profile)` — INSERT ... ON CONFLICT (proxy_wallet) DO UPDATE into `wallet_profiles`
-  - `profile` shape: `{ proxyWallet: string, totalVolumeUsdc: number, tradeCount: number, whaleTradeCount: number, firstSeenAt: Date, lastSeenAt: Date }`
-  - Return type: `Promise<void>`
-  - Export: `getWalletProfile(db, proxyWallet)` — returns the existing row or null (for 24h recency check)
-  - Test guidance: `src/db/queries/wallets.test.ts`
-    - Mock `db.execute` (or use drizzle mock pattern from existing tests)
-    - Assert upsert called with correct field mapping
-    - Assert ON CONFLICT path sets all fields
-    - Assert `getWalletProfile` returns null when no row found
+---
 
-- [ ] **Task 2.2: Create `src/db/queries/markets.ts` addition — `markMarketClosed`**
-  - File: `src/db/queries/markets.ts` (may already exist — check first; if so, add to it)
-  - Export: `markMarketClosed(db, tokenId: string): Promise<void>` — UPDATE markets SET closed=true WHERE token_id={tokenId}
-  - Test guidance: `src/db/queries/markets.test.ts` — mock db, assert update called with correct tokenId
+### Chunk 2: PriceImpactSignalEvaluator
 
-- [ ] **Task 2.3: Extend `enrichWhaleAlert` to include `walletFirstSeenAt`**
-  - File: `src/db/queries/whales.ts`
-  - Add `walletFirstSeenAt?: Date` to the enrichment parameter type (optional — backward-compatible)
-  - Update the `db.update().set()` call to include `walletFirstSeenAt: enrichment.walletFirstSeenAt ?? null`
-  - Must not break existing `whales.test.ts` assertions (optional field safe)
-  - Test guidance: add one assertion in `whales.test.ts` that when `walletFirstSeenAt` is provided, it is passed through; when omitted, the call still succeeds
-
-### Chunk 3: ClobWsPool completions (dep: Task 2.2)
-
-- [ ] **Task 3.1: Add `url` option + jitter + `market_resolved` to `ClobWsPool`**
-  - File: `src/sources/clob-ws-pool.ts`
-  - **URL option**: Add `url?: string` to `ClobWsPoolOptions`. Store as `private readonly url: string` in constructor (default `"wss://ws-subscriptions-clob.polymarket.com/ws/market"`). Use `this.url` in `openShard()` instead of hardcoded string.
-  - **Jitter**: In `scheduleShardReconnect()`, apply jitter before capping: `const jittered = delay * (0.8 + Math.random() * 0.4); const capped = Math.min(jittered, this.reconnectMaxMs);`. Use `capped` as the actual delay.
-  - **`db` option**: Add `db?: Db` to `ClobWsPoolOptions`. Store as `private readonly db: Db | undefined`.
-  - **`market_resolved` handling**: In `handleEvent()`, add `case "market_resolved":` — parse `tokenId` from event, log `"ClobWsPool: market resolved"`, call `markMarketClosed(this.db, tokenId)` if `this.db` is defined, emit `"market_resolved"` event with `{ tokenId }`.
-  - Test guidance: additions to `src/sources/clob-ws-pool.test.ts`
-    - Assert custom URL is passed to `WsConstructor` (Task 5.1 from old plan — now here)
-    - Assert jitter: spy on `scheduleShardReconnect`, trigger close 3 times, verify delays are in range `[0.8×base, reconnectMaxMs]` and vary (not identical)
-    - Assert `market_resolved`: mock db, send a `market_resolved` message, assert `markMarketClosed` called with correct tokenId
-    - Assert `market_resolved` without db: message arrives, no throw, `"market_resolved"` event emitted
-  - Existing tests must still pass (all changes backward-compatible — new opts are optional)
-
-### Chunk 4: WsBookImbalanceEvaluator (dep: Tasks 1.1, 2.1)
-
-- [ ] **Task 4.1: Create `src/processors/ws-book-imbalance-evaluator.ts`**
-  - File: `src/processors/ws-book-imbalance-evaluator.ts`
-  - Class: `WsBookImbalanceEvaluator`
-  - Constructor: `(bus: TypedEventBus, db: Db, opts?: { threshold?: number; cooldownMs?: number })`
-  - Reads defaults from `config.imbalanceRatioThreshold` and `config.imbalanceCooldownMs`
-  - Method: `evaluate(book: OrderBook): void`
-    - Compute `bidDepthUsdc = sum(price × size)` for all bids, `askDepthUsdc` for all asks (spec does not restrict to top-N — use full book; leave a TODO if implementer wants to cap)
-    - If `askDepthUsdc === 0`: return early
-    - `ratio = bidDepthUsdc / askDepthUsdc`
-    - **Always** insert `ws_event` snapshot: call `insertBookSnapshot(db, { tokenId, conditionId, bids, asks, bidDepthUsdc, askDepthUsdc, imbalanceRatio: ratio, snapshotTrigger: "ws_event", capturedAt: new Date() })`
-    - Check threshold: `isBullish = ratio > threshold`, `isBearish = ratio < 1/threshold`
-    - If neither: return (no signal)
-    - Check cooldown: `lastEmits.get(tokenId)` — if within `cooldownMs`: return (no signal)
-    - Compute signal:
-      - `direction`: `"BULLISH"` when bids dominate, `"BEARISH"` when asks dominate
-      - `confidence`: `min(1.0, (ratio - threshold) / threshold)` for BULLISH; `min(1.0, (1/ratio - threshold) / threshold)` for BEARISH
-      - `strength`: `bidDepthUsdc + askDepthUsdc` (total depth — spec requirement, NOT ratio)
-      - `priceAtSignal`: mid = `(bids[0].price + asks[0].price) / 2` if both present, else 0
-    - Update `lastEmits.set(tokenId, Date.now())`
-    - Build `ImbalanceSignal` with `signalType: "ORDER_BOOK_IMBALANCE"`
-    - Call `this.bus.emit("signal", signal)`
-  - Private: `lastEmits = new Map<TokenId, number>()` (timestamp only — simpler than Phase 1)
-  - Export: `resetCooldown(tokenId: TokenId): void` for test reset
-  - **Does NOT replace `OrderBookImbalanceEngine`** — that class is untouched
-  - Test guidance: `src/processors/ws-book-imbalance-evaluator.test.ts`
-    - Mock bus and db (mock `insertBookSnapshot`)
-    - BULL signal: ratio 4.0 > threshold 3.0 → signal emitted with direction BULLISH, confidence = min(1, (4-3)/3) = 0.333
-    - BEAR signal: ratio 0.25 < 1/3.0 = 0.333 → signal emitted with direction BEARISH
-    - Cooldown: evaluate twice in rapid succession → second call emits no signal (snapshot still inserted)
-    - No signal within band: ratio 2.0 (between 0.333 and 3.0) → no signal emitted, snapshot still inserted
-    - Strength = total depth: verify `signal.strength === bidDepthUsdc + askDepthUsdc`
-    - Confidence formula: verify value matches `min(1.0, (ratio - threshold) / threshold)` precisely
-    - `askDepthUsdc === 0` guard: evaluate with empty asks → no signal, no snapshot insert (or insert with null imbalanceRatio — make this explicit in implementation)
-    - Verify `insertBookSnapshot` called with `snapshotTrigger: "ws_event"` on every evaluate call (even when no signal fired)
-    - Verify `ORDER_BOOK_IMBALANCE` signal type (not `BOOK_IMBALANCE`)
-
-### Chunk 5: WebhookEmitter (dep: Task 1.1)
-
-- [ ] **Task 5.1: Create `src/alerts/webhook-emitter.ts`**
-  - File: `src/alerts/webhook-emitter.ts`
-  - Class: `WebhookEmitter`
-  - Constructor: `(opts?: { discordUrl?: string; slackUrl?: string; rps?: number })`
-  - Reads `discordUrl` from `config.discordWebhookUrl` if not passed in opts (same for slack)
-  - Method: `async send(payload: WhaleAlert | ImbalanceSignal): Promise<void>` — never throws
-  - Internal: token-bucket (max 5 tokens, refill 5/s), in-memory async queue
-  - **No-op**: when both `discordUrl` and `slackUrl` are empty/undefined, return immediately without touching `fetch`
-  - **Discord payload** (POST to `discordUrl`):
-    ```json
-    { "embeds": [{ "title": "...", "description": "...", "color": 16729156, "fields": [...], "timestamp": "ISO" }] }
-    ```
-    - Whale alert: color `0xFF4444` (16729156), fields: market title, value USDC, wallet (truncated to 12 chars + …), sigma score, pct of daily volume
-    - Imbalance signal: color `0xFFAA00` (16754176), fields: market (tokenId), ratio, direction, total depth
-  - **Slack payload** (POST to `slackUrl`):
-    ```json
-    { "blocks": [{ "type": "section", "text": { "type": "mrkdwn", "text": "*🐋 Whale Alert*\n..." } }] }
-    ```
-    - Same data as Discord but formatted as mrkdwn section blocks
-  - **Rate limiting**: before each `fetch`, await until a token is available; tokens refill at 5/s via `setInterval`
-  - **429 retry**: if response status is 429, wait `Retry-After` header seconds (or 10s) then retry once; if retry also fails, log and move on
-  - **Network errors**: catch all errors from `fetch`, log warning via `logger`, swallow (never propagate)
-  - Uses `globalThis.fetch` (Node 22 built-in)
-  - Test guidance: `src/alerts/webhook-emitter.test.ts`
-    - `vi.stubGlobal('fetch', mockFn)` + `vi.unstubAllGlobals()` in afterEach
-    - Assert Discord embed shape: whale alert → color `0xFF4444`, expected fields present
-    - Assert Slack block shape: imbalance signal → `blocks[0].type === "section"`, text contains direction
-    - Assert no-op: empty URLs → `fetch` never called, method resolves immediately
-    - Assert rate limit: enqueue 10 sends synchronously, use `vi.useFakeTimers()`, advance < 2 seconds → `fetch` called ≤ 10 times but spaced by token availability
-    - Assert 429 retry: mock returns 429 on first call, 200 on second → `fetch` called twice for one `send()`
-    - Assert network error: `fetch` throws → method resolves (no propagation), logger.warn called
-
-- [ ] **Task 5.2: Wire WebhookEmitter into `AlertEmitter`**
-  - File: `src/alerts/alert-emitter.ts`
-  - Add optional `webhookEmitter?: WebhookEmitter` to constructor
-  - In `emit(alert)`: after `console.log(formatWhaleAlert(alert))`, call `this.webhookEmitter?.send(alert)` (fire-and-forget — do not await)
-  - `AlertEmitter` constructor signature change is backward-compatible (optional param)
-  - Must not break existing `alert-emitter.test.ts` (no webhookEmitter → same behavior)
-  - Test: add one test: pass a mock webhookEmitter, verify `send()` called after `emit()`
-
-### Chunk 6: WalletEnricher (deps: Tasks 1.1, 2.1, 2.3)
-
-- [ ] **Task 6.1: Create `src/enrichment/wallet-enricher.ts`**
-  - File: `src/enrichment/wallet-enricher.ts` (new directory `src/enrichment/`)
-  - Class: `WalletEnricher`
-  - Constructor: `(db: Db, opts?: { timeoutMs?: number; rps?: number; recencyHours?: number })`
-    - `timeoutMs` default: `config.walletEnrichmentTimeoutMs` (5000)
-    - `rps` default: `config.walletEnrichmentRateLimitRps` (2)
-    - `recencyHours` default: `config.walletEnrichmentRecencyHours` (24)
-  - Method: `enrich(alert: WhaleAlert, alertId: bigint): void` — sync return, fire-and-forget
-    - Internally calls `this._enrich(alert, alertId).catch(err => logger.warn(...))`
-  - Private async: `_enrich(alert: WhaleAlert, alertId: bigint): Promise<void>`
-    1. **Recency guard**: `const existing = await getWalletProfile(db, alert.trade.proxyWallet)`
-       - If `existing` and `existing.updatedAt > Date.now() - recencyHours * 3600_000`:
-         - Skip API fetch; call `enrichWhaleAlert(db, alertId, { walletTotalVolumeUsdc: existing.totalVolumeUsdc, walletTradeCount: existing.tradeCount, walletFirstSeenAt: existing.firstSeenAt })`; return
-    2. **Rate limit**: await token from token-bucket (max `rps` tokens, refill at `rps`/s)
-    3. **Fetch with timeout**: `AbortController` with `timeoutMs`; fetch `https://data-api.polymarket.com/activity?user={proxyWallet}&limit=100`
-    4. **429 handling**: if response status 429, wait `Retry-After` header value (or 10s), retry once; if still 429, log and return
-    5. **Parse**: parse response as `ZDataApiTrade[]` (existing Zod schema)
-    6. **Compute stats**:
-       - `totalVolumeUsdc = sum(trade.size * trade.price)`
-       - `tradeCount = trades.length`
-       - `whaleTradeCount = trades.filter(t => t.size * t.price > 10_000).length`
-       - `firstSeenAt = new Date(Math.min(...trades.map(t => t.timestamp)) * 1000)`
-       - `lastSeenAt = new Date(Math.max(...trades.map(t => t.timestamp)) * 1000)`
-       - Edge case: empty array → all zeros, `firstSeenAt = lastSeenAt = new Date(0)`
-    7. **Upsert**: `await upsertWalletProfile(db, { proxyWallet, totalVolumeUsdc, tradeCount, whaleTradeCount, firstSeenAt, lastSeenAt })`
-    8. **Enrich alert**: `await enrichWhaleAlert(db, alertId, { walletTotalVolumeUsdc, walletTradeCount, walletFirstSeenAt: firstSeenAt })`
-    9. On `AbortError`: log warning `"WalletEnricher: timeout"`, return without DB writes
-    10. On any other error: log warning, return without DB writes
-  - `proxyWallet` truncation: if length > 42, log warning and truncate (schema `varchar(42)`)
-  - Test guidance: `src/enrichment/wallet-enricher.test.ts`
-    - Mock `globalThis.fetch` with `vi.stubGlobal`
-    - Mock `upsertWalletProfile` and `enrichWhaleAlert` (vi.mock or manual mock)
-    - Happy path: 5 trades including 2 > $10k → assert `upsertWalletProfile` called with `whaleTradeCount=2`, `enrichWhaleAlert` called with `walletFirstSeenAt`
-    - 429: first call returns 429 with `Retry-After: 1`, second returns 200 with data → two fetch calls, upsert called
-    - Timeout: `fetch` hangs (never resolves), AbortController fires after `timeoutMs` → `_enrich` resolves, no DB calls
-    - Recency guard hit: mock `getWalletProfile` returns row with `updatedAt` = 1h ago → fetch NOT called, `enrichWhaleAlert` called with cached data
-    - Recency guard miss: `getWalletProfile` returns row with `updatedAt` = 25h ago → fetch called
-    - Empty trades: `fetch` returns `[]` → upsert called with zeros, enrich called
-    - `enrich()` never throws: even if `_enrich` rejects, outer `enrich()` catches and returns
-
-- [ ] **Task 6.2: Add `onWhaleInserted` callback to `SignalAggregator`**
-  - File: `src/processors/signal-aggregator.ts`
-  - Add optional `onWhaleInserted?: (alert: WhaleAlert, id: bigint) => void` to constructor options
-  - In `handleWhaleAlert()`, after `insertWhaleAlert` returns a non-null `id`: call `this.onWhaleInserted?.(alert, id)`
-  - Call happens AFTER the DB write (both transaction and non-transaction paths)
-  - Must not break existing `signal-aggregator.test.ts` (optional param → no-op when absent)
-  - Test: add assertion that `onWhaleInserted` is called with correct `(alert, id)` after successful insert; not called when `emitSignal=false`
-
-### Chunk 7: Pipeline wiring (deps: all chunks 1–6)
-
-- [ ] **Task 7.1: Wire Phase 2 in `src/pipeline.ts`**
-  - File: `src/pipeline.ts`
-  - Add imports: `ClobWsPool`, `WsBookImbalanceEvaluator`, `WalletEnricher`, `WebhookEmitter`
-  - Add import: `markMarketClosed` from `../db/queries/markets.js`
-  - Add import: `getWatchlistedTokenIds` (check if already present — if not, add to markets queries)
-  - **Instantiate**:
+- [x] **Task 2.1: Rewrite `src/signals/price-impact-signal.ts`**
+  - Files: `src/signals/price-impact-signal.ts`
+  - Remove all Phase 1 code. Export `PriceImpactSignalEvaluator` class.
+  - Class interface:
     ```typescript
-    const webhookEmitter = new WebhookEmitter();
-    const walletEnricher = new WalletEnricher(db);
-    const clobWsPool = new ClobWsPool({
-      url: config.clobWsUrl,
-      shardSize: config.clobWsShardSize,
-      reconnectBaseMs: config.reconnectBaseMs,
-      reconnectMaxMs: config.reconnectMaxMs,
-      db,
-    });
-    const wsImbalanceEvaluator = new WsBookImbalanceEvaluator(bus, db);
+    export class PriceImpactSignalEvaluator {
+      constructor(private readonly db: Db, private readonly opts?: PriceImpactOptions) {}
+      async evaluate(trade: TradeEvent): Promise<PriceImpactSignal | null>
+    }
+    export interface PriceImpactOptions {
+      anomalyThreshold?: number;   // default config.priceImpactAnomalyThreshold
+      cooldownMs?: number;         // default config.priceImpactCooldownMs
+    }
     ```
-  - **Update AlertEmitter**: pass `webhookEmitter` to `AlertEmitter` constructor
-  - **Update SignalAggregator**: pass `onWhaleInserted: (alert, id) => walletEnricher.enrich(alert, id)` in constructor
-  - **Wire ClobWsPool local events → bus**:
-    ```typescript
-    clobWsPool.on("book", (evt) => bus.emit("book_update", evt));
-    clobWsPool.on("price_change", (evt) => bus.emit("price_change", evt));
-    clobWsPool.on("best_bid_ask", (evt) => bus.emit("best_bid_ask", evt));
-    clobWsPool.on("last_trade_price", (evt) => bus.emit("last_trade_price", evt));
-    ```
-  - **Wire `book_update` → `WsBookImbalanceEvaluator`**:
-    ```typescript
-    const bookUpdateHandler = (evt: BookUpdateEvent) => wsImbalanceEvaluator.evaluate(evt.book);
-    bus.on("book_update", bookUpdateHandler);
-    ```
-  - **Wire `signal` (ORDER_BOOK_IMBALANCE) → WebhookEmitter**:
-    ```typescript
-    const imbalanceWebhookHandler = (signal: Signal) => {
-      if (signal.signalType === "ORDER_BOOK_IMBALANCE") webhookEmitter.send(signal);
-    };
-    bus.on("signal", imbalanceWebhookHandler);
-    ```
-  - **Start ClobWsPool**: after GammaPoller starts and watchlisted token IDs are loaded:
-    ```typescript
-    const tokenIds = await getWatchlistedTokenIds(db);
-    await clobWsPool.connect(tokenIds);
-    ```
-  - **Shutdown cleanup**: add to `shutdown()`:
-    ```typescript
-    clobWsPool.disconnect();
-    bus.off("book_update", bookUpdateHandler);
-    bus.off("signal", imbalanceWebhookHandler);
-    ```
-  - No test file for pipeline.ts (integration-level — covered by existing pipeline test if it exists, else skip)
+  - Internal state: `private lastEmit: Map<TokenId, number>` for cooldown
+  - DB reads: `getLatestBook(db, tokenId)` + `getRecentPriceHistory(db, tokenId, 2)`
+  - Full algorithm per Decision 2 above
+  - Signal fields: `signalType: "PRICE_IMPACT_ANOMALY"`, `direction` (`BULLISH`/`BEARISH`), `confidence`, `strength: score`, `priceAtSignal: priceNow`, `payload: { score, expectedImpact, actualImpact, depthUsdc, snapshotAgeMs }`
+  - Existing interface `PriceImpactSignal` in `events/types.ts` stays unchanged — the existing fields (`priceChangePct`, `windowSeconds`, `triggeringTradeValueUsdc`) must still be populated:
+    - `priceChangePct = actualImpact * 100`
+    - `windowSeconds = 0` (not window-based anymore — set to 0 or snapshot age in seconds)
+    - `triggeringTradeValueUsdc = trade.valueUsdc`
+  - Input/Output: `TradeEvent → Promise<PriceImpactSignal | null>`
+  - Test guidance: `price-impact-signal.test.ts` — mock `getLatestBook` + `getRecentPriceHistory`, test all skip conditions, test score math, test cooldown, test confidence formula
+  - Edge cases: `depthUsdc === 0`, stale snapshot (>60s), fewer than 2 price records, division by zero in actualImpact (priceBeforeTrade=0)
 
-### Chunk 8: Tests (alongside or after each module)
+- [x] **Task 2.2: Replace `src/signals/price-impact-signal.test.ts`**
+  - Files: `src/signals/price-impact-signal.test.ts`
+  - Replace entirely — old tests test the Phase 1 stub algorithm
+  - Required test cases (from spec):
+    1. Anomaly fires when score > threshold
+    2. Skipped when snapshot age > 60s (log warn, no signal)
+    3. Skipped when `getRecentPriceHistory` returns < 2 records
+    4. Cooldown suppression (second call within cooldown window returns null)
+    5. Confidence scaling: `confidence = min(1.0, (score-threshold)/threshold)`, clamped at 1.0
+    6. Direction: BUY → BULLISH, SELL → BEARISH
+    7. Score below threshold → no signal
+    8. Depth = 0 → skip (division guard)
+    9. No snapshot found → skip
+    10. `opts` defaults used when not provided
+  - Mock pattern: `vi.mock("../db/queries/price-history.js", ...)` and `vi.mock("../db/queries/snapshots.js", ...)`
+  - Use `vi.fn()` for DB mock; pass `db` as `{} as Db` (queries are mocked at module level)
 
-- [ ] **Task 8.1**: `src/alerts/webhook-emitter.test.ts` — see Task 5.1 guidance
-- [ ] **Task 8.2**: `src/enrichment/wallet-enricher.test.ts` — see Task 6.1 guidance
-- [ ] **Task 8.3**: `src/db/queries/wallets.test.ts` — see Task 2.1 guidance
-- [ ] **Task 8.4**: `src/db/queries/markets.test.ts` — see Task 2.2 guidance (add `markMarketClosed` test)
-- [ ] **Task 8.5**: Additions to `src/sources/clob-ws-pool.test.ts` — see Task 3.1 guidance (URL, jitter, market_resolved)
-- [ ] **Task 8.6**: Additions to `src/db/queries/whales.test.ts` — see Task 2.3 guidance (walletFirstSeenAt)
-- [ ] **Task 8.7**: Additions to `src/config.test.ts` — see Task 1.1 guidance (new Phase 2 fields)
-- [ ] **Task 8.8**: `src/processors/ws-book-imbalance-evaluator.test.ts` — see Task 4.1 guidance
-- [ ] **Task 8.9**: Additions to `src/alerts/alert-emitter.test.ts` — see Task 5.2 guidance (webhookEmitter wired)
-- [ ] **Task 8.10**: Additions to `src/processors/signal-aggregator.test.ts` — see Task 6.2 guidance (onWhaleInserted callback)
+---
 
-### Chunk 9: Docs & commit
+### Chunk 3: SentimentVelocityEvaluator
 
-- [ ] **Task 9.1: Update `CLAUDE.md`**
-  - Add Phase 2 modules to Current State section
-  - Add new env vars table
-  - Add note about two separate imbalance evaluators and their distinct trigger paths
+- [x] **Task 3.1: Rewrite `src/signals/velocity-signal.ts`**
+  - Files: `src/signals/velocity-signal.ts`
+  - Remove all Phase 1 code. Export `SentimentVelocityEvaluator` class.
+  - Class interface:
+    ```typescript
+    export class SentimentVelocityEvaluator {
+      constructor(private readonly opts?: VelocityOptions) {}
+      recordPrice(tokenId: TokenId, price: number, timestamp?: number): void
+      recordTrade(tokenId: TokenId, timestamp?: number): void
+      evaluate(tokenId: TokenId, conditionId: string): VelocitySignal | null
+      async bootstrap(db: Db, tokenIds: TokenId[]): Promise<void>
+    }
+    export interface VelocityOptions {
+      windowSeconds?: number;              // default config.velocityWindowSeconds
+      priceThreshold?: number;             // default config.velocityPriceThreshold
+      tradeCountMultiplier?: number;       // default config.velocityTradeCountMultiplier
+      cooldownMs?: number;                 // default config.velocityCooldownMs
+    }
+    ```
+  - Internal state:
+    - `private priceBuffers: Map<TokenId, Array<{ price: number; timestamp: number }>>`
+    - `private tradeBuffers: Map<TokenId, Array<{ timestamp: number }>>`
+    - `private lastEmit: Map<TokenId, number>`
+  - `recordPrice`: push `{ price, timestamp: timestamp ?? Date.now() }`, prune entries older than `2 * windowSeconds * 1000`
+  - `recordTrade`: push `{ timestamp: timestamp ?? Date.now() }`, prune same
+  - `evaluate`: full algorithm per Decision 3 above — returns `VelocitySignal | null`
+  - `bootstrap(db, tokenIds)`: for each tokenId, query `getRecentPriceHistory(db, tokenId, 200)` (last 200 price records) and call `recordPrice()` for each; does NOT pre-populate tradeBuffers (trades only come from live events)
+  - `VelocitySignal` existing fields must be populated:
+    - `velocityZScore: tradeCountVelocity` (reuse for strength, not a z-score anymore — note: the type field is named `velocityZScore` but Phase 3 algorithm doesn't compute z-scores; set it to `tradeCountVelocity`)
+    - `hourlyPriceChangePct: priceVelocity * 60` (velocity is per-minute, * 60 = per hour)
+    - `baselineStdDev: 0` (not computed in Phase 3 algorithm — set to 0)
+  - Input/Output: in-memory state + event-driven
+  - Test guidance: `velocity-signal.test.ts`
+  - Edge cases: empty buffers, single price point, tradeCountVelocity edge case (0 prior trades → divisor = 1)
 
-- [ ] **Task 9.2: Commit sequence per spec**
+- [x] **Task 3.2: Replace `src/signals/velocity-signal.test.ts`**
+  - Files: `src/signals/velocity-signal.test.ts`
+  - Replace entirely — old tests test Phase 1 z-score algorithm
+  - Required test cases (from spec):
+    1. Fires when both `|priceVelocity| > threshold` AND `tradeCountVelocity > multiplier`
+    2. No fire when only price threshold met (trade count insufficient)
+    3. No fire when only trade count threshold met (price velocity insufficient)
+    4. Cooldown: second `evaluate()` call for same token within cooldown → null
+    5. Direction: positive velocity → BULLISH, negative → BEARISH
+    6. Rolling window correctly excludes records older than `windowSeconds`
+    7. Prior window correctly uses `[now-2w, now-w)` range for trade count comparison
+    8. `recordPrice()` / `recordTrade()` prune buffer at `2 * windowSeconds`
+    9. `evaluate()` returns null when fewer than 2 prices in current window
+    10. `bootstrap()` pre-populates price buffer from DB records
+  - All tests use `vi.useFakeTimers()` for deterministic timestamp control
+
+---
+
+### Chunk 4: SignalAggregator — Composite Scoring
+
+- [x] **Task 4.1: Update `src/processors/signal-aggregator.ts`**
+  - Files: `src/processors/signal-aggregator.ts`
+  - Add private `compositeMap: Map<TokenId, { signals: Array<{ type: SignalType; confidence: number; createdAt: number }>; windowStart: number }>`
+  - Update `handleSignal()` to:
+    1. Before inserting to DB, call `updateCompositeMap(signal)` which:
+       - Purges entries older than `compositeWindowMs` for all tokens
+       - Adds current signal to the token's list
+       - If 2+ signals in the window: computes `compositeConfidence` and logs
+    2. If composite window has 2+ signals for this token, add `compositeScore` to `signal.payload` before insert
+  - New private method `updateCompositeMap(signal: Signal): number | null` — returns composite score or null if only 1 signal
+  - Formula: `compositeConfidence = mean(confidences) * (1 + 0.15 * (signalCount - 1))`
+  - Log format: `[COMPOSITE] tokenId: <score>, signals: [<types>]`
+  - Config: use `config.compositeWindowMs`
+  - **Preserve all existing behavior** — new code only added to `handleSignal()`
+  - Input/Output: `Signal` → enriched `payload` field before DB insert
+  - Test guidance: `signal-aggregator.test.ts` additions (do NOT replace existing tests)
+  - Edge cases: window boundary (signal at exactly `compositeWindowMs` — include or exclude; spec says "within", so exclude expired), single signal (no composite), payload immutability (spread signal before enriching to avoid mutation)
+
+- [x] **Task 4.2: Extend `src/processors/signal-aggregator.test.ts`**
+  - Files: `src/processors/signal-aggregator.test.ts`
+  - **Add** new describe block: `"SignalAggregator — composite confidence scoring"`
+  - Do NOT modify existing tests
+  - Required test cases (from spec):
+    1. 2 co-occurring signals → `compositeScore` added to both payloads, correct formula
+    2. 3 signals → 1.30× bonus applied (`1 + 0.15 * 2 = 1.30`)
+    3. Payload enriched: `signal.payload.compositeScore` present after insert
+    4. Single signal → no composite (no `compositeScore` in payload)
+    5. Window expiry: signal outside `compositeWindowMs` → not included in composite
+    6. Different tokenIds: composite only for matching tokenId, not cross-token
+
+---
+
+### Chunk 5: Backtest Module
+
+- [x] **Task 5.1: Create `src/backtest/types.ts`**
+  - Files: `src/backtest/types.ts` (new)
+  - Export interfaces:
+    ```typescript
+    export interface BacktestConfig {
+      startDate: Date;
+      endDate: Date;
+      signalTypes?: SignalType[];
+      minConfidence?: number;
+      tokenIds?: string[];
+    }
+    
+    export interface SignalOutcome {
+      signalId: number;
+      tokenId: string;
+      signalType: SignalType;
+      direction: string;
+      confidence: number;
+      createdAt: Date;
+      resolved: boolean;       // market resolved in time range
+      correct: boolean | null; // null if not resolved
+    }
+    
+    export interface SignalMetrics {
+      precision: number;       // correct / total fired (for resolved)
+      recall: number;          // correct / total resolvable
+      f1: number;
+      avgConfidence: number;
+      totalFired: number;
+      totalResolved: number;
+      totalCorrect: number;
+    }
+    
+    export interface BacktestResult {
+      config: BacktestConfig;
+      byType: Partial<Record<SignalType, SignalMetrics>>;
+      overall: SignalMetrics;
+      generatedAt: Date;
+    }
+    ```
+  - No test needed (type-only file)
+
+- [x] **Task 5.2: Create `src/backtest/evaluator.ts`**
+  - Files: `src/backtest/evaluator.ts` (new)
+  - Export `BacktestEvaluator` class:
+    ```typescript
+    export class BacktestEvaluator {
+      evaluate(outcomes: SignalOutcome[]): BacktestResult["byType"] & { overall: SignalMetrics }
+    }
+    ```
+  - `evaluate()` groups outcomes by `signalType`, computes `SignalMetrics` for each group + overall
+  - Precision = `totalCorrect / totalResolved` (or 0 if `totalResolved === 0`)
+  - Recall = `totalCorrect / totalResolved` (same as precision here — recall requires knowing total positives; clarification: per spec, `recall = correct / total resolvable` where "total resolvable" = `totalResolved`. So precision ≡ recall in this formulation. Implement as-is per spec.)
+  - F1 = `2 * precision * recall / (precision + recall)` (or 0 if both are 0)
+  - avgConfidence = mean of all signal confidences in the group
+  - Input: `SignalOutcome[]`
+  - Output: `{ byType: ..., overall: ... }`
+  - Test guidance: `backtest/evaluator.test.ts` — precision/recall/f1 math, zero-division (no resolved markets → all zeros), per-type breakdown, overall aggregation
+
+- [x] **Task 5.3: Create `src/backtest/report.ts`**
+  - Files: `src/backtest/report.ts` (new)
+  - Export `BacktestReport` class:
+    ```typescript
+    export class BacktestReport {
+      print(result: BacktestResult): void  // stdout table
+      async save(result: BacktestResult, outputDir?: string): Promise<string>  // returns path written
+    }
+    ```
+  - `print()`: renders the box-drawing table to `process.stdout` (use `console.log`)
+  - `save()`: writes JSON to `backtest-results/{startDate}_{endDate}.json`
+    - Date format in filename: `YYYY-MM-DD` (e.g., `2025-01-01_2025-04-01.json`)
+    - Creates `backtest-results/` directory if not present (use `fs.mkdirSync` with `recursive: true`)
+  - Table format: exact box-drawing chars from spec
+  - Column widths: fixed at the widths shown in the spec
+  - Test guidance: `backtest/report.test.ts`
+    - JSON output shape matches `BacktestResult`
+    - stdout output contains expected signal type names and numeric values
+    - `save()` writes to correct path
+    - Mock `fs.writeFileSync` and `fs.mkdirSync` in tests
+
+- [x] **Task 5.4: Create `src/backtest/runner.ts`**
+  - Files: `src/backtest/runner.ts` (new)
+  - Export `BacktestRunner` class + `main()` function:
+    ```typescript
+    export class BacktestRunner {
+      constructor(private readonly db: Db) {}
+      async run(config: BacktestConfig): Promise<BacktestResult>
+    }
+    
+    // CLI entry (called when file run directly)
+    async function main(): Promise<void>
+    ```
+  - `run()`:
+    1. Query `signals` table: `WHERE created_at BETWEEN config.startDate AND config.endDate [AND signal_type IN (...)] [AND confidence >= minConfidence] [AND token_id IN (...)]`
+    2. For each signal, join to `markets` table: get `winner` field for the `tokenId`
+    3. Determine correctness:
+       - Signal direction `BULLISH` = predicted `winner = true` (Yes outcome wins)
+       - Signal direction `BEARISH` = predicted `winner = false`
+       - If `markets.winner IS NULL` → not resolved (resolved=false, correct=null)
+       - If resolved: correct = `(direction=BULLISH && winner=true) || (direction=BEARISH && winner=false)`
+    4. Build `SignalOutcome[]`, call `BacktestEvaluator.evaluate()`, call `BacktestReport.print()` + `.save()`
+  - `main()`: parse `process.argv` for `--start`, `--end`, `--signal-types`, `--min-confidence`; create DB; run; close DB
+  - Test guidance: `backtest/runner.test.ts` — mock DB (mock `execute()` or use drizzle mock), assert correct signal fetch query shape, assert `BacktestEvaluator.evaluate` called with correct outcomes, assert `BacktestReport.print` called
+
+---
+
+### Chunk 6: Pipeline Wiring
+
+- [x] **Task 6.1: Update `src/pipeline.ts`**
+  - Files: `src/pipeline.ts`
+  - Changes:
+    1. **Remove** old imports: `evaluatePriceImpact` from `price-impact-signal.js`, `evaluateVelocity` from `velocity-signal.js`
+    2. **Add** new imports: `PriceImpactSignalEvaluator` from `price-impact-signal.js`, `SentimentVelocityEvaluator` from `velocity-signal.js`, `getRecentPriceHistory` from `db/queries/price-history.js`
+    3. **Remove** `recentPrices` Map, `recordPrice()`, `priceBuckets` Map, `recordBucketPrice()` (replaced by evaluator-internal state)
+    4. **Remove** the `SnapshotWriter` callback block that called `evaluatePriceImpact()`
+    5. **Remove** the 5-min `setInterval` block that called `evaluateVelocity()`
+    6. **Instantiate**: `const priceImpactEvaluator = new PriceImpactSignalEvaluator(db)` and `const velocityEvaluator = new SentimentVelocityEvaluator()`
+    7. **Bootstrap** velocity evaluator on startup: `await velocityEvaluator.bootstrap(db, watchlistedTokenIds)` (after `getWatchlistedTokenIds`)
+    8. **Wire trade handler**: In `tradeHandler1`, after existing logic, add:
+       ```typescript
+       velocityEvaluator.recordPrice(trade.tokenId, trade.priceUsdc);
+       velocityEvaluator.recordTrade(trade.tokenId);
+       const velSignal = velocityEvaluator.evaluate(trade.tokenId, conditionIdMap.get(trade.tokenId) ?? trade.tokenId);
+       if (velSignal) bus.emit("signal", velSignal);
+       const impactSignal = await priceImpactEvaluator.evaluate(trade);
+       if (impactSignal) bus.emit("signal", impactSignal);
+       ```
+    9. **Wire book_update handler**: Also call `velocityEvaluator.recordPrice()` from `best_bid_ask` and `last_trade_price` CLOB WS events (mid-price from bid/ask, last trade price)
+    10. **Shutdown**: add `velocityEvaluator` and `priceImpactEvaluator` cleanup (if they have any timers — they don't, so no action needed)
+  - **CRITICAL**: `conditionIdMap` must be populated before `velocityEvaluator.evaluate()` is called. The existing code populates it lazily (on first `getMarketStats()` call). For the evaluate call, fall back to `tokenId` as `conditionId` when not yet populated (same as existing pattern).
+  - Test guidance: Pipeline is integration-tested via the existing `tests/` directory — no new pipeline unit tests needed. Verify pipeline test file if it exists.
+  - Edge cases: `PriceImpactSignalEvaluator.evaluate()` is async — must `await` in trade handler, handler must remain `async`
+
+---
+
+### Chunk 7: Package.json + `backtest-results/` directory
+
+- [x] **Task 7.1: Add `backtest` script to `package.json`**
+  - Files: `package.json`
+  - Add: `"backtest": "node --import tsx/esm src/backtest/runner.ts"`
+  - No test needed
+
+- [x] **Task 7.2: Create `backtest-results/.gitkeep`**
+  - Files: `backtest-results/.gitkeep` (new empty file)
+  - Add `backtest-results/*.json` to `.gitignore` (keep the directory, ignore output files)
+  - No test needed
+
+---
+
+### Chunk 8: Testing
+
+- [x] **Task 8.1: `src/db/queries/price-history.test.ts`** (new)
+  - Test: correct SQL query shape, row mapping, empty result
+  - Mock: `db.select().from().where().orderBy().limit()` chain
+
+- [x] **Task 8.2: `src/signals/price-impact-signal.test.ts`** (replace)
+  - See Task 2.2
+
+- [x] **Task 8.3: `src/signals/velocity-signal.test.ts`** (replace)
+  - See Task 3.2
+
+- [x] **Task 8.4: `src/processors/signal-aggregator.test.ts`** (extend)
+  - See Task 4.2
+
+- [x] **Task 8.5: `src/backtest/evaluator.test.ts`** (new)
+  - Test precision/recall/f1 math with known inputs
+  - Zero-division: `totalResolved = 0` → all zeros, no NaN
+  - Per-type breakdown and overall aggregation
+  - Multiple signal types mixed
+
+- [x] **Task 8.6: `src/backtest/report.test.ts`** (new)
+  - Mock `fs.mkdirSync`, `fs.writeFileSync`
+  - Assert JSON structure matches `BacktestResult`
+  - Assert stdout contains expected signal type names
+  - Assert filename format `YYYY-MM-DD_YYYY-MM-DD.json`
+
+- [x] **Task 8.7: `src/backtest/runner.test.ts`** (new)
+  - Mock DB with `vi.fn()` for `execute` calls
+  - Assert signal query includes date range filter
+  - Assert `BacktestEvaluator.evaluate()` called with correct `SignalOutcome[]`
+  - Assert resolved/unresolved market mapping correct
+  - Test `--start`, `--end` CLI arg parsing in `main()`
+
+- [x] **Task 8.8: `src/config.test.ts` additions**
+  - Add assertions for 7 new Phase 3 env vars (default values + override)
+
+---
+
+### Chunk 9: Docs + Commit Strategy
+
+- [x] **Task 9.1: Update `CLAUDE.md`**
+  - Add Phase 3 section to current state
+  - Update test counts (target: 357 + new tests)
+  - Add new env vars to environment variables table
+
+- [x] **Task 9.2: Commit sequence on `feat/phase-3`**
   ```
-  feat: ClobWsPool sharded WS        (Task 3.1 + Task 8.5)
-  feat: WsBookImbalanceEvaluator      (Task 4.1 + Task 8.8 + snapshot persistence)
-  feat: WebhookEmitter                (Tasks 5.1, 5.2, 8.1, 8.9)
-  feat: WalletEnricher                (Tasks 2.1, 2.2, 2.3, 6.1, 6.2, 8.2, 8.3, 8.4, 8.6, 8.10)
-  feat: phase-2 pipeline wiring       (Task 7.1)
-  chore: update docs for Phase 2      (Task 9.1 + Tasks 1.1, 1.2, 8.7)
+  feat: add getRecentPriceHistory query + Phase 3 config
+  feat: PriceImpactSignalEvaluator (DB-backed anomaly detection)
+  feat: SentimentVelocityEvaluator (in-memory rolling window)
+  feat: SignalAggregator composite confidence scoring
+  feat: backtest module (runner, evaluator, report, types)
+  feat: wire Phase 3 evaluators in pipeline.ts
+  chore: update docs for Phase 3
   ```
 
-- [ ] **Task 9.3: Push `feat/phase-2` and open PR to `main`**
+- [x] **Task 9.3: Push + open PR to `main`**
 
 ---
 
 ## Execution Order
 
-```
-1.1 → 1.2                           (config first — no deps)
-2.1 → 2.2 → 2.3                     (DB queries — no deps, parallel with 1.x)
-3.1                                  (ClobWsPool completions — dep: 2.2 for markMarketClosed)
-4.1                                  (WsBookImbalanceEvaluator — dep: 1.1, 2.1)
-5.1 → 5.2                           (WebhookEmitter — dep: 1.1)
-6.1 → 6.2                           (WalletEnricher — dep: 1.1, 2.1, 2.3)
-7.1                                  (pipeline wiring — dep: all above)
-8.x                                  (tests alongside each module)
-9.x                                  (docs + commits last)
-```
+Dependencies must be respected:
 
-Parallel tracks (can be done concurrently by different agents):
-- Track A: 1.1 → 1.2 → 5.1 → 5.2 (config + webhooks)
-- Track B: 2.1 → 2.2 → 2.3 → 6.1 → 6.2 (DB + wallet enrichment)
-- Track C: 3.1 → 4.1 (ClobWsPool + WS evaluator)
-- Track D: 7.1 (pipeline wiring — waits for all tracks)
-
----
-
-## Risks & Mitigations (Law-reviewed)
-
-| Risk | Severity | Status | Mitigation |
-|---|---|---|---|
-| Phase 1 `OrderBookImbalanceEngine` reused for WS path causes spec drift (confidence formula, strength, cooldown) | **MAJOR** | ✅ Resolved | New `WsBookImbalanceEvaluator` class, existing engine frozen |
-| WS-driven imbalance metrics not persisted to `order_book_snapshots` | **MAJOR** | ✅ Resolved | `WsBookImbalanceEvaluator.evaluate()` always calls `insertBookSnapshot()` with `snapshotTrigger: "ws_event"` |
-| `ClobWsPool` missing jitter and `market_resolved` handler | **MAJOR** | ✅ Resolved | Task 3.1 adds jitter and `market_resolved` → `markMarketClosed()` |
-| Plan uses wrong signal name `BOOK_IMBALANCE` instead of `ORDER_BOOK_IMBALANCE` | **MAJOR** | ✅ Resolved | All occurrences corrected to `ORDER_BOOK_IMBALANCE` throughout |
-| `onWhaleInserted` callback silently skips non-persisted alerts | **MINOR** | ✅ Resolved | Explicit policy: enrichment only for `emitSignal=true` alerts; documented in code and CLAUDE.md |
-| "Must NOT change" list inconsistent with actual edit surface | **MINOR** | ✅ Resolved | Allowed edit surface table in Codebase State section replaces blanket prohibition |
-| Wallet re-enrichment of heavy traders wastes API quota | **NIT** | ✅ Resolved | 24h recency guard in `WalletEnricher._enrich()` — skips fetch if profile updated within 24h |
-| `walletFirstSeenAt` not in `enrichWhaleAlert` | Medium | ✅ Resolved | Task 2.3 adds it as optional field (backward-compatible) |
-| `alertId` for `WalletEnricher` requires aggregator callback | Medium | ✅ Resolved | `onWhaleInserted` callback in Task 6.2 |
-| `fetch` global in tests | Low | ✅ Resolved | `vi.stubGlobal` + `vi.unstubAllGlobals()` in afterEach — standard pattern |
-| Rate limiter timing in tests | Low | ✅ Resolved | Use `vi.useFakeTimers()` for token-bucket refill assertions |
-| Shared cooldown state if REST + WS both use same engine instance | Medium | ✅ Resolved | Two separate evaluators with independent `lastEmits` maps |
+1. **Task 1.1** (config) — no deps
+2. **Task 1.2** (.env.example) — no deps
+3. **Task 1.3** (price-history query) — no deps
+4. **Task 5.1** (backtest/types.ts) — no deps
+5. **Task 2.1** (PriceImpactSignalEvaluator) — depends on 1.1, 1.3
+6. **Task 3.1** (SentimentVelocityEvaluator) — depends on 1.1, 1.3 (bootstrap uses price-history query)
+7. **Task 4.1** (SignalAggregator composite) — depends on 1.1
+8. **Task 5.2** (BacktestEvaluator) — depends on 5.1
+9. **Task 5.3** (BacktestReport) — depends on 5.1, 5.2
+10. **Task 5.4** (BacktestRunner) — depends on 5.1, 5.2, 5.3
+11. **Task 6.1** (pipeline wiring) — depends on 2.1, 3.1
+12. **Task 7.1** (package.json script) — depends on 5.4
+13. **Task 7.2** (backtest-results dir) — no deps
+14. **All tests** — depend on their respective implementation tasks
 
 ---
 
-## Signal Type Reference (canonical — do not drift)
+## Risks & Unknowns
 
-| Signal type | String literal | Source path | Evaluator |
-|---|---|---|---|
-| Whale trade | `"WHALE_TRADE"` | Live WS + data-api | `WhaleDetector` (Phase 1) |
-| Book imbalance | `"ORDER_BOOK_IMBALANCE"` | REST timer (Phase 1) | `OrderBookImbalanceEngine` (Phase 1, frozen) |
-| Book imbalance | `"ORDER_BOOK_IMBALANCE"` | WS book event (Phase 2) | `WsBookImbalanceEvaluator` (Phase 2, new) |
-| Price impact | `"PRICE_IMPACT_ANOMALY"` | Phase 3+ | — |
-| Sentiment velocity | `"SENTIMENT_VELOCITY"` | Phase 3+ | — |
+### Risk 1: `PriceImpactSignal` type field mismatch
+The existing `PriceImpactSignal` interface has `priceChangePct`, `windowSeconds`, `triggeringTradeValueUsdc`. The new algorithm doesn't naturally produce these. Resolution documented in Task 2.1 — set them to derived/dummy values to preserve the type contract without changing `events/types.ts`.
 
-**Both imbalance paths emit `ORDER_BOOK_IMBALANCE` — they share the same signal type and DB record format. The trigger path is distinguished by `order_book_snapshots.snapshot_trigger` (`"rest_timer"` vs `"ws_event"`).**
+### Risk 2: Phase 1 price-impact and velocity tests break on algorithm change
+The existing `price-impact-signal.test.ts` and `velocity-signal.test.ts` test the Phase 1 stub algorithms. These tests will fail once the implementations are replaced. **This is expected** — both test files are completely replaced in Tasks 2.2 and 3.2. Zoro must replace them before running `pnpm test`.
+
+### Risk 3: Hot-path async in tradeHandler1
+`PriceImpactSignalEvaluator.evaluate()` does 2 DB reads per trade. On high-throughput markets this could back-pressure the trade pipeline. Mitigation: keep the DB calls non-blocking (fire and continue), wrap in try/catch that only warns. Do NOT `await` inside the synchronous portion of the handler — restructure as a separate async handler registered independently.
+
+### Risk 4: `SentimentVelocityEvaluator.bootstrap()` DB query volume
+Querying 200 price records for each of 200 watchlisted tokens on startup = up to 40,000 rows. This is a startup-only cost and acceptable, but Zoro should batch these queries (query all tokens at once with `WHERE token_id IN (...)` + subquery for `LIMIT per token`) if performance is a concern. Simple approach: sequential per-token queries with `await Promise.all()` batching.
+
+### Risk 5: `markets.winner` field semantics
+The schema has `winner: boolean` on the `markets` table (from `src/db/schema.ts`). For a binary Yes/No market, `winner = true` means "Yes" won. But signal direction is `BULLISH`/`BEARISH` relative to a trade side. A `BUY` on the "Yes" token is bullish — it's a bet that `winner = true`. A `BUY` on the "No" token (negRisk) is also a `BUY` but is bearish on the outcome. **Mitigation**: For Phase 3, assume all tokens in the watchlist are non-negRisk (consistent with Phase 1/2 architecture). The correctness mapping `BULLISH → winner=true` is valid for non-negRisk tokens only.
+
+### Risk 6: Backtest `signals` query with date range on partitioned table
+`trades` is partitioned. `signals` is NOT partitioned (see schema). `ORDER BY created_at` with `BETWEEN` on `signals` will do a full table scan without a date-range partition pruning. This is acceptable for a CLI backtest tool — not on the hot path.
+
+---
+
+## Board Questions for Law (Architecture/Strategy Trade-offs)
+
+1. **Composite scoring placement:** The spec says enrich the `payload` column before insert. But `handleSignal()` currently receives the `Signal` object and spreads it into `insertSignal()`. To enrich `payload`, we need to mutate or create a new `Signal` with an updated `payload`. Is `{ ...signal, payload: { ...signal.payload, compositeScore } }` the right pattern, or should `insertSignal()` accept an extra `extraPayload` parameter?
+
+2. **PriceImpactEvaluator on the trade hot path:** 2 DB reads per trade is risky under load. Should it fire-and-forget (no `await` in the trade handler — just detach the async work) or should there be an internal queue/buffer for evaluation work?
+
+3. **`VelocitySignal.velocityZScore` field name:** The Phase 3 algorithm doesn't compute a z-score — it computes `tradeCountVelocity`. Should we rename the field in `events/types.ts` (but that would change the type) or just populate it with `tradeCountVelocity` and note the semantic drift? The spec says "Do NOT change `src/db/schema.ts`" — `events/types.ts` is not mentioned in the edit surface constraints.
+
+4. **Backtest resolution correctness for multi-outcome markets:** The current schema has one row per token (Yes/No are separate rows). If a market has `winner=true` on the "Yes" token and `winner=false` on the "No" token, a `BULLISH` signal on the "No" token would be incorrectly counted as correct (`winner=true` but signal is on the "No" side). Does the backtest need to account for `outcomeIndex` when computing correctness?
 
 ---
 
 ## TODO
-- [ ] Task 1.1 — Extend `src/config.ts`
+- [ ] Task 1.1 — Extend `src/config.ts` (7 Phase 3 fields)
 - [ ] Task 1.2 — Update `.env.example`
-- [ ] Task 2.1 — Create `src/db/queries/wallets.ts`
-- [ ] Task 2.2 — Create `markMarketClosed` in markets queries
-- [ ] Task 2.3 — Extend `enrichWhaleAlert` for `walletFirstSeenAt`
-- [ ] Task 3.1 — ClobWsPool: url option + jitter + market_resolved
-- [ ] Task 4.1 — Create `src/processors/ws-book-imbalance-evaluator.ts`
-- [ ] Task 5.1 — Create `src/alerts/webhook-emitter.ts`
-- [ ] Task 5.2 — Wire WebhookEmitter into AlertEmitter
-- [ ] Task 6.1 — Create `src/enrichment/wallet-enricher.ts`
-- [ ] Task 6.2 — Add `onWhaleInserted` to SignalAggregator
-- [ ] Task 7.1 — Wire Phase 2 in pipeline.ts
-- [ ] Task 8.1 — `webhook-emitter.test.ts`
-- [ ] Task 8.2 — `wallet-enricher.test.ts`
-- [ ] Task 8.3 — `wallets.test.ts` (queries)
-- [ ] Task 8.4 — `markets.test.ts` (markMarketClosed)
-- [ ] Task 8.5 — `clob-ws-pool.test.ts` additions (URL, jitter, market_resolved)
-- [ ] Task 8.6 — `whales.test.ts` additions (walletFirstSeenAt)
-- [ ] Task 8.7 — `config.test.ts` additions (Phase 2 fields)
-- [ ] Task 8.8 — `ws-book-imbalance-evaluator.test.ts`
-- [ ] Task 8.9 — `alert-emitter.test.ts` additions (webhookEmitter)
-- [ ] Task 8.10 — `signal-aggregator.test.ts` additions (onWhaleInserted)
-- [ ] Task 9.1 — Update CLAUDE.md
+- [ ] Task 1.3 — Create `src/db/queries/price-history.ts`
+- [ ] Task 2.1 — Rewrite `src/signals/price-impact-signal.ts`
+- [ ] Task 2.2 — Replace `src/signals/price-impact-signal.test.ts`
+- [ ] Task 3.1 — Rewrite `src/signals/velocity-signal.ts`
+- [ ] Task 3.2 — Replace `src/signals/velocity-signal.test.ts`
+- [ ] Task 4.1 — Update `src/processors/signal-aggregator.ts` (composite scoring)
+- [ ] Task 4.2 — Extend `src/processors/signal-aggregator.test.ts`
+- [ ] Task 5.1 — Create `src/backtest/types.ts`
+- [ ] Task 5.2 — Create `src/backtest/evaluator.ts`
+- [ ] Task 5.3 — Create `src/backtest/report.ts`
+- [ ] Task 5.4 — Create `src/backtest/runner.ts`
+- [ ] Task 6.1 — Update `src/pipeline.ts`
+- [ ] Task 7.1 — Add `backtest` script to `package.json`
+- [ ] Task 7.2 — Create `backtest-results/.gitkeep`
+- [ ] Task 8.1 — `src/db/queries/price-history.test.ts`
+- [ ] Task 8.2 — `src/signals/price-impact-signal.test.ts` (replace)
+- [ ] Task 8.3 — `src/signals/velocity-signal.test.ts` (replace)
+- [ ] Task 8.4 — `src/processors/signal-aggregator.test.ts` (extend)
+- [ ] Task 8.5 — `src/backtest/evaluator.test.ts`
+- [ ] Task 8.6 — `src/backtest/report.test.ts`
+- [ ] Task 8.7 — `src/backtest/runner.test.ts`
+- [ ] Task 8.8 — `src/config.test.ts` (Phase 3 additions)
+- [ ] Task 9.1 — Update `CLAUDE.md`
 - [ ] Task 9.2 — Commit sequence
-- [ ] Task 9.3 — Push + open PR
+- [ ] Task 9.3 — Push + open PR to `main`
