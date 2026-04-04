@@ -1,129 +1,207 @@
 import type { VelocitySignal, TokenId } from "../events/types.js";
+import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import * as schema from "../db/schema.js";
+import { getRecentPriceHistory, getRecentTradeTimestamps } from "../db/queries/price-history.js";
 import { config } from "../config.js";
 
-const MIN_HISTORY_POINTS = 20;
-const RECENT_WINDOW_POINTS = 12; // 60 min at 5-min buckets
+type Db = NodePgDatabase<typeof schema>;
 
-export interface PriceBucket {
+interface PriceEntry {
   price: number;
-  bucketStart: Date;
+  timestamp: number;
 }
 
-export interface VelocityOptions {
-  zScoreThreshold?: number;
-  minLiquidityUsdc?: number;
-  marketAgeMs?: number;
-  categoryMedianReturn?: number | null;
-  categoryMedianStdDev?: number | null;
+interface TradeEntry {
+  timestamp: number;
 }
 
-/** Compute mean of an array */
-export function mean(values: number[]): number {
-  if (values.length === 0) return 0;
-  return values.reduce((a, b) => a + b, 0) / values.length;
-}
+export class SentimentVelocityEvaluator {
+  private readonly windowSeconds: number;
+  private readonly priceThreshold: number;
+  private readonly tradeCountMultiplier: number;
+  private readonly cooldownMs: number;
 
-/** Compute population stddev */
-export function stddev(values: number[], avg: number): number {
-  if (values.length < 2) return 0;
-  const variance = values.reduce((s, v) => s + (v - avg) ** 2, 0) / values.length;
-  return Math.sqrt(variance);
-}
+  /** Per-token price buffer — entries within 2× windowMs */
+  private readonly priceBuffer = new Map<TokenId, PriceEntry[]>();
+  /** Per-token trade timestamp buffer — entries within 2× windowMs */
+  private readonly tradeBuffer = new Map<TokenId, TradeEntry[]>();
+  /** Per-token last-emit timestamp for cooldown */
+  private readonly lastEmit = new Map<TokenId, number>();
+  /**
+   * Warm-up suppression: if a token has no bootstrap data, block evaluation
+   * until both current and prior windows have been live-observed.
+   */
+  private readonly warmUntil = new Map<TokenId, number>();
 
-/** Compute pairwise returns: (p[i+1] - p[i]) / p[i] */
-function pairwiseReturns(prices: number[]): number[] {
-  const returns: number[] = [];
-  for (let i = 0; i < prices.length - 1; i++) {
-    if (prices[i] > 0) {
-      returns.push((prices[i + 1] - prices[i]) / prices[i]);
-    }
-  }
-  return returns;
-}
-
-/**
- * Evaluate sentiment velocity for a token.
- * Returns a VelocitySignal or null.
- */
-export function evaluateVelocity(
-  tokenId: TokenId,
-  conditionId: string,
-  history24h: PriceBucket[],
-  liquidityUsdc: number,
-  opts: VelocityOptions = {}
-): VelocitySignal | null {
-  const threshold = opts.zScoreThreshold ?? config.velocityZScoreThreshold;
-  const minLiquidityUsdc = opts.minLiquidityUsdc ?? config.minLiquidityUsdc;
-  const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-
-  // Bootstrap guard: need at least 20 history points
-  if (history24h.length < MIN_HISTORY_POINTS) return null;
-
-  // Liquidity guard
-  if (liquidityUsdc < minLiquidityUsdc) return null;
-
-  const prices = history24h.map((b) => b.price);
-  const returns = pairwiseReturns(prices);
-
-  if (returns.length < 2) return null;
-
-  // Determine baseline (24h returns or category median)
-  const marketAgeMs = opts.marketAgeMs ?? Infinity;
-  const isNewMarket = marketAgeMs < TWO_HOURS_MS;
-
-  let baselineMean: number;
-  let baselineStdDev: number;
-
-  if (isNewMarket) {
-    // Use category-median baseline
-    if (opts.categoryMedianReturn == null || opts.categoryMedianStdDev == null) {
-      // No category median available — skip (guard)
-      return null;
-    }
-    baselineMean = opts.categoryMedianReturn;
-    baselineStdDev = opts.categoryMedianStdDev;
-  } else {
-    baselineMean = mean(returns);
-    baselineStdDev = stddev(returns, baselineMean);
+  constructor(opts?: {
+    windowSeconds?: number;
+    priceThreshold?: number;
+    tradeCountMultiplier?: number;
+    cooldownMs?: number;
+  }) {
+    this.windowSeconds = opts?.windowSeconds ?? config.velocityWindowSeconds;
+    this.priceThreshold = opts?.priceThreshold ?? config.velocityPriceThreshold;
+    this.tradeCountMultiplier = opts?.tradeCountMultiplier ?? config.velocityTradeCountMultiplier;
+    this.cooldownMs = opts?.cooldownMs ?? config.velocityCooldownMs;
   }
 
-  if (baselineStdDev === 0) return null;
+  /** Record a new price observation. Prunes stale entries automatically. */
+  recordPrice(tokenId: TokenId, price: number, timestamp?: number): void {
+    const ts = timestamp ?? Date.now();
+    if (!this.priceBuffer.has(tokenId)) this.priceBuffer.set(tokenId, []);
+    const buf = this.priceBuffer.get(tokenId)!;
+    buf.push({ price, timestamp: ts });
+    // Prune to 2× window
+    const cutoff = ts - this.windowSeconds * 2 * 1000;
+    const fresh = buf.filter((e) => e.timestamp >= cutoff);
+    this.priceBuffer.set(tokenId, fresh);
+  }
 
-  // Recent 60-min window (last 12 buckets)
-  const recentBuckets = history24h.slice(-RECENT_WINDOW_POINTS);
-  const recentPrices = recentBuckets.map((b) => b.price);
-  const firstRecent = recentPrices[0];
-  const lastRecent = recentPrices[recentPrices.length - 1];
+  /** Record a trade occurrence for count-velocity calculation. */
+  recordTrade(tokenId: TokenId, timestamp?: number): void {
+    const ts = timestamp ?? Date.now();
 
-  if (!firstRecent || firstRecent <= 0) return null;
+    // Set warm-up if this token is brand new (no bootstrap data)
+    if (!this.tradeBuffer.has(tokenId) && !this.warmUntil.has(tokenId)) {
+      this.warmUntil.set(tokenId, ts + this.windowSeconds * 2 * 1000);
+    }
 
-  const recentReturn = (lastRecent - firstRecent) / firstRecent;
-  const hourlyChangePct = recentReturn * 100;
-  const zScore = (recentReturn - baselineMean) / baselineStdDev;
+    if (!this.tradeBuffer.has(tokenId)) this.tradeBuffer.set(tokenId, []);
+    const buf = this.tradeBuffer.get(tokenId)!;
+    buf.push({ timestamp: ts });
+    // Prune to 2× window
+    const cutoff = ts - this.windowSeconds * 2 * 1000;
+    const fresh = buf.filter((e) => e.timestamp >= cutoff);
+    this.tradeBuffer.set(tokenId, fresh);
+  }
 
-  if (Math.abs(zScore) < threshold) return null;
+  /**
+   * Evaluate velocity for a token. Returns a signal or null.
+   * Should be called after `recordTrade` and `recordPrice` for the current event.
+   */
+  evaluate(tokenId: TokenId, conditionId?: string): VelocitySignal | null {
+    const now = Date.now();
+    const windowMs = this.windowSeconds * 1000;
 
-  const direction = zScore > 0 ? "BULLISH" : "BEARISH" as const;
-  const confidence = Math.min(1.0, Math.abs(zScore) / 4);
+    // Warm-up guard
+    const warm = this.warmUntil.get(tokenId);
+    if (warm !== undefined && now < warm) return null;
 
-  return {
-    signalType: "SENTIMENT_VELOCITY",
-    tokenId,
-    conditionId,
-    direction,
-    confidence,
-    strength: zScore,
-    priceAtSignal: lastRecent,
-    createdAt: new Date(),
-    payload: {
-      zScore,
-      hourlyChangePct,
-      baselineMean,
-      baselineStdDev,
-      historyPoints: history24h.length,
-    },
-    velocityZScore: zScore,
-    hourlyPriceChangePct: hourlyChangePct,
-    baselineStdDev,
-  };
+    // Current window price data: [now - windowMs, now]
+    const allPrices = this.priceBuffer.get(tokenId) ?? [];
+    const currentPrices = allPrices.filter((p) => p.timestamp >= now - windowMs);
+
+    if (currentPrices.length < 2) return null;
+
+    const windowStartPrice = currentPrices[0].price;
+    const latestPrice = currentPrices[currentPrices.length - 1].price;
+
+    if (windowStartPrice === 0) return null;
+
+    // Price velocity: % per minute
+    const priceVelocity =
+      ((latestPrice - windowStartPrice) / windowStartPrice / this.windowSeconds) * 60;
+
+    if (Math.abs(priceVelocity) <= this.priceThreshold) return null;
+
+    // Trade count velocity
+    const allTrades = this.tradeBuffer.get(tokenId) ?? [];
+    const currentTrades = allTrades.filter((t) => t.timestamp >= now - windowMs);
+    const priorTrades = allTrades.filter(
+      (t) => t.timestamp >= now - 2 * windowMs && t.timestamp < now - windowMs
+    );
+    const tradeCountVelocity = currentTrades.length / Math.max(priorTrades.length, 1);
+
+    if (tradeCountVelocity <= this.tradeCountMultiplier) return null;
+
+    // Cooldown
+    const lastFired = this.lastEmit.get(tokenId) ?? 0;
+    if (now - lastFired < this.cooldownMs) return null;
+
+    // Direction and confidence
+    const direction = priceVelocity > 0 ? "BULLISH" : "BEARISH";
+    const confidence = Math.min(1.0, Math.abs(priceVelocity) / (this.priceThreshold * 3));
+
+    this.lastEmit.set(tokenId, now);
+
+    const resolvedConditionId = conditionId ?? tokenId;
+
+    return {
+      signalType: "SENTIMENT_VELOCITY",
+      tokenId,
+      conditionId: resolvedConditionId,
+      direction,
+      confidence,
+      strength: tradeCountVelocity,
+      priceAtSignal: latestPrice,
+      createdAt: new Date(),
+      payload: {
+        priceVelocityPctPerMin: priceVelocity * 100,
+        tradeCountVelocity,
+        windowSeconds: this.windowSeconds,
+        windowStartPrice,
+        latestPrice,
+      },
+      tradeCountVelocity,
+    };
+  }
+
+  /**
+   * Bootstrap from DB: pre-populate price and trade buffers from historical data.
+   * If both windows are covered by DB data, warm-up suppression is NOT applied.
+   * If no data for a token, warm-up remains until 2× window has elapsed live.
+   */
+  async bootstrap(db: Db, tokenIds: TokenId[]): Promise<void> {
+    const windowSeconds = this.windowSeconds * 2; // fetch 2× window for prior-window calculation
+
+    await Promise.all(
+      tokenIds.map(async (tokenId) => {
+        try {
+          // Populate price buffer
+          const prices = await getRecentPriceHistory(db, tokenId, 500);
+          if (prices.length > 0) {
+            // getRecentPriceHistory returns newest-first — reverse for chronological order
+            for (const p of [...prices].reverse()) {
+              this.recordPrice(tokenId, p.price, p.recordedAt.getTime());
+            }
+          }
+
+          // Populate trade buffer
+          const tradeTs = await getRecentTradeTimestamps(db, tokenId, windowSeconds);
+          if (tradeTs.length > 0) {
+            for (const t of tradeTs) {
+              // Direct insert without triggering warm-up logic
+              if (!this.tradeBuffer.has(tokenId)) this.tradeBuffer.set(tokenId, []);
+              this.tradeBuffer.get(tokenId)!.push({ timestamp: t.tradedAt.getTime() });
+            }
+          }
+
+          // If we have data for both windows, skip warm-up
+          const now = Date.now();
+          const windowMs = this.windowSeconds * 1000;
+          const allTrades = this.tradeBuffer.get(tokenId) ?? [];
+          const priorWindow = allTrades.filter(
+            (t) => t.timestamp >= now - 2 * windowMs && t.timestamp < now - windowMs
+          );
+          const currentWindow = allTrades.filter((t) => t.timestamp >= now - windowMs);
+
+          if (priorWindow.length > 0 && currentWindow.length > 0) {
+            // Both windows have data — no warm-up needed
+            this.warmUntil.delete(tokenId);
+          }
+          // If only partial data, let warm-up remain (or not be set if token was never seen)
+        } catch {
+          // Bootstrap failure is non-fatal — warm-up suppression will handle it
+        }
+      })
+    );
+  }
+
+  /** Clear all buffers — use in tests and on shutdown. */
+  clear(): void {
+    this.priceBuffer.clear();
+    this.tradeBuffer.clear();
+    this.lastEmit.clear();
+    this.warmUntil.clear();
+  }
 }

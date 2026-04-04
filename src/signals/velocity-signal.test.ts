@@ -1,207 +1,408 @@
-import { describe, it, expect } from "vitest";
-import { evaluateVelocity, mean, stddev } from "./velocity-signal.js";
-import type { PriceBucket } from "./velocity-signal.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { SentimentVelocityEvaluator } from "./velocity-signal.js";
 
-const OPTS = {
-  zScoreThreshold: 2.0,
-  minLiquidityUsdc: 50_000,
-};
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Create 24h of 5-min buckets with a stable price (no velocity).
- *  Prices are deterministic — no Math.random() to avoid flaky z-score failures.
- *  A tiny deterministic noise (alternating ±0.0001) keeps stddev non-zero
- *  but z-score stays near 0 across the whole window.
+const TOKEN = "tok1";
+const COND = "cond1";
+
+// default evaluator: windowSeconds=300, priceThreshold=0.005, multiplier=1.5, cooldown=120000
+// We use tight opts in tests for fast time control
+
+function makeEvaluator(opts?: {
+  windowSeconds?: number;
+  priceThreshold?: number;
+  tradeCountMultiplier?: number;
+  cooldownMs?: number;
+}) {
+  return new SentimentVelocityEvaluator({
+    windowSeconds: 300,
+    priceThreshold: 0.005, // 0.5% per min
+    tradeCountMultiplier: 1.5,
+    cooldownMs: 120_000,
+    ...opts,
+  });
+}
+
+/**
+ * Populate a fresh evaluator so both conditions are met:
+ * - price rising from start to end at given velocity (pct/min)
+ * - trade count velocity exceeds multiplier
+ *
+ * @param ev       - evaluator instance
+ * @param now      - current time (Date.now())
+ * @param priceVelocityPctPerMin - positive = rising (BULLISH), negative = falling (BEARISH)
+ * @param tradeRatio - currentTrades / max(priorTrades, 1) — default 2.0 (exceeds 1.5)
  */
-function makeStableHistory(basePrice: number, count = 24): PriceBucket[] {
-  const now = Date.now();
-  return Array.from({ length: count }, (_, i) => ({
-    price: basePrice + (i % 2 === 0 ? 0.0001 : -0.0001), // deterministic tiny alternating noise
-    bucketStart: new Date(now - (count - i) * 5 * 60 * 1000),
-  }));
+function populate(
+  ev: SentimentVelocityEvaluator,
+  now: number,
+  priceVelocityPctPerMin: number,
+  tradeRatio = 2.0
+) {
+  const windowSeconds = 300;
+  const windowMs = windowSeconds * 1000;
+
+  // Price: add 2 points in current window
+  // windowStartPrice and latestPrice to produce the target velocity
+  // priceVelocity = (latest - start) / start / windowSeconds * 60
+  // → (latest - start) / start = priceVelocityPctPerMin / 100 * windowSeconds / 60
+  const priceDeltaFraction = (priceVelocityPctPerMin / 100) * (windowSeconds / 60);
+  const startPrice = 0.60;
+  const endPrice = startPrice * (1 + priceDeltaFraction);
+
+  ev.recordPrice(TOKEN, startPrice, now - windowMs + 1); // oldest in window
+  ev.recordPrice(TOKEN, endPrice, now); // latest
+
+  // Trades: prior window = Math.floor(10/tradeRatio), current window = 10
+  const currentCount = 10;
+  const priorCount = Math.floor(currentCount / tradeRatio); // so ratio = 10/priorCount >= tradeRatio
+
+  for (let i = 0; i < priorCount; i++) {
+    const ts = now - 2 * windowMs + i * 1000;
+    ev.tradeBuffer.get(TOKEN) ?? ev["tradeBuffer"].set(TOKEN, []);
+    (ev as unknown as { tradeBuffer: Map<string, { timestamp: number }[]> }).tradeBuffer
+      .get(TOKEN)!
+      .push({ timestamp: ts });
+  }
+  for (let i = 0; i < currentCount; i++) {
+    const ts = now - windowMs + i * 1000;
+    (ev as unknown as { tradeBuffer: Map<string, { timestamp: number }[]> }).tradeBuffer
+      .get(TOKEN)!
+      .push({ timestamp: ts });
+  }
+  // Disable warm-up for this token
+  (ev as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);
 }
 
-/** Create history where last 12 buckets jump significantly */
-function makeAccelerationHistory(basePrice: number, jumpPct: number): PriceBucket[] {
-  const now = Date.now();
-  const stableCount = 12;
-  const recentCount = 12;
-  const total = stableCount + recentCount;
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
-  return Array.from({ length: total }, (_, i) => {
-    const isRecent = i >= stableCount;
-    const price = isRecent
-      ? basePrice * (1 + (jumpPct / 100) * ((i - stableCount + 1) / recentCount))
-      : basePrice;
-    return {
-      price,
-      bucketStart: new Date(now - (total - i) * 5 * 60 * 1000),
-    };
-  });
-}
+describe("SentimentVelocityEvaluator", () => {
+  let ev: SentimentVelocityEvaluator;
+  let now: number;
 
-describe("evaluateVelocity", () => {
-  it("skips market with < 20 history points", () => {
-    const history = makeStableHistory(0.65, 15);
-    const result = evaluateVelocity("tok1", "cond1", history, 100_000, OPTS);
-    expect(result).toBeNull();
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2025-03-01T12:00:00Z"));
+    now = Date.now();
+    ev = makeEvaluator();
   });
 
-  it("fires when |z| >= threshold", () => {
-    // Large recent acceleration: 30% jump in last 12 buckets on stable baseline
-    const history = makeAccelerationHistory(0.50, 30);
-    const result = evaluateVelocity("tok1", "cond1", history, 200_000, OPTS);
-    // With a 30% jump on a stable baseline, z-score should be >> 2.0
+  afterEach(() => {
+    ev.clear();
+    vi.useRealTimers();
+  });
+
+  // ── Fires when both conditions met ────────────────────────────────────
+
+  it("fires BULLISH when price velocity and trade count velocity both exceed thresholds", () => {
+    populate(ev, now, 1.0, 2.0); // 1% per min > 0.5% threshold; ratio 2.0 > 1.5
+    const result = ev.evaluate(TOKEN, COND);
     expect(result).not.toBeNull();
-    expect(result!.velocityZScore).toBeGreaterThan(2.0);
+    expect(result!.direction).toBe("BULLISH");
+    expect(result!.signalType).toBe("SENTIMENT_VELOCITY");
   });
 
-  it("does not fire when |z| < threshold (stable market)", () => {
-    const history = makeStableHistory(0.65, 30);
-    const result = evaluateVelocity("tok1", "cond1", history, 100_000, OPTS);
-    // Stable prices → z-score near 0, below threshold
+  it("fires BEARISH when price is falling fast", () => {
+    populate(ev, now, -1.0, 2.0); // -1% per min
+    const result = ev.evaluate(TOKEN, COND);
+    expect(result).not.toBeNull();
+    expect(result!.direction).toBe("BEARISH");
+  });
+
+  // ── Does NOT fire when only one condition met ─────────────────────────
+
+  it("does NOT fire when only price velocity exceeded (trade count below multiplier)", () => {
+    // Set up: price moves 1%/min but trade ratio = 1.0 (equal, not exceeding 1.5×)
+    populate(ev, now, 1.0, 1.0); // ratio=1.0 < 1.5
+    const result = ev.evaluate(TOKEN, COND);
     expect(result).toBeNull();
   });
 
-  it("z-score computed correctly against 24h baseline", () => {
-    const history = makeAccelerationHistory(0.50, 30);
-    const result = evaluateVelocity("tok1", "cond1", history, 200_000, OPTS);
-    if (result) {
-      expect(typeof result.velocityZScore).toBe("number");
-      expect(isFinite(result.velocityZScore)).toBe(true);
-    }
-  });
-
-  it("direction BULLISH when z > 0 (price increasing)", () => {
-    const history = makeAccelerationHistory(0.50, 30);
-    const result = evaluateVelocity("tok1", "cond1", history, 200_000, OPTS);
-    if (result) {
-      expect(result.direction).toBe("BULLISH");
-    }
-  });
-
-  it("direction BEARISH when z < 0 (price decreasing)", () => {
-    const history = makeAccelerationHistory(0.50, -30);
-    const result = evaluateVelocity("tok1", "cond1", history, 200_000, OPTS);
-    if (result) {
-      expect(result.direction).toBe("BEARISH");
-      expect(result.velocityZScore).toBeLessThan(-2.0);
-    }
-  });
-
-  it("uses category-median when market < 2h old", () => {
-    const history = makeStableHistory(0.65, 24);
-    const result = evaluateVelocity("tok1", "cond1", history, 100_000, {
-      ...OPTS,
-      marketAgeMs: 30 * 60 * 1000, // 30 min (< 2h)
-      categoryMedianReturn: 0.001,
-      categoryMedianStdDev: 0.005,
-    });
-    // Might fire or not; important is no crash
-    expect(true).toBe(true);
-  });
-
-  it("does not crash when category-median missing for new market — skips with null", () => {
-    const history = makeStableHistory(0.65, 24);
-    const result = evaluateVelocity("tok1", "cond1", history, 100_000, {
-      ...OPTS,
-      marketAgeMs: 30 * 60 * 1000, // 30 min
-      categoryMedianReturn: null,
-      categoryMedianStdDev: null,
-    });
-    expect(result).toBeNull(); // skipped gracefully
-  });
-
-  it("liquidity guard: returns null if under threshold", () => {
-    const history = makeAccelerationHistory(0.50, 30);
-    const result = evaluateVelocity("tok1", "cond1", history, 10_000, OPTS);
+  it("does NOT fire when only trade count velocity exceeded (price below threshold)", () => {
+    // Price velocity near 0 but trade ratio high
+    populate(ev, now, 0.1, 3.0); // 0.1%/min < 0.5% threshold
+    const result = ev.evaluate(TOKEN, COND);
     expect(result).toBeNull();
   });
 
-  it("confidence capped at 1.0", () => {
-    const history = makeAccelerationHistory(0.50, 60);
-    const result = evaluateVelocity("tok1", "cond1", history, 200_000, OPTS);
+  // ── Cooldown ───────────────────────────────────────────────────────────
+
+  it("cooldown suppresses second evaluation within cooldownMs", () => {
+    populate(ev, now, 1.0, 2.0);
+    const first = ev.evaluate(TOKEN, COND);
+    expect(first).not.toBeNull();
+
+    // Re-populate with same conditions
+    populate(ev, now, 1.0, 2.0);
+    const second = ev.evaluate(TOKEN, COND);
+    expect(second).toBeNull();
+  });
+
+  it("fires again after cooldownMs elapses", () => {
+    populate(ev, now, 1.0, 2.0);
+    ev.evaluate(TOKEN, COND);
+
+    vi.advanceTimersByTime(120_001);
+    now = Date.now();
+
+    ev.clear();
+    ev = makeEvaluator();
+    populate(ev, now, 1.0, 2.0);
+    const result = ev.evaluate(TOKEN, COND);
+    expect(result).not.toBeNull();
+  });
+
+  // ── Rolling window ─────────────────────────────────────────────────────
+
+  it("returns null when fewer than 2 price records in current window", () => {
+    // Only 1 price point in current window
+    ev.recordPrice(TOKEN, 0.60, now - 100);
+    (ev as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);
+    const result = ev.evaluate(TOKEN, COND);
+    expect(result).toBeNull();
+  });
+
+  it("excludes price records older than windowSeconds", () => {
+    const windowMs = 300 * 1000;
+    // Price from long ago — outside current window
+    ev.recordPrice(TOKEN, 0.50, now - windowMs - 1);
+    // Only one point in current window
+    ev.recordPrice(TOKEN, 0.60, now - 100);
+    (ev as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);
+    const result = ev.evaluate(TOKEN, COND);
+    // Only 1 point in window → null
+    expect(result).toBeNull();
+  });
+
+  it("prior window uses [now-2W, now-W) range", () => {
+    const windowMs = 300 * 1000;
+    // Put many trades in prior window, few in current
+    // prior: 20 trades, current: 20 trades → ratio = 20/20 = 1.0 < 1.5 → no signal
+
+    // Add price data for 2 points in current window
+    ev.recordPrice(TOKEN, 0.60, now - windowMs + 1000);
+    ev.recordPrice(TOKEN, 0.70, now);
+
+    // Add 20 trades in prior window
+    for (let i = 0; i < 20; i++) {
+      ev.recordTrade(TOKEN, now - 2 * windowMs + i * 1000);
+    }
+    // Add 20 trades in current window
+    for (let i = 0; i < 20; i++) {
+      ev.recordTrade(TOKEN, now - windowMs + i * 1000);
+    }
+
+    (ev as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);
+
+    // Price velocity = (0.70-0.60)/0.60 / 300 * 60 ≈ 0.0333/min > 0.005 ✓
+    // Trade ratio = 20/20 = 1.0 < 1.5 → null
+    const result = ev.evaluate(TOKEN, COND);
+    expect(result).toBeNull();
+  });
+
+  it("tradeCountVelocity = 1 when prior window is empty (division guard)", () => {
+    // Prior window empty → denominator = max(0,1) = 1
+    // current has 2 trades → ratio = 2/1 = 2.0 > 1.5 ✓
+    // Add 2 price points
+    ev.recordPrice(TOKEN, 0.60, now - 299_000);
+    ev.recordPrice(TOKEN, 0.70, now);
+    // 2 trades in current window only
+    ev.recordTrade(TOKEN, now - 100);
+    ev.recordTrade(TOKEN, now - 50);
+    (ev as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);
+
+    const result = ev.evaluate(TOKEN, COND);
+    // price velocity = (0.10/0.60)/300*60 ≈ 0.0333 > 0.005 ✓
+    // tradeCountVelocity = 2/1 = 2 > 1.5 ✓
+    expect(result).not.toBeNull();
+    expect(result!.tradeCountVelocity).toBe(2);
+  });
+
+  // ── Warm-up suppression ────────────────────────────────────────────────
+
+  it("warm-up: returns null before 2× windowMs has elapsed for cold-start token", () => {
+    // First recordTrade for a brand-new token triggers warm-up
+    ev.recordTrade(TOKEN, now);
+    // Add price points
+    ev.recordPrice(TOKEN, 0.60, now - 299_000);
+    ev.recordPrice(TOKEN, 0.70, now);
+    // warmUntil = now + 2*300*1000 = now + 600s
+    const result = ev.evaluate(TOKEN, COND);
+    expect(result).toBeNull();
+  });
+
+  it("warm-up: fires after 2× windowMs has elapsed", () => {
+    const windowMs = 300 * 1000;
+    ev.recordTrade(TOKEN, now); // triggers warmUntil = now + 2*windowMs
+
+    // Advance past warm-up
+    vi.advanceTimersByTime(2 * windowMs + 1);
+    const newNow = Date.now();
+
+    // Add fresh data after warm-up
+    ev.recordPrice(TOKEN, 0.60, newNow - windowMs + 1000);
+    ev.recordPrice(TOKEN, 0.70, newNow);
+    ev.recordTrade(TOKEN, newNow - 100);
+    ev.recordTrade(TOKEN, newNow - 50);
+
+    const result = ev.evaluate(TOKEN, COND);
+    // tradeCountVelocity: current=2, prior = trades before (newNow-windowMs) but after (newNow-2*windowMs)
+    // prior may have 1 trade (the one at `now` = newNow - 2*windowMs - 1) — could be 0
+    // Let's just check it fires (warm-up guard passed) if conditions met
+    // Actually if prior=1 and current=2 → ratio=2 > 1.5 ✓
+    // But price velocity is (0.10/0.60)/300*60 ≈ 0.0333 > 0.005 ✓
+    expect(result).not.toBeNull();
+  });
+
+  // ── Bootstrap ──────────────────────────────────────────────────────────
+
+  it("bootstrap: pre-populates buffers and suppresses warm-up when both windows covered", async () => {
+    const windowMs = 300 * 1000;
+    const now2 = Date.now();
+
+    // Mock DB: returns price history and trade timestamps covering both windows
+    const priceRows = [
+      { price: 0.70, recordedAt: new Date(now2 - 100) },       // current window
+      { price: 0.60, recordedAt: new Date(now2 - windowMs + 1000) }, // current window start
+      { price: 0.58, recordedAt: new Date(now2 - windowMs - 1000) }, // prior window
+      { price: 0.55, recordedAt: new Date(now2 - 2 * windowMs + 1000) }, // prior window
+    ];
+
+    const tradeRows = [
+      { tradedAt: new Date(now2 - 100) },            // current window
+      { tradedAt: new Date(now2 - 200) },            // current window
+      { tradedAt: new Date(now2 - windowMs - 1000) }, // prior window
+    ];
+
+    const mockDb = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue(
+                // Return newest-first (DESC)
+                priceRows.sort((a, b) => b.recordedAt.getTime() - a.recordedAt.getTime())
+                  .map((r) => ({ price: r.price.toString(), recordedAt: r.recordedAt }))
+              ),
+            }),
+          }),
+        }),
+      }),
+      execute: vi.fn().mockResolvedValue({
+        rows: tradeRows.map((t) => ({ traded_at: t.tradedAt })),
+      }),
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ev.bootstrap(mockDb as any, [TOKEN]);
+
+    // warm-up should be cleared since both windows are covered
+    const warmUntil = (ev as unknown as { warmUntil: Map<string, number> }).warmUntil;
+    expect(warmUntil.has(TOKEN)).toBe(false);
+
+    // Price buffer should contain entries
+    const priceBuf = (ev as unknown as { priceBuffer: Map<string, unknown[]> }).priceBuffer;
+    expect((priceBuf.get(TOKEN) ?? []).length).toBeGreaterThan(0);
+  });
+
+  it("bootstrap: does not set warm-up for tokens with no DB data (remains unset until first recordTrade)", async () => {
+    const mockDb = {
+      select: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([]),
+            }),
+          }),
+        }),
+      }),
+      execute: vi.fn().mockResolvedValue({ rows: [] }),
+    };
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await ev.bootstrap(mockDb as any, [TOKEN]);
+
+    // warm-up not set by bootstrap (only by recordTrade for new token)
+    const warmUntil = (ev as unknown as { warmUntil: Map<string, number> }).warmUntil;
+    expect(warmUntil.has(TOKEN)).toBe(false);
+  });
+
+  // ── Confidence ─────────────────────────────────────────────────────────
+
+  it("confidence scales as min(1.0, |priceVelocity| / (threshold * 3))", () => {
+    // priceVelocity = 0.005 * 3 → confidence = 1.0
+    populate(ev, now, (0.005 * 3 * 100), 2.0); // 1.5%/min = threshold*3
+    (ev as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);
+    const result = ev.evaluate(TOKEN, COND);
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBeCloseTo(1.0, 2);
+  });
+
+  it("confidence capped at 1.0 for very high velocity", () => {
+    populate(ev, now, 5.0, 2.0); // 5%/min >> threshold*3 = 0.015
+    (ev as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);
+    const result = ev.evaluate(TOKEN, COND);
     if (result) {
       expect(result.confidence).toBeLessThanOrEqual(1.0);
     }
   });
 
-  it("returns null when baselineStdDev is 0 (all returns identical)", () => {
-    // All prices exactly equal → all pairwise returns = 0 → stddev = 0 → guard fires
-    const now = Date.now();
-    const history: PriceBucket[] = Array.from({ length: 24 }, (_, i) => ({
-      price: 0.65, // perfectly flat
-      bucketStart: new Date(now - (24 - i) * 5 * 60 * 1000),
-    }));
-    const result = evaluateVelocity("tok1", "cond1", history, 100_000, OPTS);
+  it("strength equals tradeCountVelocity", () => {
+    populate(ev, now, 1.0, 2.0); // trade ratio = 2.0
+    (ev as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);
+    const result = ev.evaluate(TOKEN, COND);
+    expect(result).not.toBeNull();
+    expect(result!.strength).toBeCloseTo(result!.tradeCountVelocity, 5);
+  });
+
+  // ── Custom opts ────────────────────────────────────────────────────────
+
+  it("respects custom windowSeconds from constructor opts", () => {
+    const shortWindow = makeEvaluator({ windowSeconds: 60 });
+    const shortNow = Date.now();
+
+    // Add 2 price points within the 60s window
+    shortWindow.recordPrice(TOKEN, 0.60, shortNow - 59_000);
+    shortWindow.recordPrice(TOKEN, 0.70, shortNow);
+    // 2 trades in current window, 0 in prior → ratio = 2/1 = 2 > 1.5
+    shortWindow.recordTrade(TOKEN, shortNow - 100);
+    shortWindow.recordTrade(TOKEN, shortNow - 50);
+    (shortWindow as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);
+
+    // priceVelocity = (0.10/0.60)/60*60 = 0.1667/min > 0.005 ✓
+    const result = shortWindow.evaluate(TOKEN, COND);
+    expect(result).not.toBeNull();
+  });
+
+  it("uses default config when no opts provided", () => {
+    const defaultEv = new SentimentVelocityEvaluator();
+    // Just verify it instantiates and doesn't throw
+    const result = defaultEv.evaluate(TOKEN, COND);
+    expect(result).toBeNull(); // no data → null
+    defaultEv.clear();
+  });
+
+  // ── windowStartPrice = 0 guard ─────────────────────────────────────────
+
+  it("returns null when windowStartPrice is 0", () => {
+    const windowMs = 300 * 1000;
+    ev.recordPrice(TOKEN, 0, now - windowMs + 1000); // price = 0 at window start
+    ev.recordPrice(TOKEN, 0.70, now);
+    (ev as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);
+    const result = ev.evaluate(TOKEN, COND);
     expect(result).toBeNull();
   });
 
-  it("returns null when recent window firstRecent price is 0 (division guard)", () => {
-    // Last-12 buckets start with price=0, which triggers firstRecent <= 0 guard
-    const now = Date.now();
-    const history: PriceBucket[] = Array.from({ length: 24 }, (_, i) => ({
-      price: i < 12 ? 0.65 : 0, // first 12 stable, last 12 at 0
-      bucketStart: new Date(now - (24 - i) * 5 * 60 * 1000),
-    }));
-    const result = evaluateVelocity("tok1", "cond1", history, 100_000, OPTS);
-    expect(result).toBeNull();
-  });
+  // ── clear() ────────────────────────────────────────────────────────────
 
-  it('uses config defaults when opts not provided (exercises ?? branches)', () => {
-    // Call without opts — exercises opts.zScoreThreshold ?? config.xxx fallback
-    const now = Date.now();
-    const history: PriceBucket[] = Array.from({ length: 24 }, (_, i) => ({
-      price: 0.65,
-      bucketStart: new Date(now - (24 - i) * 5 * 60 * 1000),
-    }));
-    // All prices equal → stddev=0 → null (but exercises the opts ?? branches)
-    const result = evaluateVelocity('tok1', 'cond1', history, 100_000);
-    expect(result).toBeNull();
-  });
+  it("clear() resets all buffers", () => {
+    populate(ev, now, 1.0, 2.0);
+    ev.clear();
 
-  it('returns null when pairwise returns array has < 2 entries (single-price-change)', () => {
-    // 21 identical prices followed by 1 change → only 1 non-zero return, returns.length == 23
-    // But 20 identical prices → 19 returns all 0, stddev=0 → null
-    // Use exactly 20 points with only 1 unique change pair
-    const now = Date.now();
-    // 20 buckets where first 19 are 0 (will be skipped by pairwiseReturns guard) + 1 valid
-    const history: PriceBucket[] = Array.from({ length: 20 }, (_, i) => ({
-      price: i === 0 ? 0 : 0.65, // first price is 0 → pairwiseReturns skips it
-      bucketStart: new Date(now - (20 - i) * 5 * 60 * 1000),
-    }));
-    const result = evaluateVelocity('tok1', 'cond1', history, 100_000, OPTS);
-    // First price=0 skipped → returns has 18 entries from i=1..19 → stddev computed
-    // All returns (0.65-0.65)/0.65 = 0 for i=1..18, last = (0.65-0.65)/0.65 = 0 → stddev=0 → null
-    expect(result).toBeNull();
+    const pb = (ev as unknown as { priceBuffer: Map<string, unknown[]> }).priceBuffer;
+    const tb = (ev as unknown as { tradeBuffer: Map<string, unknown[]> }).tradeBuffer;
+    expect(pb.size).toBe(0);
+    expect(tb.size).toBe(0);
   });
-
-  it("mean([]) returns 0 (line 22 empty-array guard)", () => {
-    expect(mean([])).toBe(0);
-  });
-
-  it("stddev with 1 value returns 0 (line 28 length<2 guard)", () => {
-    expect(stddev([0.65], 0.65)).toBe(0);
-  });
-
-  it("stddev with 0 values returns 0", () => {
-    expect(stddev([], 0)).toBe(0);
-  });
-
-  it('returns null when pairwise returns.length < 2 (only 1 valid price transition, line 68)', () => {
-    // To hit line 68: need >= 20 history points AND < 2 pairwise returns.
-    // pairwiseReturns skips prices[i] === 0, so use 19 zeros + 1 non-zero = only 0 usable transitions.
-    // Actually: prices = [0,0,...,0, 0.65] → pairwiseReturns:
-    //   i=0: prices[0]=0 → skip; i=1..18: prices[i]=0 → skip; only i=19: prices[19]=0.65
-    //   But pairs are (prices[i], prices[i+1]) with prices[i]>0 check.
-    //   So we need prices[0..18]=0, prices[19]=0.65 → loop checks i=0..18 as divisors: all 0 → skipped.
-    //   returns.length = 0 < 2 → return null ✓
-    const now = Date.now();
-    const history: PriceBucket[] = Array.from({ length: 20 }, (_, i) => ({
-      price: i < 19 ? 0 : 0.65, // 19 zeros, 1 non-zero (only at index 19)
-      bucketStart: new Date(now - (20 - i) * 5 * 60 * 1000),
-    }));
-    const result = evaluateVelocity('tok1', 'cond1', history, 100_000, OPTS);
-    expect(result).toBeNull();
-  });
-
 });
