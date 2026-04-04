@@ -156,3 +156,41 @@ describe("GET /api/signals", () => {
     expect(res.status).toBe(200);
   });
 });
+
+// Additional test added post-round-3:
+// Verify parameter placeholder numbering when both types AND tokenId are provided
+// params = [hours=$1, minConf=$2, types[]=$3, tokenId=$4]
+// A regression here would silently mix up filter values.
+
+describe("GET /api/signals — combined types + tokenId filter", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("passes types as $3 and tokenId as $4 when both filters active", async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    const req = makeRequest({ types: "WHALE_TRADE", tokenId: "token_abc" });
+    await GET(req);
+
+    const callParams = mockQuery.mock.calls[0][1] as unknown[];
+    // $1 = hours, $2 = minConf, $3 = types array, $4 = tokenId
+    expect(callParams).toHaveLength(4);
+    expect(callParams[0]).toBe(24);                        // hours default
+    expect(callParams[1]).toBe(0);                         // minConf default
+    expect(callParams[2]).toEqual(["WHALE_TRADE"]);        // types array
+    expect(callParams[3]).toBe("token_abc");               // tokenId
+  });
+
+  it("passes only tokenId as $3 when no types filter active", async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    const req = makeRequest({ tokenId: "token_xyz" });
+    await GET(req);
+
+    const callParams = mockQuery.mock.calls[0][1] as unknown[];
+    // $1 = hours, $2 = minConf, $3 = tokenId (no types pushed)
+    expect(callParams).toHaveLength(3);
+    expect(callParams[2]).toBe("token_xyz");
+  });
+});

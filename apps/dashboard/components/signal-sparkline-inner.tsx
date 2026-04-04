@@ -27,12 +27,14 @@ interface Props {
 }
 
 export default function SignalSparklineInner({ data }: Props) {
-  // Pivot: [{ hour, WHALE_TRADE: n, ORDER_BOOK_IMBALANCE: n, ... }]
+  // Pivot buckets into per-hour rows: { hour: "HH:MM", WHALE_TRADE: n, ... }
+  // Use an empty object (no placeholder) to avoid the `hour` key collision
+  // when spreading counts into the final row.
   const pivotMap = new Map<string, Record<string, number>>();
   for (const bucket of data) {
     const key = bucket.hour;
     if (!pivotMap.has(key)) {
-      pivotMap.set(key, { hour: 0 }); // placeholder
+      pivotMap.set(key, {});
     }
     const row = pivotMap.get(key)!;
     row[bucket.type] = (row[bucket.type] ?? 0) + bucket.count;
@@ -45,7 +47,9 @@ export default function SignalSparklineInner({ data }: Props) {
         hour: "2-digit",
         minute: "2-digit",
       });
-      return { hour: label, ...counts };
+      // hour: label must come AFTER ...counts so it is not overwritten
+      // by a stray `hour` key inside the counts object.
+      return { ...counts, hour: label };
     });
 
   // Collect all types present in data
