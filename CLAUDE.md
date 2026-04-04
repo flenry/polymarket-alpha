@@ -15,6 +15,7 @@ Real-time Polymarket data pipeline. Ingests trade events and order book data, pe
 **Phase 5 is complete and fully tested.** 480 tests passing.
 **Phase 6 (Dashboard) is complete and fully tested.** 480 pipeline tests + 108 dashboard tests = 588 total. Branch: `feat/dashboard`.
 **E2E tests added.** 49 Playwright E2E tests covering all 5 pages. Branch: `feat/dashboard-e2e`.
+**Seed script added.** `pnpm seed` backfills the DB with real Polymarket data. 541 pipeline+seeder tests passing. Branch: `cr/20260404-seed-backfill`.
 
 ---
 
@@ -44,6 +45,7 @@ polymarket-alpha/
 │   ├── db/                # schema.ts, client.ts, partition-manager.ts, queries/
 │   ├── neg-risk/          # Phase 4: GroupResolver, ArbDetector, NegRiskEngine
 │   ├── analytics/         # Phase 5: leaderboard.ts, signal-dashboard.ts, heat-map.ts
+│   ├── seeder/            # Seed script: seed-backfill.ts + seed-utils.ts (pnpm seed)
 │   ├── validation/        # Zod schemas for external API responses
 │   ├── config.ts          # Env-var config with Zod validation
 │   ├── logger.ts          # Pino logger
@@ -235,7 +237,11 @@ pnpm db:migrate                   # applies 0000 + 0002 via drizzle-kit
 # If drizzle-kit can't apply partition DDL cleanly, run directly:
 pnpm db:migrate:partitions        # psql $DATABASE_URL -f drizzle/0002_partition_trades.sql
 
-# 5. Start pipeline
+# 5. Backfill DB with real Polymarket data (optional, do once)
+pnpm seed
+# SEED_TRADE_LIMIT=10000 and SEED_HOURS=24 are the defaults (configurable in .env)
+
+# 6. Start pipeline
 pnpm start
 
 # Analytics CLIs
