@@ -8,3 +8,6 @@ analytics-results/*.json
 apps/dashboard/.next/
 apps/dashboard/next-env.d.ts
 apps/dashboard/tsconfig.tsbuildinfo
+apps/dashboard/.env.local
+apps/dashboard/test-results/
+.pi/

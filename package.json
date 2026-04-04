@@ -23,7 +23,8 @@
     "heatmap": "tsc && node dist/analytics/heat-map.js",
     "dashboard:dev": "pnpm --filter dashboard dev",
     "dashboard:build": "pnpm --filter dashboard build",
-    "dashboard:test:e2e": "pnpm --filter dashboard test:e2e"
+    "dashboard:test:e2e": "pnpm --filter dashboard test:e2e",
+    "serve-dashboard": "npx tsx src/scripts/serve-dashboard.ts"
   },
   "dependencies": {
     "drizzle-orm": "^0.40.0",
