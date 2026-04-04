@@ -118,6 +118,17 @@ describe("GET /api/wallets", () => {
     expect(res.body).toEqual({ wallets: [] });
   });
 
+  it("silently defaults non-numeric limit to 50 (no 400)", async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    const req = makeRequest({ limit: "abc" });
+    await getWallets(req);
+
+    // parseInt('abc') = NaN, NaN || 50 = 50
+    const callParams = mockQuery.mock.calls[0][1] as unknown[];
+    expect(callParams[2]).toBe(50);
+  });
+
   it("clamps limit to max 200", async () => {
     mockQuery.mockResolvedValueOnce({ rows: [] });
 

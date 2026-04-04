@@ -82,6 +82,16 @@ describe("GET /api/signals", () => {
     expect(res.status).toBe(200);
   });
 
+  it("treats non-numeric minConfidence as 0 (no 400 — silent clamp)", async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    const req = makeRequest({ minConfidence: "abc" });
+    await GET(req);
+
+    const callParams = mockQuery.mock.calls[0][1] as unknown[];
+    expect(callParams[1]).toBe(0); // NaN → 0
+  });
+
   it("clamps minConfidence to 0 if negative", async () => {
     mockQuery.mockResolvedValueOnce({ rows: [] });
 
