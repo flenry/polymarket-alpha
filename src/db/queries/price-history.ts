@@ -1,4 +1,4 @@
-import { desc, eq, gte, and, lt, sql } from "drizzle-orm";
+import { desc, eq, gte, and, lt, asc, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as schema from "../schema.js";
 import { priceHistory, trades } from "../schema.js";
@@ -30,6 +30,34 @@ export async function getRecentPriceHistory(
     .where(eq(priceHistory.tokenId, tokenId))
     .orderBy(desc(priceHistory.recordedAt))
     .limit(limit);
+
+  return rows.map((r) => ({
+    price: Number(r.price),
+    recordedAt: r.recordedAt,
+  }));
+}
+
+/**
+ * Fetch last-trade price history for a token over the last 24 hours, ordered ASC.
+ * Only includes `event_type = 'last_trade'` records (not best_bid_ask — too noisy).
+ * Used by ArbDetector.evaluate() to compute mean/stddev for outlier detection.
+ */
+export async function getTokenPriceHistory24h(
+  db: Db,
+  tokenId: TokenId
+): Promise<PriceRecord[]> {
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const rows = await db
+    .select({ price: priceHistory.price, recordedAt: priceHistory.recordedAt })
+    .from(priceHistory)
+    .where(
+      and(
+        eq(priceHistory.tokenId, tokenId),
+        eq(priceHistory.eventType, "last_trade"),
+        gte(priceHistory.recordedAt, cutoff)
+      )
+    )
+    .orderBy(asc(priceHistory.recordedAt));
 
   return rows.map((r) => ({
     price: Number(r.price),

@@ -97,13 +97,17 @@ export type SignalType =
   | "WHALE_TRADE"
   | "ORDER_BOOK_IMBALANCE"
   | "PRICE_IMPACT_ANOMALY"
-  | "SENTIMENT_VELOCITY";
+  | "SENTIMENT_VELOCITY"
+  | "NEG_RISK_ARB"
+  | "NEG_RISK_OUTLIER";
 
 export const SIGNAL_TYPES: readonly SignalType[] = [
   "WHALE_TRADE",
   "ORDER_BOOK_IMBALANCE",
   "PRICE_IMPACT_ANOMALY",
   "SENTIMENT_VELOCITY",
+  "NEG_RISK_ARB",
+  "NEG_RISK_OUTLIER",
 ] as const;
 
 export type SignalDirection = "BULLISH" | "BEARISH" | "NEUTRAL";
@@ -153,7 +157,20 @@ export interface VelocitySignal extends BaseSignal {
   tradeCountVelocity: number;
 }
 
-export type Signal = WhaleSignal | ImbalanceSignal | PriceImpactSignal | VelocitySignal;
+export interface NegRiskSignal extends BaseSignal {
+  signalType: "NEG_RISK_ARB" | "NEG_RISK_OUTLIER";
+  /** Present for ARB signals — how much below 1.0 the sum of asks is */
+  arbSpread?: number;
+  /** Present for OUTLIER signals — sigma deviation from 24h mean */
+  priceDeviation?: number;
+  negRiskGroupSize: number;
+  negRiskSumBid: number;
+  negRiskSumAsk: number;
+  /** The conditionId of the neg-risk group */
+  conditionIdGroup: string;
+}
+
+export type Signal = WhaleSignal | ImbalanceSignal | PriceImpactSignal | VelocitySignal | NegRiskSignal;
 
 // ─── Whale alert ──────────────────────────────────────────────────────────────
 export interface WhaleAlert {
@@ -203,6 +220,14 @@ export interface PipelineConfig {
   velocityTradeCountMultiplier: number;
   velocityCooldownMs: number;
   compositeWindowMs: number;
+  // Phase 4
+  negRiskRefreshIntervalMs: number;
+  negRiskArbThreshold: number;
+  negRiskCooldownMs: number;
+  // Phase 5
+  dashboardRefreshMs: number;
+  leaderboardMinTrades: number;
+  leaderboardTopN: number;
   logLevel: string;
   databaseUrl: string;
 }

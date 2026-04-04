@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { WebhookEmitter } from "./webhook-emitter.js";
-import type { WhaleAlert, TradeEvent, WhaleSignal, ImbalanceSignal, VelocitySignal, Signal } from "../events/types.js";
+import type { WhaleAlert, TradeEvent, WhaleSignal, ImbalanceSignal, VelocitySignal, Signal, NegRiskSignal } from "../events/types.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -486,5 +486,77 @@ describe("WebhookEmitter", () => {
     const walletField = body.embeds[0].fields.find((f) => f.name === "Wallet");
     expect(walletField?.value).toContain("…");
     expect(walletField?.value.length).toBeLessThanOrEqual(13); // 12 chars + ellipsis
+  });
+
+  // ── Neg-Risk signal tests ──────────────────────────────────────
+
+  function makeNegRiskSignal(overrides: Partial<NegRiskSignal> = {}): NegRiskSignal {
+    return {
+      signalType: "NEG_RISK_ARB",
+      tokenId: "tok1",
+      conditionId: "cond1",
+      conditionIdGroup: "cond1",
+      direction: "BULLISH",
+      confidence: 0.80,
+      strength: 0.10,
+      priceAtSignal: 0.33,
+      createdAt: new Date(),
+      payload: {},
+      negRiskGroupSize: 3,
+      negRiskSumBid: 0.90,
+      negRiskSumAsk: 0.96,
+      arbSpread: -0.04,
+      ...overrides,
+    };
+  }
+
+  it("Discord embed for NEG_RISK_ARB uses purple color 0x9B59B6", async () => {
+    const mockFetch = makeMockFetch([{ status: 200 }]);
+    vi.stubGlobal("fetch", mockFetch);
+    const emitter = new WebhookEmitter({ discordUrl: "https://discord.com/test", slackUrl: "" });
+    await emitter.send(makeNegRiskSignal());
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body) as {
+      embeds: Array<{ color: number; title: string; fields: Array<{ name: string }> }>;
+    };
+    expect(body.embeds[0].color).toBe(0x9B59B6);
+    expect(body.embeds[0].title).toContain("Arb");
+    expect(body.embeds[0].fields.some((f) => f.name === "Arb Spread")).toBe(true);
+  });
+
+  it("Discord embed for NEG_RISK_OUTLIER shows Price Deviation field and purple color", async () => {
+    const mockFetch = makeMockFetch([{ status: 200 }]);
+    vi.stubGlobal("fetch", mockFetch);
+    const emitter = new WebhookEmitter({ discordUrl: "https://discord.com/test", slackUrl: "" });
+    await emitter.send(makeNegRiskSignal({ signalType: "NEG_RISK_OUTLIER", arbSpread: undefined, priceDeviation: 4.2 }));
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body) as {
+      embeds: Array<{ color: number; title: string; fields: Array<{ name: string }> }>;
+    };
+    expect(body.embeds[0].color).toBe(0x9B59B6);
+    expect(body.embeds[0].title).toContain("Outlier");
+    expect(body.embeds[0].fields.some((f) => f.name === "Price Deviation")).toBe(true);
+  });
+
+  it("Slack payload for NEG_RISK_ARB contains 'Neg-Risk Arb' and Arb Spread", async () => {
+    const mockFetch = makeMockFetch([{ status: 200 }]);
+    vi.stubGlobal("fetch", mockFetch);
+    const emitter = new WebhookEmitter({ discordUrl: "", slackUrl: "https://hooks.slack.com/test" });
+    await emitter.send(makeNegRiskSignal());
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body) as {
+      blocks: Array<{ text: { text: string } }>;
+    };
+    expect(body.blocks[0].text.text).toContain("Neg-Risk Arb");
+    expect(body.blocks[0].text.text).toContain("Arb Spread");
+  });
+
+  it("fallback NOT hit for NEG_RISK_ARB — explicit purple builder used", async () => {
+    const mockFetch = makeMockFetch([{ status: 200 }]);
+    vi.stubGlobal("fetch", mockFetch);
+    const emitter = new WebhookEmitter({ discordUrl: "https://discord.com/test", slackUrl: "" });
+    await emitter.send(makeNegRiskSignal());
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body) as {
+      embeds: Array<{ title: string }>;
+    };
+    // Fallback gives title="Signal"; explicit builder must be used instead
+    expect(body.embeds[0].title).not.toBe("Signal");
   });
 });

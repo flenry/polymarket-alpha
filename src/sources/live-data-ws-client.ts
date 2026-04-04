@@ -116,10 +116,8 @@ export class LiveDataWsClient extends EventEmitter {
       const d = parsed.data;
       const tokenId = d.asset;
 
-      // Filter neg_risk tokens at ingestion boundary
-      if (this.options.negRiskSet.has(tokenId)) {
-        continue;
-      }
+      // Phase 4: neg-risk filter removed — trades flow through for persistence
+      // Signal evaluation for neg-risk is handled by NegRiskEngine
 
       const valueUsdc = d.size * d.price;
       const trade: TradeEvent = {

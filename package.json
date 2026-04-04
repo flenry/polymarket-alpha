@@ -16,7 +16,10 @@
     "db:migrate:partitions": "psql $DATABASE_URL -f drizzle/0002_partition_trades.sql",
     "typecheck": "tsc --noEmit",
     "typecheck:all": "tsc -p tsconfig.test.json",
-    "backtest": "tsc && node dist/backtest/runner.js"
+    "backtest": "tsc && node dist/backtest/runner.js",
+    "leaderboard": "tsc && node dist/analytics/leaderboard.js",
+    "dashboard": "tsc && node dist/analytics/signal-dashboard.js",
+    "heatmap": "tsc && node dist/analytics/heat-map.js"
   },
   "dependencies": {
     "drizzle-orm": "^0.40.0",

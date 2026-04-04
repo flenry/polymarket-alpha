@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { upsertMarket, upsertMarketStats, getWatchlistedTokenIds, getNegRiskTokenIds, getMarketStats, markMarketClosed } from "./markets.js";
+import { upsertMarket, upsertMarketStats, getWatchlistedTokenIds, getNegRiskTokenIds, getMarketStats, markMarketClosed, getNegRiskMarketsByCondition, getAllWatchlistedTokenIds } from "./markets.js";
 
 function makeInsertDb() {
   const onConflictDoUpdate = vi.fn().mockResolvedValue(undefined);
@@ -224,5 +224,62 @@ describe("markMarketClosed", () => {
     expect(setArg.closed).toBe(true);
     expect(setArg.updatedAt).toBeInstanceOf(Date);
     expect(where).toHaveBeenCalledOnce();
+  });
+});
+
+describe("getNegRiskMarketsByCondition", () => {
+  function makeNegRiskSelectDb(rows: object[]) {
+    const where = vi.fn().mockResolvedValue(rows);
+    const from = vi.fn().mockReturnValue({ where });
+    const select = vi.fn().mockReturnValue({ from });
+    return { select } as unknown as Parameters<typeof getNegRiskMarketsByCondition>[0];
+  }
+
+  it("returns mapped rows for neg-risk markets", async () => {
+    const rows = [
+      { tokenId: "tok1", conditionId: "cond1", question: "Will X?", slug: "will-x" },
+      { tokenId: "tok2", conditionId: "cond1", question: "Will X?", slug: null },
+    ];
+    const db = makeNegRiskSelectDb(rows);
+    const result = await getNegRiskMarketsByCondition(db);
+    expect(result).toHaveLength(2);
+    expect(result[0].tokenId).toBe("tok1");
+    expect(result[0].conditionId).toBe("cond1");
+    expect(result[1].slug).toBeNull();
+  });
+
+  it("returns empty array when no neg-risk markets", async () => {
+    const db = makeNegRiskSelectDb([]);
+    const result = await getNegRiskMarketsByCondition(db);
+    expect(result).toHaveLength(0);
+  });
+
+  it("maps slug=undefined to null", async () => {
+    const rows = [{ tokenId: "tok1", conditionId: "cond1", question: "Q", slug: undefined }];
+    const db = makeNegRiskSelectDb(rows);
+    const result = await getNegRiskMarketsByCondition(db);
+    expect(result[0].slug).toBeNull();
+  });
+});
+
+describe("getAllWatchlistedTokenIds", () => {
+  function makeAllWatchlistDb(rows: object[]) {
+    const where = vi.fn().mockResolvedValue(rows);
+    const from = vi.fn().mockReturnValue({ where });
+    const select = vi.fn().mockReturnValue({ from });
+    return { select } as unknown as Parameters<typeof getAllWatchlistedTokenIds>[0];
+  }
+
+  it("returns all watchlisted tokenIds including neg-risk", async () => {
+    const rows = [{ tokenId: "tok1" }, { tokenId: "tok2" }, { tokenId: "neg-risk-tok" }];
+    const db = makeAllWatchlistDb(rows);
+    const result = await getAllWatchlistedTokenIds(db);
+    expect(result).toEqual(["tok1", "tok2", "neg-risk-tok"]);
+  });
+
+  it("returns empty array when nothing watchlisted", async () => {
+    const db = makeAllWatchlistDb([]);
+    const result = await getAllWatchlistedTokenIds(db);
+    expect(result).toHaveLength(0);
   });
 });

@@ -1,755 +1,990 @@
-# Plan: Phase 3 — Signal Intelligence & Backtesting
+# Plan: Phase 4 + Phase 5 — Neg-Risk Cross-Book Pricing + Analytics & Observability
 
-> **Board-reviewed & Law-approved** — synthesised from Robin's research brief, Vegapunk's architecture
-> review, and Law's critique. All MAJOR and MINOR findings addressed inline.
-> Zoro implements. Usopp tests. Law approves architecture decisions.
+> **Board-reviewed & Law-approved** — synthesised from Robin's research brief, Vegapunk's
+> architecture review, and Law's strategic critique. All MAJOR and MINOR findings from the
+> Law review are addressed inline. Zoro implements. Usopp tests. Law approves decisions.
 
 ## Goal
-Deliver two new signal evaluators (`PriceImpactSignalEvaluator` v2, `SentimentVelocityEvaluator` v2 —
-fully replacing the Phase 1 stubs), composite confidence scoring in `SignalAggregator`, a four-file
-backtesting module (`src/backtest/`), pipeline wiring for all new components, and ≥ 95% test coverage
-across all new code, with all existing 357 tests continuing to pass.
+Ship a fully tested, type-clean implementation of Phase 4 (neg-risk cross-book arb/outlier signal
+engine) and Phase 5 (wallet leaderboard, signal dashboard, market heat-map CLIs) on branch
+`feat/phase-4-5`, with a PR to `main`. All 414 existing tests must continue to pass. Target
+≥ 470 tests total (+56). Zero TypeScript errors.
 
 ## Branch
-`feat/phase-3` (created from `main` at 58ed40d)
+`feat/phase-4-5` (created from `main` at Phase 3 merge)
 
 ---
 
 ## Project Status
-**EXISTING project — Phase 1 + Phase 2 complete.** 357 tests, 97.33% stmt / 95.91% branch.
-
----
-
-## Codebase State (as of Phase 2)
-
-### What is LOCKED — must not change
-- `src/db/schema.ts` — complete, frozen
-- `drizzle/` — migration files and journal, frozen
-- All Phase 1 and Phase 2 source files **not listed** in the allowed edit surface below
-
-### Allowed edit surface (Phase 3 may touch these files)
-
-| File | Permitted change |
-|---|---|
-| `src/signals/price-impact-signal.ts` | Full rewrite — replace Phase 1 stub with Phase 3 algorithm |
-| `src/signals/velocity-signal.ts` | Full rewrite — replace Phase 1 stub with Phase 3 algorithm |
-| `src/processors/signal-aggregator.ts` | Add composite confidence scoring (in-memory map + enriched payload) |
-| `src/pipeline.ts` | Wire PriceImpactSignalEvaluator v2 + SentimentVelocityEvaluator v2 |
-| `src/config.ts` | Add 7 Phase 3 env vars; remove legacy Phase 1 vars superseded by Phase 3 |
-| `.env.example` | Add Phase 3 env vars |
-| `package.json` | Add `backtest` script |
-| `src/events/types.ts` | Update `VelocitySignal` type (rename `velocityZScore` → `tradeCountVelocity`, remove Phase 1 fields) |
-
-### What is NEW (create from scratch)
-- `src/db/queries/price-history.ts`
-- `src/backtest/types.ts`
-- `src/backtest/runner.ts`
-- `src/backtest/evaluator.ts`
-- `src/backtest/report.ts`
-- `backtest-results/.gitkeep`
-- `src/db/queries/price-history.test.ts`
-- `src/signals/price-impact-signal.test.ts` — **replace** Phase 1 stub tests
-- `src/signals/velocity-signal.test.ts` — **replace** Phase 1 stub tests
-- `src/processors/signal-aggregator.test.ts` — extend (composite scoring additions only)
-- `src/backtest/evaluator.test.ts`
-- `src/backtest/report.test.ts`
-- `src/backtest/runner.test.ts`
+**EXISTING project — Phase 1 + Phase 2 + Phase 3 complete.** 414 tests, 95.88% stmt / 94.64% branch.
 
 ---
 
 ## Board Findings Resolved
 
-### [LAW-MAJOR-1] Composite scoring — insert-then-update design selected
+### [LAW-MAJOR-1] Neg-risk trade routing — early-return must NOT skip persistence
 
-**Finding:** `SignalAggregator.handleSignal()` sees one signal at a time; prior signals are
-already committed to the DB when a corroborating signal arrives. The original plan required
-enriching "each participating signal" — which is impossible with an insert-only path.
+**Finding:** The original plan's `tradeHandler1` would have added an early-return for neg-risk
+tokens at the top, which would accidentally drop neg-risk trades before they are persisted to
+the `trades` table.
 
-**Resolution — Insert-then-update design:**
+**Resolution — split persistence from signal evaluation:**
 
-1. `SignalAggregator` maintains `private compositeMap: Map<tokenId, CompositeWindow>` where
-   `CompositeWindow = { signals: Array<{id: bigint, type: SignalType, confidence: number, createdAt: number}>, windowStart: number }`.
-2. **On each `handleSignal()` call:**
-   a. Insert the signal into DB via `insertSignal()` → obtain `insertedId: bigint`.
-   b. Register the new signal in `compositeMap[tokenId]` with its `id` and metadata.
-   c. Purge entries older than `COMPOSITE_WINDOW_MS` from the window.
-   d. If the window now has ≥ 2 signals: compute `compositeConfidence` and PATCH the `payload`
-      jsonb column of **all signals in the window** (including the one just inserted and all prior
-      ones) via a single SQL `UPDATE signals SET payload = payload || $patch WHERE id = ANY($ids)`.
-   e. Log: `[COMPOSITE] tokenId: <score>, signals: [<types>]`.
-3. A new query helper `updateSignalPayloads(db, ids, patch)` is added to `src/db/queries/signals.ts`.
-4. The `compositeScore` field is merged into the `payload` jsonb of each participating signal row.
-
-This means: the first signal in a window receives `compositeScore` retroactively when the second
-signal arrives; the second and subsequent signals receive it immediately. This fully satisfies the
-spec requirement that every participating signal carries the composite score.
-
-### [LAW-MAJOR-2] Backtest runner — `createDb()` does not exist
-
-**Finding:** `src/db/client.ts` exports `getDb()`, `db`, and `closeDb()` only. No `createDb()`.
-
-**Resolution:** `runner.ts` uses `getDb()` (for the DB instance) and `closeDb()` (for teardown).
-No new exports are added to `src/db/client.ts`. The plan reference to `createDb()` is removed
-everywhere.
-
-### [LAW-MAJOR-3] Backtest runner — `tsx` not in devDependencies, no new packages allowed
-
-**Finding:** `node --import tsx/esm src/backtest/runner.ts` requires `tsx`, which is absent
-from `package.json`. No new packages are permitted.
-
-**Resolution:** The `backtest` script compiles first then runs compiled JS:
-```json
-"backtest": "tsc && node dist/backtest/runner.js"
-```
-`runner.ts` is a standard TypeScript file under `src/`, compiled by the existing `tsc` config.
-CLI arg parsing uses `process.argv` with `process.env` variables as the stable interface — no
-third-party arg parsers.
-
-### [LAW-MAJOR-4] PriceImpactSignalEvaluator — async DB reads on the trade hot path cause timing races
-
-**Finding:** `price_history` is written asynchronously by `PriceHistoryWriter`. At the moment
-a `TradeEvent` arrives, the triggering price move may not yet be committed to `price_history`.
-
-**Resolution — In-memory price state, no hot-path DB reads:**
-
-`PriceImpactSignalEvaluator` does **not** read `price_history` from DB on the hot path. Instead:
-
-- It is injected with **two price values directly at call time**:
-  `evaluate(trade, priceBeforeTrade, priceNow, snapshot)`.
-- `priceBeforeTrade` = the last price recorded *before* the current trade (maintained in-memory by
-  pipeline in `recentPrices` map).
-- `priceNow` = the current trade's `priceUsdc`.
-- `snapshot` = a `SnapshotRecord | null` passed in from `snapshotWriter.getLatestBook()` (already
-  in-memory in the pipeline).
-- DB reads (snapshot and price history) are **not** performed inside `evaluate()`.
-- The evaluator remains a **pure class with no DB dependency**; it receives all data as parameters.
-
-This eliminates the race entirely. `priceBeforeTrade` is captured inside `tradeHandler1` from
-`recentPrices.get(tokenId)` (last entry) **before** recording the new price; `priceNow` is
-`trade.priceUsdc`. The snapshot is obtained from `snapshotWriter.getLatestBook(tokenId)`.
-
-The DB query file `src/db/queries/price-history.ts` is **still created** (for the bootstrap path
-in `SentimentVelocityEvaluator` and for backtest) but is **not called** on the hot path by
-`PriceImpactSignalEvaluator`.
-
-**Pipeline sequencing contract (explicit, addresses LAW-MINOR-2):**
-
+In `tradeHandler1`, do NOT early-return for neg-risk tokens before the trade batch push.
+Instead:
 ```
 tradeHandler1(trade):
-  1. priceBeforeTrade = recentPrices.get(trade.tokenId)?.at(-1)?.price ?? null
-  2. snapshot = snapshotWriter.getLatestBook(trade.tokenId)
-  3. recordPrice(trade.tokenId, trade.priceUsdc)          ← updates recentPrices
-  4. recordBucketPrice(trade.tokenId, trade.priceUsdc)
-  5. tradeBatch.push(trade)  + flush if full
-  6. velocityEvaluator.recordTrade(trade.tokenId, Date.now())
-  7. (fire-and-forget) priceImpactEvaluator.evaluate(trade, priceBeforeTrade, priceNow, snapshot)
-       .then(sig => { if (sig) bus.emit("signal", sig) })
-       .catch(err => logger.error(err))
-  8. velocityEvaluator.evaluate(trade.tokenId) → if signal, bus.emit("signal", signal)
+  1. tradeBatch.push(trade)   ← always, including neg-risk
+  2. (flush if batch full)    ← always
+  3. if (negRiskSet.has(trade.tokenId)) return  ← return HERE (after persist path)
+  4. ... velocity / price-impact evaluation for non-neg-risk only ...
 ```
 
-Step 1 captures the price **before** step 3 updates it. "Evaluate" at step 7 uses `priceBeforeTrade`
-and `trade.priceUsdc` — both available synchronously. No DB read is needed or performed.
-
-### [LAW-MAJOR-5] SentimentVelocityEvaluator — cold restart distorts `tradeCountVelocity`
-
-**Finding:** After restart, `tradeBuffer` starts empty. The prior-window trade count will be 0,
-causing `tradeCountVelocity = currentCount / max(0,1) = currentCount` which is always ≥ 1.5× and
-would produce false positives on startup.
-
-**Resolution — warm-up suppression + trade bootstrap:**
-
-Two complementary mitigations:
-
-1. **Bootstrap from DB:** `SentimentVelocityEvaluator.bootstrap(db, tokenIds)` queries the
-   `trades` table for timestamps within the last `2 * VELOCITY_WINDOW_SECONDS` for each token
-   and pre-populates `tradeBuffer`. Query: `SELECT traded_at FROM trades WHERE token_id = $1
-   AND traded_at >= NOW() - interval '$n seconds' ORDER BY traded_at ASC`.
-   Called once at pipeline startup, after DB is available.
-
-2. **Warm-up suppression:** A `private warmUntil: Map<TokenId, number>` records the time at
-   which both current and prior trade windows will have been fully populated in-memory.
-   - On first `recordTrade(tokenId, ts)` for a token that has **no bootstrap data**, set
-     `warmUntil[tokenId] = ts + 2 * VELOCITY_WINDOW_SECONDS * 1000`.
-   - In `evaluate(tokenId)`, return `null` if `Date.now() < warmUntil[tokenId]`.
-   - If bootstrap data is present for both windows, `warmUntil` is not set (bootstrap covers it).
-   - The price buffer already initialises from DB on bootstrap; cold price buffer is also guarded
-     by `currentPrices.length < 2` check.
-
-### [LAW-MAJOR-6] Backtest `recall` metric — definition was ambiguous and non-computable
-
-**Finding:** `recall = correct / total resolvable` is only a filtered precision metric if the
-only inputs are fired signals + resolutions. True recall requires knowing all eligible prediction
-opportunities, not just the ones the system fired on.
-
-**Resolution — rename to `resolvedHitRate`, document contract precisely:**
-
-The metric is renamed `resolvedHitRate` throughout:
+In `tradeHandler2` (WhaleDetector path), the same guard applies:
 ```
-resolvedHitRate = signalsWithCorrectDirection / signalsWithAnyResolution
+tradeHandler2(trade):
+  1. if (negRiskSet.has(trade.tokenId)) return  ← top-of-handler; no DB write needed here
 ```
 
-Where:
-- `signalsWithAnyResolution` = fired signals (within backtest window) whose `tokenId` has a
-  resolved `markets` row (`winner IS NOT NULL`).
-- `signalsWithCorrectDirection` = subset of the above where signal direction matches the winner
-  outcome.
+Neg-risk trades ARE persisted to `trades` (for analytics, wallet profiling, backtest).
+They are NOT evaluated by WhaleDetector, PriceImpactSignalEvaluator, or SentimentVelocityEvaluator.
 
-This is a **hit rate on resolved markets** — meaningful, computable from the available data,
-and accurately named. The `BacktestMetrics` type replaces `recall` with `resolvedHitRate`.
+### [LAW-MAJOR-2] Outlier detection — direction-aware logic
 
-The backtest report table header is updated accordingly:
+**Finding:** The original `max(|price - mean| / stddev)` selector would fire `"BULLISH"` on an
+overpriced token (negative spread from the group's perspective) — wrong direction.
+
+**Resolution — direction-aware outlier detection:**
+
+The `ArbDetector.evaluate()` outlier path uses a **directional filter**:
+- Compute `priceDeviation = (mean24h - token.bestAsk) / stddev` for each token
+  (positive → token is underpriced relative to its 24h mean)
+- `outlierToken = token with max(priceDeviation)` where `priceDeviation > 0`
+- Fire `NEG_RISK_OUTLIER` only when `priceDeviation > 3.0` (underpriced by 3σ)
+- Direction is always `"BULLISH"` (underpriced token is a buy opportunity)
+- To fire a `"BEARISH"` outlier signal (overpriced): `(token.bestAsk - mean24h) / stddev > 3.0`
+  — For Phase 4 MVP, emit `BEARISH` for overpriced tokens too, with `direction = "BEARISH"`
+  and use the token with max overpriced-deviation as the outlier
+
+**Algorithm (Phase 4 MVP, symmetric):**
 ```
-  Signal Type         Precision  HitRate  F1     Fired
+for each token in group:
+  history = getTokenPriceHistory24h(db, token.tokenId)
+  if history.length < 5: skip
+  mean   = avg(history.prices)
+  stddev = populationStddev(history.prices)
+  if stddev === 0: skip
+
+  underpricedDev = (mean - token.bestAsk) / stddev   // + means underpriced
+  overpricedDev  = (token.bestAsk - mean) / stddev   // + means overpriced
+
+Select outlier = token with max(|underpricedDev|) among tokens where |dev| > 3.0
+If underpricedDev > 3.0  → direction = "BULLISH"
+If overpricedDev  > 3.0  → direction = "BEARISH"
 ```
-F1 is computed as: `2 * precision * resolvedHitRate / (precision + resolvedHitRate)`.
 
-### [LAW-MINOR-1] Depth mapping inversion — BUY should consume ask depth, not bid depth
+Confidence: `min(1.0, maxDeviation / 5.0)`
 
-**Finding:** A BUY order consumes resting ask-side liquidity. Using `bidDepthUsdc` for BUY
-inverts the microstructure relationship and distorts anomaly scores.
+### [LAW-MAJOR-3] Arb detection — size-aware minimum to filter dust quotes
 
-**Resolution — corrected depth mapping:**
+**Finding:** Arb detection based on `bids[0]` / `asks[0]` top-of-book prices ignores executable
+size. A dust quote (e.g. ask size = 0.01) would trigger a false positive arb signal.
+
+**Resolution — minimum size guard on top-of-book:**
+
+In `GroupResolver.resolveGroups()`, when mapping books to `NegRiskToken`:
 ```
-depthUsdc = side=BUY  ? snapshot.askDepthUsdc   // BUY consumes asks
-          : side=SELL ? snapshot.bidDepthUsdc    // SELL consumes bids
+bestAsk = asks[0]?.price ?? 1
+bestAskSize = asks[0]?.size ?? 0
+
+// If best ask size < MIN_NEG_RISK_SIZE, use next ask or treat as 1.0
+const MIN_NEG_RISK_SIZE = 10.0   // minimum 10 tokens notional to count as tradeable
+if (bestAskSize < MIN_NEG_RISK_SIZE) {
+  // Walk ask ladder to find first level with sufficient size
+  const tradeable = asks.find(a => a.size >= MIN_NEG_RISK_SIZE)
+  bestAsk = tradeable?.price ?? 1.0   // if no tradeable ask, treat as worst-case (1.0)
+}
 ```
-This is the standard market microstructure convention. The algorithm reference below reflects this
-corrected mapping. The original PRD had this backwards; the plan overrides it.
 
-### [LAW-MINOR-2] Pipeline sequencing contract
+This means `sumAsk` reflects prices where at least `MIN_NEG_RISK_SIZE` tokens are available.
+`MIN_NEG_RISK_SIZE` is a constant (not a config var for Phase 4 MVP) — set to `10.0`.
 
-Addressed under LAW-MAJOR-4. The explicit step-by-step order in `tradeHandler1` is the binding
-implementation contract.
-
-### [LAW-MINOR-3] Path typo — `events/types.ts` → `src/events/types.ts`
-
-**Resolution:** All references in this plan use `src/events/types.ts`.
-
-### [LAW-NIT-1] `velocityZScore` field name obsolete
-
-**Resolution:** `VelocitySignal` in `src/events/types.ts` is updated:
-- Remove: `velocityZScore`, `hourlyPriceChangePct`, `baselineStdDev` (Phase 1 vocabulary)
-- Add: `tradeCountVelocity: number` (the new semantic field — the ratio of current/prior window
-  trade counts, also stored as `strength` in the base signal)
-- The `payload` jsonb will carry: `priceVelocityPctPerMin`, `tradeCountVelocity`,
-  `windowSeconds`, `windowStartPrice`, `latestPrice`
-
-### [VEGAPUNK] Fire-and-forget wrapper for async evaluation
-
-**Resolution:** `priceImpactEvaluator.evaluate(...)` is invoked with:
-```typescript
-priceImpactEvaluator.evaluate(trade, priceBeforeTrade, priceNow, snapshot)
-  .then(sig => { if (sig) bus.emit("signal", sig); })
-  .catch(err => logger.error({ err }, "Pipeline: price impact eval failed"));
+`bestBid` uses the same guard (minimum bid size before counting as a liquid bid):
 ```
-This prevents unhandled promise rejections while not back-pressuring WS ingestion.
-The call is placed **after** `recordPrice()` so the buffer is updated, but `priceBeforeTrade`
-is captured **before** `recordPrice()` as specified in the sequencing contract.
+if (bids[0]?.size ?? 0 < MIN_NEG_RISK_SIZE) bestBid = 0
+else bestBid = bids[0].price
+```
 
-### [VEGAPUNK] `getRecentPriceHistory` — Drizzle v0.40 API
+### [LAW-MAJOR-4] Group membership — dynamic refresh on `markets_updated`
 
-Uses `.select().from(priceHistory).where(eq(...)).orderBy(desc(...)).limit(n)` — standard Drizzle
-chained query API, compatible with `drizzle-orm ^0.40.0`.
+**Finding:** `NegRiskEngine.start(negRiskTokenIds)` seeds from a static array at startup. As
+`GammaPoller` discovers new neg-risk markets, those tokens are silently missed by the engine.
+Also, newly-discovered neg-risk tokens are not subscribed in `ClobWsPool`.
+
+**Resolution — refresh neg-risk membership on `markets_updated`:**
+
+`NegRiskEngine` is wired to `GammaPoller`'s `markets_updated` event in `pipeline.ts`:
+```ts
+gammaPoller.on("markets_updated", (_newTokenIds: TokenId[], newNegRiskIds: TokenId[]) => {
+  if (newNegRiskIds.length > 0) {
+    negRiskEngine.addTokenIds(newNegRiskIds);
+    clobWsPool.addTokenIds(newNegRiskIds);   // subscribe new neg-risk tokens to CLOB WS
+  }
+});
+```
+
+`NegRiskEngine.addTokenIds(ids: string[]): void`:
+- Adds new IDs to `this.negRiskTokenIds` set
+- Triggers a debounced `refresh()` (debounce 2000ms to batch rapid updates)
+- Does NOT restart the interval — new tokens will be picked up on the next scheduled refresh
+  OR the next `BookUpdateEvent` for those tokens
+
+The initial call to `negRiskEngine.start()` uses `gammaPoller.getNegRiskIds()` (populated
+synchronously after `gammaPoller.start()` completes). Subsequent additions come via `addTokenIds`.
+
+### [LAW-MAJOR-5] Analytics SQL — parse cutoffs in Node, not string interpolation
+
+**Finding:** Interpolating `--days` / `--hours` into SQL interval strings (`INTERVAL '${days} days'`)
+is fragile and wrong for CLI inputs.
+
+**Resolution — compute JS Date cutoff, pass as bound parameter:**
+
+All analytics CLIs compute the cutoff as a `Date` object in Node:
+```ts
+// In leaderboard.ts / signal-dashboard.ts / heat-map.ts:
+const days = parseInt(argv.days ?? "7", 10);
+if (!Number.isFinite(days) || days <= 0) throw new Error("--days must be a positive integer");
+const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+// Then in the query:
+.where(gte(signals.createdAt, cutoff))   // Drizzle ORM
+// OR raw SQL:
+sql`WHERE created_at >= ${cutoff.toISOString()}::timestamptz`
+```
+
+All three CLIs validate their numeric args before issuing any query. Invalid args throw a
+usage error before DB connection is opened.
+
+### [LAW-MINOR-1] Must-have contradiction — `src/validation/schemas.ts` vs `src/events/types.ts`
+
+**Finding:** The must-have list said "extend `src/validation/schemas.ts`" but Task 1.2 said
+no change needed. Contradictory.
+
+**Resolution — definitive answer:**
+
+`src/validation/schemas.ts` does NOT need to change. The `ZSignalType` enum used in
+`src/db/queries/signals.ts` is built from `SIGNAL_TYPES` in `src/events/types.ts` directly.
+Extending `SIGNAL_TYPES` in `events/types.ts` (Task 1.1) automatically propagates to
+`ZSignalType`. No separate change to `validation/schemas.ts` is required.
+
+The must-have is updated: "Extend `src/events/types.ts` and `src/db/queries/signals.ts`
+(via SIGNAL_TYPES propagation) with two new types."
+
+### [LAW-MINOR-2] `SignalAggregator` guard — pick one design
+
+**Finding:** The must-have required updating `SignalAggregator`'s `SIGNAL_TYPES` guard, but
+the architecture bypasses `SignalAggregator` for neg-risk signals entirely.
+
+**Resolution — independent subsystem design selected:**
+
+`NegRiskEngine` is a fully independent subsystem. It calls `insertSignal()` directly (bypassing
+the event bus and `SignalAggregator`). `SignalAggregator` is NOT updated. Consequently:
+- `SIGNAL_TYPES` guard in `SignalAggregator.handleSignal()` does NOT need `NEG_RISK_ARB` or
+  `NEG_RISK_OUTLIER` added — those types will never reach `SignalAggregator`.
+- `ZSignalType` in `signals.ts` DOES need to include both new types (for `insertSignal`'s
+  Zod validation of signals written directly by `NegRiskEngine`).
+- The must-have requiring `SignalAggregator` guard update is removed.
+- No webhook routing is added to the bus signal handler; `NegRiskEngine` calls
+  `webhookEmitter.send()` directly.
+
+### [LAW-MINOR-3] Group validity upper bound on `sumAsk`
+
+**Finding:** `sumAsk >= 0.95 && sumBid <= 1.05` allows obviously broken books like `sumAsk=1.40`.
+
+**Resolution — add explicit upper bound:**
+
+```
+isValid = sumBid <= 1.05 && sumAsk >= 0.95 && sumAsk <= 1.20 && tokens.length >= 2
+```
+
+The `sumAsk <= 1.20` guard filters groups with egregiously overpriced books (20% above fair
+value suggests data integrity issues or extreme market conditions where arb calculations would
+not be meaningful). Empirical upper bound: legitimate neg-risk groups rarely exceed 1.10 even
+during high volatility.
+
+### [LAW-MINOR-4] `handleBookUpdate` — missing group guard for startup races
+
+**Finding:** `handleBookUpdate` assumes `evt.book.conditionId` maps cleanly to a cached group,
+but the first `refresh()` may not have completed when early book updates arrive.
+
+**Resolution — queue or ignore with debug logging:**
+
+```ts
+handleBookUpdate(evt: BookUpdateEvent): void {
+  if (!this.negRiskTokenIds.has(evt.book.tokenId)) return;   // not a neg-risk token
+  const group = this.groups.get(evt.book.conditionId);
+  if (!group) {
+    logger.debug({ conditionId: evt.book.conditionId }, "NegRiskEngine: group not yet resolved, skipping BookUpdateEvent");
+    return;   // group will be populated on next refresh(); no queue needed (low frequency)
+  }
+  // ... partial update + evaluate
+}
+```
+
+Test: `"book update arrives before first refresh completes"` — should silently return, no throw.
+
+### [LAW-MINOR-5] Leaderboard — sourced from `wallet_profiles` only
+
+**Finding:** The original spec promised joins with `whale_alerts` and `signals` for the
+leaderboard, but the practical join is impractical (whale_alerts lacks a direct proxy_wallet
+column for SQL JOIN).
+
+**Resolution — documented trade-off:**
+
+Phase 5 leaderboard is sourced from `wallet_profiles` only. `wallet_profiles` is maintained by
+`WalletEnricher` and already tracks `trade_count`, `win_ratio`, `total_volume_usdc`, and
+`whale_trade_count`. This is the correct data source for correctness and simplicity.
+
+**This trade-off is documented explicitly:**
+- In the leaderboard CLI output header: `# Source: wallet_profiles (enriched by WalletEnricher)`
+- In CLAUDE.md / README.md Phase 5 description
+
+### [LAW-NIT-1] WebhookEmitter — add explicit neg-risk payload builders
+
+**Finding:** The fallback `JSON.stringify` branch in `WebhookEmitter` is safe but should not
+be relied on long-term for neg-risk signals.
+
+**Resolution:** Task 6.1 adds explicit `buildDiscordNegRiskEmbed()` and `buildSlackNegRiskPayload()`
+builders with purple color `0x9B59B6`. The fallback remains as defensive code for any future
+unknown signal types.
 
 ---
 
-## Signal Algorithm Reference
+## Must-Haves (corrected post-Law review)
 
-### PriceImpactSignalEvaluator
-
-**Signature:** `evaluate(trade: TradeEvent, priceBeforeTrade: number | null, priceNow: number, snapshot: SnapshotRecord | null): Promise<PriceImpactSignal | null>`
-
-> Note: signature is `async` only to allow future DB use in non-hot paths; the hot-path impl
-> is synchronous internally.
-
-**Inputs:**
-- `trade`: `{ tokenId, conditionId, side, valueUsdc, priceUsdc }`
-- `priceBeforeTrade`: last recorded price from `recentPrices` before this trade (may be `null` on cold start)
-- `priceNow`: `trade.priceUsdc`
-- `snapshot`: result of `snapshotWriter.getLatestBook(tokenId)` (may be `null`)
-
-**Algorithm:**
-```
-// 1. Guard: need a snapshot
-if (!snapshot) → skip (no warn; expected on cold start)
-
-// 2. Staleness guard
-if (Date.now() - snapshot.capturedAt.getTime() > 60_000) → skip + warn
-
-// 3. Guard: need prior price
-if (priceBeforeTrade === null || priceBeforeTrade === 0) → skip silently
-
-// 4. Depth lookup — CORRECTED (LAW-MINOR-1)
-depthUsdc = trade.side === "BUY" ? snapshot.askDepthUsdc : snapshot.bidDepthUsdc
-if (!depthUsdc || depthUsdc === 0) → skip (division guard)
-
-// 5. Expected impact
-expectedImpact = trade.valueUsdc / depthUsdc
-
-// 6. Actual impact
-actualImpact = Math.abs(priceNow - priceBeforeTrade) / priceBeforeTrade
-
-// 7. Anomaly score
-score = actualImpact / expectedImpact
-if (score <= config.priceImpactAnomalyThreshold) → null
-
-// 8. Cooldown per token
-if (Date.now() - lastEmit.get(tokenId) < config.priceImpactCooldownMs) → null
-
-// 9. Direction, confidence, signal
-direction = trade.side === "BUY" ? "BULLISH" : "BEARISH"
-confidence = min(1.0, (score - threshold) / threshold)
-```
-
-**Payload fields:** `{ score, expectedImpact, actualImpact, depthUsdc, valueUsdc, priceBeforeTrade, priceNow, snapshotAgeMs }`
-
-### SentimentVelocityEvaluator
-
-**State per token:**
-```
-priceBuffer: Map<TokenId, Array<{ price: number; timestamp: number }>>
-tradeBuffer: Map<TokenId, Array<{ timestamp: number }>>
-lastEmit:    Map<TokenId, number>
-warmUntil:   Map<TokenId, number>   ← warm-up suppression
-```
-
-**Algorithm on `evaluate(tokenId: TokenId): VelocitySignal | null`:**
-```
-now = Date.now()
-windowMs = config.velocityWindowSeconds * 1000
-
-// Warm-up guard (LAW-MAJOR-5)
-if (warmUntil.get(tokenId) > now) → null
-
-// Current window: [now - windowMs, now]
-currentPrices = priceBuffer[tokenId].filter(p => p.timestamp >= now - windowMs)
-if (currentPrices.length < 2) → null
-
-windowStartPrice = currentPrices[0].price
-latestPrice = currentPrices[last].price
-if (windowStartPrice === 0) → null
-
-// Price velocity: % per minute
-priceVelocity = (latestPrice - windowStartPrice) / windowStartPrice
-              / config.velocityWindowSeconds * 60
-
-if (|priceVelocity| <= config.velocityPriceThreshold) → null
-
-// Trade count velocity
-currentTrades = tradeBuffer[tokenId].filter(t => t.timestamp >= now - windowMs)
-priorTrades   = tradeBuffer[tokenId].filter(t => t.timestamp >= now - 2*windowMs
-                                               && t.timestamp <  now - windowMs)
-tradeCountVelocity = currentTrades.length / max(priorTrades.length, 1)
-
-if (tradeCountVelocity <= config.velocityTradeCountMultiplier) → null
-
-// Cooldown
-if (now - lastEmit.get(tokenId) < config.velocityCooldownMs) → null
-
-// Direction, confidence, signal
-direction = priceVelocity > 0 ? "BULLISH" : "BEARISH"
-confidence = min(1.0, |priceVelocity| / (config.velocityPriceThreshold * 3))
-strength   = tradeCountVelocity
-
-payload = {
-  priceVelocityPctPerMin: priceVelocity * 100,
-  tradeCountVelocity,
-  windowSeconds: config.velocityWindowSeconds,
-  windowStartPrice,
-  latestPrice
-}
-```
-
-**Buffer management:** On each `recordPrice()` and `recordTrade()`, prune entries older than
-`2 * windowMs` using `.filter()` — O(n) but bounded by `2 * windowSeconds * eventsPerSecond`.
-
-**Warm-up rule (detail):**
-- `bootstrap(db, tokenIds)` is called at pipeline startup. For each tokenId, it queries
-  `trades` for the last `2 * VELOCITY_WINDOW_SECONDS` seconds and pre-populates `tradeBuffer`.
-  It also queries `price_history` and pre-populates `priceBuffer`.
-- If bootstrap returns data covering both windows for a token, `warmUntil` is not set for
-  that token (sufficient history exists).
-- If bootstrap returns no data (new token), `warmUntil[tokenId] = now + 2 * windowMs`.
-
----
-
-## Config Reference (Phase 3 additions)
-
-Add to `src/config.ts` and `.env.example`:
-
-```
-PRICE_IMPACT_ANOMALY_THRESHOLD=2.5     → config.priceImpactAnomalyThreshold
-PRICE_IMPACT_COOLDOWN_MS=30000         → config.priceImpactCooldownMs
-VELOCITY_WINDOW_SECONDS=300            → config.velocityWindowSeconds
-VELOCITY_PRICE_THRESHOLD=0.005         → config.velocityPriceThreshold
-VELOCITY_TRADE_COUNT_MULTIPLIER=1.5    → config.velocityTradeCountMultiplier
-VELOCITY_COOLDOWN_MS=120000            → config.velocityCooldownMs
-COMPOSITE_WINDOW_MS=60000              → config.compositeWindowMs
-```
-
-Legacy Phase 1 config vars superseded by Phase 3 (remove from `config.ts`):
-- `priceImpactWindowSec` (was `PRICE_IMPACT_WINDOW_SEC`) — Phase 3 evaluator does not use a window
-- `priceImpactMinChangePct` (was `PRICE_IMPACT_MIN_CHANGE_PCT`) — replaced by anomaly threshold
-- `velocityZScoreThreshold` (was `VELOCITY_Z_SCORE_THRESHOLD`) — algorithm fully replaced
-
-> **Caution:** Before removing legacy vars, confirm they are not referenced outside `pipeline.ts`
-> and `price-impact-signal.ts`. If any test imports them from `config`, update those tests.
-
----
-
-## Backtest Module Design
-
-### Types (`src/backtest/types.ts`)
-```typescript
-export interface BacktestConfig {
-  startDate: Date;
-  endDate: Date;
-  signalTypes?: SignalType[];
-  minConfidence?: number;
-  tokenIds?: string[];
-}
-
-export interface BacktestMetrics {
-  totalFired: number;
-  totalResolved: number;    // signals with a resolved market
-  totalCorrect: number;     // resolved signals with correct direction
-  precision: number;        // totalCorrect / totalFired
-  resolvedHitRate: number;  // totalCorrect / max(totalResolved, 1)
-  f1: number;               // harmonic mean of precision and resolvedHitRate
-  avgConfidence: number;
-}
-
-export interface BacktestResult {
-  config: BacktestConfig;
-  byType: Partial<Record<SignalType, BacktestMetrics>>;
-  overall: BacktestMetrics;
-}
-
-export interface SignalOutcome {
-  signalId: bigint;
-  signalType: SignalType;
-  direction: "BULLISH" | "BEARISH";
-  confidence: number;
-  tokenId: string;
-  createdAt: Date;
-  marketWinner: boolean | null;  // null = unresolved
-}
-```
-
-### Runner (`src/backtest/runner.ts`)
-- `BacktestRunner` class with `constructor(private db: Db)` — **no `createDb()`, uses `getDb()`**
-- `run(config: BacktestConfig): Promise<BacktestResult>`
-  1. Query `signals` joined to `markets` on `token_id`:
-     `SELECT s.*, m.winner FROM signals s LEFT JOIN markets m ON s.token_id = m.token_id
-     WHERE s.created_at BETWEEN $start AND $end [AND s.signal_type = ANY($types)]
-     [AND s.confidence >= $minConf] [AND s.token_id = ANY($tokenIds)]`
-  2. Map each row to `SignalOutcome` — resolved = `winner IS NOT NULL`
-  3. Pass to `BacktestEvaluator.evaluate(outcomes, config)`
-  4. Pass result to `BacktestReport.print(result)` + `BacktestReport.writeJson(result)`
-- `main()` function parses `process.argv`:
-  `--start YYYY-MM-DD`, `--end YYYY-MM-DD`, `--signal-types TYPE,TYPE`, `--min-confidence 0.5`
-  Uses `getDb()` and `closeDb()` from `src/db/client.ts`.
-
-### Evaluator (`src/backtest/evaluator.ts`)
-- Pure function: `evaluate(outcomes: SignalOutcome[]): BacktestResult`
-- Groups by `signalType`; computes per-type and overall `BacktestMetrics`
-- Zero-division guard: `precision = totalFired > 0 ? totalCorrect / totalFired : 0`
-- `resolvedHitRate = totalResolved > 0 ? totalCorrect / totalResolved : 0`
-- `f1 = (precision + resolvedHitRate) > 0 ? 2 * p * r / (p + r) : 0`
-
-### Report (`src/backtest/report.ts`)
-- `print(result: BacktestResult): void` — formats box table to `process.stdout`
-- `writeJson(result: BacktestResult, dir?: string): string` — writes to
-  `backtest-results/{startDate}_{endDate}.json`; returns the file path
-- Column headers in table: `Signal Type`, `Precision`, `HitRate`, `F1`, `Fired`
+- `NegRiskEngine` produces `NEG_RISK_ARB` and `NEG_RISK_OUTLIER` signals stored in `signals` table
+- `GroupResolver` correctly groups neg-risk tokens by conditionId, validates price sum with
+  both lower and upper bounds (`0.95 ≤ sumAsk ≤ 1.20`, `sumBid ≤ 1.05`, `tokens.length ≥ 2`),
+  and applies minimum ask-size guard to filter dust quotes
+- `ArbDetector` fires arb signal when spread < -0.02, fires directionally-correct outlier signal
+  (BULLISH for underpriced, BEARISH for overpriced), respects per-conditionId cooldown
+- Neg-risk tokens watchlisted=true in DB; neg-risk trade persistence is NOT skipped (only
+  signal evaluation is gated); neg-risk tokens flow to CLOB WS
+- Newly discovered neg-risk tokens from `markets_updated` are dynamically added to
+  `NegRiskEngine` and `ClobWsPool` (not just seeded at startup)
+- `WebhookEmitter.send()` has explicit purple-embed builders for neg-risk signal types
+- Three analytics CLIs use parsed JS Date cutoffs (not interpolated SQL intervals), validate
+  numeric args, and follow the `tsc && node dist/...` pattern (no tsx)
+- All Phase 4 + Phase 5 tests pass; no regressions in existing 414 tests
+- Config extended with 6 new env vars
+- Signal type union in `src/events/types.ts` extended with two new types; `SIGNAL_TYPES` array
+  updated so `ZSignalType` in `signals.ts` accepts `NEG_RISK_ARB` and `NEG_RISK_OUTLIER`
+- Docs updated: CLAUDE.md, README.md, `.env.example`
 
 ---
 
 ## Out of Scope
-- Neg-risk signal generation (Phase 4)
-- New DB schema changes or migrations
-- Any other Phase 1 / Phase 2 source files not listed in the edit surface
-- Deployment configuration changes
-- Backtesting UI
-- Streaming/pagination for large backtest windows (noted for Phase 4; bulk read acceptable for Phase 3)
+
+- No new DB tables — schema.ts is frozen; signals table handles arbitrary signalType strings
+- No drizzle migrations — drizzle/ directory untouched
+- Phase 1/2/3 source files untouched, **except**: `pipeline.ts`, `config.ts`, `.env.example`,
+  `gamma-poller.ts`, `live-data-ws-client.ts`, `clob-ws-pool.ts`, `events/types.ts`,
+  `db/queries/markets.ts`, `db/queries/price-history.ts`, `alerts/webhook-emitter.ts`
+- No new npm packages; all CLIs use Node.js built-ins + existing deps
+- Real network calls in tests (all mocked)
+- `SignalAggregator` is NOT modified (NegRiskEngine is fully independent)
+- `src/validation/schemas.ts` is NOT modified
+
+---
+
+## Codebase State (as of Phase 3)
+
+### What is LOCKED — must not change
+- `src/db/schema.ts`
+- `drizzle/` directory
+- `src/processors/signal-aggregator.ts` (no changes for Phase 4)
+- `src/validation/schemas.ts` (no changes needed)
+- All Phase 1/2/3 source files not listed in the edit surface below
+
+### Allowed edit surface (Phase 4+5 may touch these files)
+
+| File | Permitted change |
+|---|---|
+| `src/events/types.ts` | Add `NEG_RISK_ARB`, `NEG_RISK_OUTLIER` to `SignalType`, `SIGNAL_TYPES`, `Signal` union; add `NegRiskSignal` interface; add `PipelineConfig` Phase 4+5 fields |
+| `src/config.ts` | Add 6 Phase 4+5 env vars |
+| `.env.example` | Add Phase 4+5 sections |
+| `src/db/queries/markets.ts` | Add `getNegRiskMarketsByCondition()`, `getAllWatchlistedTokenIds()` |
+| `src/db/queries/price-history.ts` | Add `getTokenPriceHistory24h()` |
+| `src/sources/gamma-poller.ts` | Flip neg-risk `watchlisted = true`; maintain `negRiskSet` |
+| `src/sources/live-data-ws-client.ts` | Remove neg-risk filter block |
+| `src/pipeline.ts` | Wire NegRiskEngine; add neg-risk guards; wire `markets_updated` → `addTokenIds` |
+| `src/alerts/webhook-emitter.ts` | Add explicit neg-risk payload builders (purple embeds) |
+| `package.json` | Add `leaderboard`, `dashboard`, `heatmap` scripts |
+
+### What is NEW (create from scratch)
+- `src/neg-risk/group-resolver.ts`
+- `src/neg-risk/arb-detector.ts`
+- `src/neg-risk/neg-risk-engine.ts`
+- `src/neg-risk/index.ts` (barrel)
+- `src/analytics/leaderboard.ts`
+- `src/analytics/signal-dashboard.ts`
+- `src/analytics/heat-map.ts`
+- `analytics-results/.gitkeep`
+- `src/neg-risk/group-resolver.test.ts`
+- `src/neg-risk/arb-detector.test.ts`
+- `src/neg-risk/neg-risk-engine.test.ts`
+- `src/analytics/leaderboard.test.ts`
+- `src/analytics/signal-dashboard.test.ts`
+- `src/analytics/heat-map.test.ts`
+
+---
+
+## Architecture
+
+### Neg-Risk Pipeline Flow (Phase 4)
+
+```
+GammaPoller      → upserts all markets with watchlisted=TRUE (including neg-risk)
+                 → maintains negRiskSet for routing
+LiveDataWsClient → all trades flow through (neg-risk filter removed)
+ClobWsPool       → neg-risk tokenIds included in connect() call
+pipeline.ts      → tradeHandler1: persist all trades; guard signal evaluation for neg-risk
+                 → tradeHandler2: guard at top (neg-risk trades skip WhaleDetector)
+                 → bus.on("book_update") → NegRiskEngine.handleBookUpdate()
+                 → gammaPoller.on("markets_updated") → negRiskEngine.addTokenIds() + clobWsPool.addTokenIds()
+NegRiskEngine    → GroupResolver → ArbDetector → insertSignal + AlertEmitter + WebhookEmitter
+```
+
+### Analytics Pipeline Flow (Phase 5)
+
+```
+pnpm leaderboard/dashboard/heatmap
+  → tsc && node dist/analytics/xxx.js
+  → parse CLI args (validate numeric, compute JS Date cutoff)
+  → getDb() → query with Drizzle / raw SQL (bound params)
+  → render ASCII table to stdout
+  → (leaderboard) write JSON to analytics-results/
+  → closeDb() → process.exit(0)
+```
+
+### NegRiskEngine Internal Design
+
+```
+NegRiskEngine
+  ├── GroupResolver (queries DB + ClobRestClient.batchGetBooks)
+  ├── ArbDetector   (pure evaluation, DB for price history only)
+  ├── groups: Map<ConditionId, NegRiskGroup>   ← cache
+  ├── negRiskTokenIds: Set<TokenId>            ← for routing in handleBookUpdate
+  ├── refreshTimer                              ← setInterval(refresh, refreshIntervalMs)
+  └── debounce timer                            ← for addTokenIds batch refresh
+```
+
+---
+
+## Config Reference (Phase 4+5 additions)
+
+Add to `src/config.ts` and `.env.example`:
+
+```
+# Phase 4
+NEG_RISK_REFRESH_INTERVAL_MS=120000   → config.negRiskRefreshIntervalMs
+NEG_RISK_ARB_THRESHOLD=-0.02          → config.negRiskArbThreshold   (negative — fire when arbSpread < this)
+NEG_RISK_COOLDOWN_MS=60000            → config.negRiskCooldownMs
+
+# Phase 5
+DASHBOARD_REFRESH_MS=30000            → config.dashboardRefreshMs
+LEADERBOARD_MIN_TRADES=5              → config.leaderboardMinTrades
+LEADERBOARD_TOP_N=20                  → config.leaderboardTopN
+```
+
+`NEG_RISK_ARB_THRESHOLD=-0.02`: `Number("-0.02") = -0.02`. Comparison: `arbSpread < config.negRiskArbThreshold`
+where `arbSpread = sumAsk - 1.0`. Fire when `sumAsk < 0.98`.
+
+---
+
+## Algorithm Reference
+
+### GroupResolver — `resolveGroups()`
+
+```
+1. getNegRiskMarketsByCondition(db)           → NegRiskMarketRow[]
+2. Group by conditionId (Map<string, row[]>)
+3. For each group:
+   a. clobClient.batchGetBooks(tokenIds)      → OrderBook[]
+   b. Map books to NegRiskToken:
+      - For each token, walk ask ladder for first ask with size ≥ MIN_NEG_RISK_SIZE (10.0)
+        → bestAsk = ladder price, or 1.0 if no tradeable ask
+      - For bid: bestBid = bids[0]?.size >= MIN_NEG_RISK_SIZE ? bids[0].price : 0
+   c. sumBid = sum(token.bestBid)
+   d. sumAsk = sum(token.bestAsk)
+   e. isValid = sumBid <= 1.05
+             && sumAsk >= 0.95
+             && sumAsk <= 1.20
+             && tokens.length >= 2
+4. Return NegRiskGroup[]
+```
+
+### ArbDetector — `evaluate(group: NegRiskGroup)`
+
+```
+Guard: if (!group.isValid || group.tokens.length < 2) return []
+
+impliedProb  = group.sumAsk
+arbSpread    = impliedProb - 1.0
+dominantToken = tokens.reduce(maxByBestAsk)
+
+Cooldown: if (now - lastEmit.get(conditionId) < cooldownMs) return []
+
+signals = []
+
+// --- ARB signal ---
+if (arbSpread < config.negRiskArbThreshold) {     // arbThreshold = -0.02
+  confidence = min(1.0, abs(arbSpread) / 0.05)
+  signals.push(buildArbSignal(dominantToken, group, arbSpread, confidence))
+}
+
+// --- OUTLIER signal ---
+for each token in group:
+  history = getTokenPriceHistory24h(db, token.tokenId)
+  if history.length < 5: continue
+  mean   = avg(history)
+  stddev = populationStddev(history)
+  if stddev === 0: continue
+  underpricedDev = (mean - token.bestAsk) / stddev    // + = underpriced
+  overpricedDev  = (token.bestAsk - mean) / stddev    // + = overpriced
+
+Pick maxDev = max(underpricedDev, overpricedDev) across all tokens
+if maxDev > 3.0:
+  direction  = underpricedDev >= overpricedDev ? "BULLISH" : "BEARISH"
+  confidence = min(1.0, maxDev / 5.0)
+  signals.push(buildOutlierSignal(outlierToken, group, maxDev, direction, confidence))
+
+if signals.length > 0:
+  lastEmit.set(conditionId, now)   ← shared cooldown
+
+return signals
+```
+
+### Analytics CLIs — Arg Parsing Pattern
+
+```ts
+// Safe numeric arg parsing (all three CLIs):
+const raw = process.argv.find(a => a.startsWith("--days="))?.split("=")[1] ?? "7";
+const days = parseInt(raw, 10);
+if (!Number.isFinite(days) || days <= 0 || days > 365) {
+  console.error("--days must be a positive integer (1–365)");
+  process.exit(1);
+}
+const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+// Pass cutoff as bound parameter to Drizzle / sql`...${cutoff.toISOString()}::timestamptz`
+```
 
 ---
 
 ## Tasks (Atomic, Testable, Ordered)
 
-### Chunk 1 — Foundation (no other dependencies)
+### Chunk 1 — Type System + Config Foundation (no dependencies)
 
-**Task 1.1 — Extend `src/config.ts`**
-- Add 7 Phase 3 config vars (see Config Reference above)
-- Remove 3 superseded Phase 1 vars (`priceImpactWindowSec`, `priceImpactMinChangePct`, `velocityZScoreThreshold`)
-- ✅ Test: `src/config.test.ts` additions — verify each new var reads its env var and falls back to default
+**Task 1.1 — Extend `src/events/types.ts`**
+- Add `"NEG_RISK_ARB"` and `"NEG_RISK_OUTLIER"` to `SignalType` union
+- Add both to `SIGNAL_TYPES` readonly array
+- Add `NegRiskSignal` interface extending `BaseSignal`:
+  ```ts
+  export interface NegRiskSignal extends BaseSignal {
+    signalType: "NEG_RISK_ARB" | "NEG_RISK_OUTLIER";
+    arbSpread?: number;          // for ARB signals
+    priceDeviation?: number;     // for OUTLIER signals
+    negRiskGroupSize: number;
+    negRiskSumBid: number;
+    negRiskSumAsk: number;
+    conditionIdGroup: string;    // the group conditionId
+  }
+  ```
+- Add `NegRiskSignal` to `Signal` union type (6-way union)
+- Add Phase 4+5 fields to `PipelineConfig` interface:
+  `negRiskRefreshIntervalMs`, `negRiskArbThreshold`, `negRiskCooldownMs`,
+  `dashboardRefreshMs`, `leaderboardMinTrades`, `leaderboardTopN`
+- ✅ Test: `pnpm typecheck` passes; `SIGNAL_TYPES.length === 6`
 
-**Task 1.2 — Update `.env.example`**
-- Add Phase 3 section with all 7 new vars + defaults
-- Remove superseded Phase 1 vars
-- ✅ No tests needed (documentation file)
-
-**Task 1.3 — Update `src/events/types.ts`**
-- Update `VelocitySignal`: remove `velocityZScore`, `hourlyPriceChangePct`, `baselineStdDev`; add `tradeCountVelocity: number`
-- Update `PriceImpactSignal`: update `payload` type comment to match new fields
-- ✅ Test: TypeScript compilation (`pnpm typecheck`) must pass
-
-**Task 1.4 — Create `src/db/queries/price-history.ts`**
-- Export `getRecentPriceHistory(db, tokenId, limit)` returning `Array<{ price: number, recordedAt: Date }>`
-- Uses Drizzle `.select().from(priceHistory).where(eq(...)).orderBy(desc(...)).limit(n)` — v0.40 compatible
-- Export `getRecentTradeTimestamps(db, tokenId, windowSeconds)` returning `Array<{ tradedAt: Date }>`
-  Used by `SentimentVelocityEvaluator.bootstrap()` to pre-populate `tradeBuffer`
-- ✅ Test: `src/db/queries/price-history.test.ts` — mocked DB, correct SQL shape, ordering
-
----
-
-### Chunk 2 — PriceImpactSignalEvaluator (depends on Chunk 1)
-
-**Task 2.1 — Rewrite `src/signals/price-impact-signal.ts`**
-- Export class `PriceImpactSignalEvaluator` (no DB dependency — pure in-memory)
-- Constructor: `constructor(opts?: { threshold?: number; cooldownMs?: number })`
-- Method: `evaluate(trade: TradeEvent, priceBeforeTrade: number | null, priceNow: number, snapshot: SnapshotRecord | null): Promise<PriceImpactSignal | null>`
-- Implements corrected depth mapping (LAW-MINOR-1): `BUY → askDepthUsdc`, `SELL → bidDepthUsdc`
-- Stale snapshot guard: `Date.now() - snapshot.capturedAt.getTime() > 60_000` → skip + warn
-- Division guards: `depthUsdc === 0`, `priceBeforeTrade === 0`
-- Cooldown: `Map<TokenId, number>` per-token
-- Signal payload fields: `score`, `expectedImpact`, `actualImpact`, `depthUsdc`, `valueUsdc`, `priceBeforeTrade`, `priceNow`, `snapshotAgeMs`
-- Remove old `evaluatePriceImpact` function export entirely
-
-**Task 2.2 — Replace `tests/signals/price-impact-signal.test.ts`**
-- Test cases:
-  - ✅ Fires when `score > threshold` (BUY, correct ask depth)
-  - ✅ Fires when `score > threshold` (SELL, correct bid depth)
-  - ✅ `BULL` direction for BUY, `BEAR` direction for SELL
-  - ✅ Returns `null` when snapshot is `null`
-  - ✅ Returns `null` + logs warn when snapshot older than 60s
-  - ✅ Returns `null` when `priceBeforeTrade` is `null`
-  - ✅ Returns `null` when `depthUsdc === 0` (division guard)
-  - ✅ Returns `null` when `score <= threshold`
-  - ✅ Cooldown suppression — second call within cooldown returns `null`
-  - ✅ Cooldown resets after `cooldownMs`
-  - ✅ Confidence scaling: `min(1.0, (score - threshold) / threshold)`
-  - ✅ Custom `threshold` and `cooldownMs` via constructor opts
+**Task 1.2 — Extend `src/config.ts` + `.env.example`**
+- Add 6 new config vars with defaults (see Config Reference)
+- Use `envNumber("NEG_RISK_ARB_THRESHOLD", -0.02)` — `Number("-0.02")` parses correctly
+- ✅ Test: `src/config.test.ts` additions — each var reads its env var and falls back to default
 
 ---
 
-### Chunk 3 — SentimentVelocityEvaluator (depends on Chunk 1)
+### Chunk 2 — DB Query Extensions (no dependencies)
 
-**Task 3.1 — Rewrite `src/signals/velocity-signal.ts`**
-- Export class `SentimentVelocityEvaluator`
-- Constructor: `constructor(opts?: { windowSeconds?: number; priceThreshold?: number; tradeCountMultiplier?: number; cooldownMs?: number })`
-- Methods:
-  - `recordPrice(tokenId: TokenId, price: number, timestamp?: number): void`
-  - `recordTrade(tokenId: TokenId, timestamp?: number): void`
-  - `evaluate(tokenId: TokenId): VelocitySignal | null`
-  - `bootstrap(db: Db, tokenIds: TokenId[]): Promise<void>`
-  - `clear(): void` — reset all buffers (for testing + shutdown)
-- Warm-up suppression: `warmUntil` map — returns `null` until both windows are warm
-- Buffer pruning: prune to `2 * windowMs` on every `recordPrice`/`recordTrade`
-- Remove old `evaluateVelocity` function export entirely
-- Signal uses `tradeCountVelocity` field (not `velocityZScore`)
+**Task 2.1 — Add `getNegRiskMarketsByCondition()` to `src/db/queries/markets.ts`**
+- Query: `SELECT token_id, condition_id, question, slug FROM markets WHERE neg_risk = true AND closed = false`
+- Returns: `NegRiskMarketRow[]` (type defined in query file, imported by GroupResolver)
+  ```ts
+  export interface NegRiskMarketRow {
+    tokenId: string;
+    conditionId: string;
+    question: string;
+    slug: string | null;
+  }
+  ```
+- Application-layer grouping by conditionId (not SQL GROUP BY)
+- ✅ Test: `src/db/queries/markets.test.ts` — returns correct rows, empty when no neg-risk markets
 
-**Task 3.2 — Replace `tests/signals/velocity-signal.test.ts`**
-- Test cases:
-  - ✅ Fires when both price velocity and trade count velocity exceed thresholds
-  - ✅ Does NOT fire when only price velocity exceeded (trade count below multiplier)
-  - ✅ Does NOT fire when only trade count velocity exceeded (price below threshold)
-  - ✅ `BULLISH` direction when price rising, `BEARISH` when falling
-  - ✅ Cooldown suppression
-  - ✅ Returns `null` when fewer than 2 price records in current window
-  - ✅ Rolling window correctly excludes records older than `windowSeconds`
-  - ✅ Prior window trade count uses `[now-2W, now-W)` range
-  - ✅ `tradeCountVelocity` = 1 when prior window is 0 (division guard)
-  - ✅ Warm-up suppression — returns `null` before warm-up period expires
-  - ✅ `bootstrap()` pre-populates buffers and suppresses warm-up when data present
-  - ✅ Confidence: `min(1.0, |priceVelocity| / (threshold * 3))`
-  - ✅ Custom opts via constructor
+**Task 2.2 — Add `getAllWatchlistedTokenIds()` to `src/db/queries/markets.ts`**
+- Query: returns all `tokenId` where `watchlisted = true` (no negRisk filter)
+- Distinct from existing `getWatchlistedTokenIds` (which may filter negRisk)
+- Used by pipeline.ts for `clobWsPool.connect()` so neg-risk tokens get CLOB WS book updates
+- ✅ Test: returns both neg-risk and non-neg-risk watchlisted tokens
+
+**Task 2.3 — Add `getTokenPriceHistory24h()` to `src/db/queries/price-history.ts`**
+- Query: `price_history` table, `event_type = 'last_trade'` only (not best_bid_ask — too noisy)
+- Returns: `Array<{ price: number; recordedAt: Date }>` for last 24h, ordered ASC
+- Uses Drizzle `.where(and(eq(priceHistory.eventType, 'last_trade'), gte(priceHistory.recordedAt, cutoff24h)))` — no SQL interval interpolation
+- ✅ Test: `src/db/queries/price-history.test.ts` — correct filter, ordering, 24h boundary
 
 ---
 
-### Chunk 4 — SignalAggregator Composite Scoring (depends on Chunk 1)
+### Chunk 3 — Neg-Risk Module (`src/neg-risk/`)
 
-**Task 4.1 — Update `src/processors/signal-aggregator.ts`**
-- Add `private compositeMap: Map<TokenId, CompositeWindow>` where:
-  `CompositeWindow = { signals: Array<{id: bigint, type: SignalType, confidence: number, createdAt: number}>, windowStart: number }`
-- In `handleSignal()` (after existing insert):
-  1. Capture `insertedId` from `insertSignal()` return value
-  2. Add new signal to `compositeMap[tokenId]`
-  3. Prune entries older than `config.compositeWindowMs`
-  4. If window has ≥ 2 signals:
-     - `compositeConfidence = mean(confidences) * (1 + 0.15 * (count - 1))`
-     - Build `ids = window.signals.map(s => s.id)` (includes all signals in window)
-     - Call `updateSignalPayloads(db, ids, { compositeScore: compositeConfidence })` — patches all prior rows
-     - Log: `[COMPOSITE] tokenId: <score>, signals: [<types>]`
-- Window `windowStart` is set to the timestamp of the **first** signal in the group
-- Add `updateSignalPayloads(db, ids, patch)` to `src/db/queries/signals.ts`
+**Task 3.1 — `src/neg-risk/group-resolver.ts`**
+- Class `GroupResolver`, constructor: `(db: Db, clobClient: ClobRestClient)`
+- Method `resolveGroups(): Promise<NegRiskGroup[]>`
+- Exports:
+  ```ts
+  export interface NegRiskToken {
+    tokenId: string;
+    conditionId: string;
+    bestBid: number;
+    bestAsk: number;
+    question: string;
+  }
+  export interface NegRiskGroup {
+    conditionId: string;
+    tokens: NegRiskToken[];
+    sumBid: number;
+    sumAsk: number;
+    isValid: boolean;
+  }
+  ```
+- Algorithm (see Architecture Reference above):
+  - Size-aware top-of-book: walk ask/bid ladder for `MIN_NEG_RISK_SIZE = 10.0` guard
+  - Validity bounds: `sumBid <= 1.05 && sumAsk >= 0.95 && sumAsk <= 1.20 && tokens.length >= 2`
+- Edge cases:
+  - Empty book (no asks for a token): `bestAsk = 1.0`, `bestBid = 0`
+  - Single-token group: `isValid = false`
+  - batchGetBooks returns partial results: missing tokens default to `bestBid=0, bestAsk=1`
 
-**Task 4.2 — Extend `src/processors/signal-aggregator.test.ts`**
-- Test cases (additions only — do not break existing 357 tests):
-  - ✅ Single signal: no composite score, `updateSignalPayloads` not called
-  - ✅ Two signals within window: `compositeScore` computed + both DB rows patched
-  - ✅ Three signals: bonus factor applied `(1 + 0.15 * 2)` = 1.30
-  - ✅ Window expiry: second signal after `compositeWindowMs` does NOT combine with first
-  - ✅ Different tokenIds: separate windows, no cross-token composite
-  - ✅ Log output contains `[COMPOSITE]` with correct tokenId and types
+**Task 3.2 — `src/neg-risk/arb-detector.ts`**
+- Class `ArbDetector`, constructor: `(db: Db, opts?: { arbThreshold?: number; cooldownMs?: number })`
+- Method `evaluate(group: NegRiskGroup): Promise<NegRiskSignal[]>`
+- Direction-aware outlier (LAW-MAJOR-2 fix): BULLISH for underpriced, BEARISH for overpriced
+- All edge cases handled (see Algorithm Reference above):
+  - Invalid group: `return []`
+  - Price history < 5 points: skip outlier
+  - stddev = 0: skip outlier (division guard)
+  - cooldown shared per conditionId (both signals suppressed together — acceptable for MVP)
+- Signal `tokenId`: ARB uses `dominantToken.tokenId`; OUTLIER uses `outlierToken.tokenId`
+- Signal `conditionId`: both use `group.conditionId`
 
----
+**Task 3.3 — `src/neg-risk/neg-risk-engine.ts`**
+- Class `NegRiskEngine`:
+  ```ts
+  constructor(
+    db: Db,
+    clobClient: ClobRestClient,
+    alertEmitter: AlertEmitter,
+    webhookEmitter: WebhookEmitter,
+    opts?: { refreshIntervalMs?: number }
+  )
+  ```
+- Private state:
+  - `resolver: GroupResolver`
+  - `detector: ArbDetector`
+  - `groups: Map<ConditionId, NegRiskGroup>`
+  - `negRiskTokenIds: Set<string>`
+  - `refreshTimer: ReturnType<typeof setInterval> | null`
+  - `debounceTimer: ReturnType<typeof setTimeout> | null`
+- `start(negRiskTokenIds: string[]): void`
+  - Populates `negRiskTokenIds` set, runs immediate `refresh()`, starts interval
+- `stop(): void` — clears interval and debounce timer
+- `addTokenIds(ids: string[]): void`
+  - Adds new IDs to set; triggers debounced `refresh()` (2000ms debounce)
+- `handleBookUpdate(evt: BookUpdateEvent): void`
+  - Guard: if token not in `negRiskTokenIds` → return
+  - Guard: if group not in cache → log debug + return (startup race — LAW-MINOR-4 fix)
+  - Partial update: mutate `group.tokens[i].bestBid/bestAsk` for matching tokenId
+  - Recompute `group.sumBid` and `group.sumAsk` and `group.isValid`
+  - Fire-and-forget `detector.evaluate(group)` → emit signals
+- `refresh(): Promise<void>`
+  - `resolveGroups()` → update `this.groups` cache
+  - For each valid group: `detector.evaluate(group)` → for each signal: insert + alert + webhook
+- `private emitAlert(signal: NegRiskSignal): void`
+  - Prints `[NEG-RISK] ${signal.signalType} conditionId=${signal.conditionIdGroup} conf=${signal.confidence.toFixed(2)}`
 
-### Chunk 5 — Backtest Module (depends on Chunk 1)
-
-**Task 5.1 — Create `src/backtest/types.ts`**
-- All interfaces from Backtest Module Design above
-- Export: `BacktestConfig`, `BacktestMetrics`, `BacktestResult`, `SignalOutcome`
-
-**Task 5.2 — Create `src/backtest/evaluator.ts`**
-- Pure function `evaluate(outcomes: SignalOutcome[], config: BacktestConfig): BacktestResult`
-- Computes per-type and overall `BacktestMetrics`
-- Uses `resolvedHitRate` (not `recall`)
-- Zero-division guards on all metrics
-
-**Task 5.3 — Create `src/backtest/report.ts`**
-- `print(result: BacktestResult): void` — box table to stdout
-- `writeJson(result: BacktestResult, dir?: string): string` — returns path written
-- Column order: `Signal Type | Precision | HitRate | F1 | Fired`
-
-**Task 5.4 — Create `src/backtest/runner.ts`**
-- `BacktestRunner` class: `constructor(private db: Db)`
-- `run(config: BacktestConfig): Promise<BacktestResult>`
-- `main()`: parses `process.argv`, calls `getDb()` / `closeDb()` (NOT `createDb()`)
-- Uses `LEFT JOIN markets` to obtain `winner` for each signal's `tokenId`
-
----
-
-### Chunk 6 — Pipeline Wiring (depends on Chunks 2, 3, 4)
-
-**Task 6.1 — Update `src/pipeline.ts`**
-- Remove: `import { evaluatePriceImpact } from "./signals/price-impact-signal.js"`
-- Remove: `import { evaluateVelocity } from "./signals/velocity-signal.js"`
-- Remove: `recentPrices` map, `recordPrice()`, `PRICE_WINDOW_MS` (replaced by evaluator-internal state)
-  > **Note:** Keep `recordBucketPrice` and `priceBuckets` only if still needed — they are NOT
-  > needed after Phase 3 since `SentimentVelocityEvaluator` manages its own `priceBuffer`.
-  > Remove `priceBuckets`, `BUCKET_MS`, `MAX_BUCKETS`, `recordBucketPrice`, and the `velocityTimer`
-  > `setInterval` block.
-- Add: `import { PriceImpactSignalEvaluator } from "./signals/price-impact-signal.js"`
-- Add: `import { SentimentVelocityEvaluator } from "./signals/velocity-signal.js"`
-- Instantiate: `const priceImpactEvaluator = new PriceImpactSignalEvaluator()`
-- Instantiate: `const velocityEvaluator = new SentimentVelocityEvaluator()`
-- Bootstrap: after `gammaPoller.start()`, call `velocityEvaluator.bootstrap(db, watchlistedTokenIds)` (non-blocking, catch errors)
-- Wire `best_bid_ask` and `last_trade_price` → `velocityEvaluator.recordPrice(tokenId, price)`
-- In `tradeHandler1`:
-  1. Capture `priceBeforeTrade` from evaluator's last known price (see sequencing contract)
-  2. Call `velocityEvaluator.recordTrade(tokenId)` and `velocityEvaluator.recordPrice(tokenId, trade.priceUsdc)`
-  3. Fire-and-forget `priceImpactEvaluator.evaluate(trade, priceBeforeTrade, trade.priceUsdc, snapshot)` → emit signal
-  4. Sync call `velocityEvaluator.evaluate(tokenId)` → emit signal if not null
-- Remove `velocityTimer` setInterval (velocity evaluated per-trade now, not on a timer)
-- In `shutdown()`: call `velocityEvaluator.clear()`
-- Remove bus listener registrations for old handlers that no longer exist
-
----
-
-### Chunk 7 — Package + Output Directory (no dependencies)
-
-**Task 7.1 — Add `backtest` script to `package.json`**
-```json
-"backtest": "tsc && node dist/backtest/runner.js"
+**Task 3.4 — `src/neg-risk/index.ts` (barrel)**
+```ts
+export { NegRiskEngine } from "./neg-risk-engine.js";
+export type { NegRiskGroup, NegRiskToken } from "./group-resolver.js";
 ```
 
-**Task 7.2 — Create `backtest-results/.gitkeep`**
-- Empty file to track the output directory in git
-- Add `backtest-results/*.json` to `.gitignore` (keep `.gitkeep`, ignore results)
+---
+
+### Chunk 4 — Pipeline Changes (depends on Chunk 3)
+
+**Task 4.1 — Update `src/sources/gamma-poller.ts`**
+- Change: `const watchlisted = !isNegRisk;` → `const watchlisted = true;`
+- Maintain `negRiskSet.add(tokenId)` for all neg-risk tokens (still tracked for routing)
+- Change: neg-risk tokens now also added to `watchlistSet` for ClobWsPool subscription:
+  ```ts
+  this.watchlistSet.add(tokenId);
+  if (isNegRisk) this.negRiskSet.add(tokenId);
+  ```
+  Remove the `if (isNegRisk) { ... } else { ... }` exclusive branching
+- Stats bootstrap for neg-risk tokens: SKIP (neg-risk tokens use cross-book model, not single-token stats)
+  Keep bootstrap only for non-neg-risk newly-watchlisted tokens
+- ✅ Test: existing GammaPoller tests still pass; add test for neg-risk token having `watchlisted=true`
+
+**Task 4.2 — Update `src/sources/live-data-ws-client.ts`**
+- Remove the neg-risk filter block:
+  ```ts
+  // REMOVE:
+  if (this.options.negRiskSet.has(tokenId)) { continue; }
+  ```
+- Keep the `negRiskSet` field in `options` type (backward-compat — tests that pass it still compile)
+- ✅ Test: existing tests pass; add test that neg-risk tokenId trade events are NOT filtered
+
+**Task 4.3 — Update `src/pipeline.ts`**
+
+Routing changes:
+- **Trade persistence**: neg-risk trades flow to `tradeBatch.push(trade)` unchanged
+- **`tradeHandler1`**: after `tradeBatch.push(trade)`, add:
+  ```ts
+  if (negRiskSet.has(trade.tokenId)) return;   // signal evaluation only — persistence already done
+  ```
+- **`tradeHandler2`**: at top of handler:
+  ```ts
+  if (negRiskSet.has(trade.tokenId)) return;   // neg-risk whale detection skipped
+  ```
+
+NegRiskEngine wiring:
+```ts
+// After gammaPoller.start():
+const negRiskEngine = new NegRiskEngine(db, clobClient, alertEmitter, webhookEmitter,
+  { refreshIntervalMs: config.negRiskRefreshIntervalMs });
+negRiskEngine.start(gammaPoller.getNegRiskIds());
+
+// markets_updated handler — dynamic membership (LAW-MAJOR-4 fix):
+gammaPoller.on("markets_updated", (_newTokenIds: TokenId[], newNegRiskIds: TokenId[]) => {
+  if (newNegRiskIds.length > 0) {
+    negRiskEngine.addTokenIds(newNegRiskIds);
+    clobWsPool.addTokenIds(newNegRiskIds);
+  }
+});
+
+// book_update routing:
+const negRiskBookHandler = (evt: BookUpdateEvent) => negRiskEngine.handleBookUpdate(evt);
+bus.on("book_update", negRiskBookHandler);
+```
+
+ClobWsPool — include neg-risk tokens:
+- Use `getAllWatchlistedTokenIds(db)` (new query from Task 2.2) instead of `getWatchlistedTokenIds`
+  to pass ALL watchlisted tokens (including neg-risk) to `clobWsPool.connect()`
+
+Shutdown:
+```ts
+negRiskEngine.stop();
+bus.off("book_update", negRiskBookHandler);
+```
 
 ---
 
-### Chunk 8 — Tests (depends on respective implementation chunks)
+### Chunk 5 — WebhookEmitter Extension (depends on Task 1.1)
 
-**Task 8.1 — `src/db/queries/price-history.test.ts`**
-- `getRecentPriceHistory`: returns rows ordered DESC, limits correctly, returns `[]` on no rows
-- `getRecentTradeTimestamps`: returns timestamps within window, excludes older records
+**Task 5.1 — Update `src/alerts/webhook-emitter.ts`**
+- Add type guard: `isNegRiskSignal(p: Payload): p is NegRiskSignal`
+  ```ts
+  function isNegRiskSignal(p: Payload): p is NegRiskSignal {
+    return !isWhaleAlert(p) &&
+      ((p as Signal).signalType === "NEG_RISK_ARB" ||
+       (p as Signal).signalType === "NEG_RISK_OUTLIER");
+  }
+  ```
+- Add `buildDiscordNegRiskEmbed(signal: NegRiskSignal): object`:
+  ```ts
+  {
+    embeds: [{
+      title: signal.signalType === "NEG_RISK_ARB"
+        ? "⚗️ Neg-Risk Arb Detected"
+        : "📊 Neg-Risk Outlier Detected",
+      description: `Condition: ${signal.conditionIdGroup}`,
+      color: 0x9B59B6,  // purple
+      fields: [
+        { name: "Direction", value: signal.direction, inline: true },
+        { name: "Confidence", value: signal.confidence.toFixed(2), inline: true },
+        { name: "Group Size", value: String(signal.negRiskGroupSize), inline: true },
+        { name: "Sum Ask", value: signal.negRiskSumAsk.toFixed(4), inline: true },
+        signal.arbSpread != null
+          ? { name: "Arb Spread", value: signal.arbSpread.toFixed(4), inline: true }
+          : { name: "Price Deviation", value: (signal.priceDeviation ?? 0).toFixed(2) + "σ", inline: true },
+      ],
+      timestamp: new Date().toISOString(),
+    }]
+  }
+  ```
+- Add `buildSlackNegRiskPayload(signal: NegRiskSignal): object` — mrkdwn text equivalent
+- Wire into `buildDiscordPayload()` and `buildSlackPayload()` before the generic fallback
+- `Payload` type alias: extend to include `NegRiskSignal`
+- ✅ Test: purple color used for both neg-risk types; fallback NOT hit for NEG_RISK_ARB/OUTLIER
 
-**Task 8.2 — `src/signals/price-impact-signal.test.ts`** (already specified in Task 2.2)
+---
 
-**Task 8.3 — `src/signals/velocity-signal.test.ts`** (already specified in Task 3.2)
+### Chunk 6 — Analytics CLIs (`src/analytics/`)
 
-**Task 8.4 — `src/processors/signal-aggregator.test.ts`** (already specified in Task 4.2)
+All CLIs follow the `backtest/runner.ts` pattern. Scripts: `tsc && node dist/analytics/xxx.js`.
 
-**Task 8.5 — `src/backtest/evaluator.test.ts`**
-- Precision/resolvedHitRate/f1 math with known inputs
-- Zero-division: `totalFired = 0` → all metrics 0
-- Zero-division: `totalResolved = 0` → `resolvedHitRate = 0`
-- Per-type breakdown correctness
-- Mixed signal types in one result
+**Task 6.1 — `src/analytics/leaderboard.ts`**
+- Argv parsing: `--min-trades N` (default: `config.leaderboardMinTrades`), `--min-volume N`
+  (default 10000), `--top N` (default: `config.leaderboardTopN`), `--json`
+- Validate: all numeric args are positive finite integers before DB connection
+- Query (wallet_profiles only — LAW-MINOR-5 decision, documented in output header):
+  ```sql
+  SELECT proxy_wallet, total_volume_usdc, trade_count, win_ratio, win_count,
+         resolved_trade_count, whale_trade_count
+  FROM wallet_profiles
+  WHERE trade_count >= $minTrades AND total_volume_usdc >= $minVolume
+  ORDER BY win_ratio DESC, total_volume_usdc DESC
+  LIMIT $topN
+  ```
+- Output: ASCII box table with header `# Source: wallet_profiles (enriched by WalletEnricher)`
+- If `--json`: write JSON to `analytics-results/leaderboard_{timestamp}.json` AND stdout
+- If NOT `--json`: table to stdout, JSON to file only
+- Create `analytics-results/` via `fs.mkdirSync(dir, { recursive: true })`
+- Pattern: `main()` async function, `getDb()` / `closeDb()` from `src/db/client.ts`
 
-**Task 8.6 — `src/backtest/report.test.ts`**
-- JSON output shape matches `BacktestResult`
-- JSON written to correct path
-- Stdout table contains expected column headers
-- `HitRate` column (not `Recall`) is present in output
+**Task 6.2 — `src/analytics/signal-dashboard.ts`**
+- Argv parsing: `--days N` (default 7), `--once`
+- Validate days: positive integer, 1–365
+- Compute cutoff: `new Date(Date.now() - days * 24 * 60 * 60 * 1000)` — pass as bound param
+- Query 1 (per-type counts):
+  ```sql
+  SELECT signal_type,
+         COUNT(*) FILTER (WHERE created_at >= $cutoff24h) AS last_24h,
+         COUNT(*) FILTER (WHERE created_at >= $cutoff) AS last_nd,
+         AVG(confidence) FILTER (WHERE created_at >= $cutoff) AS avg_conf
+  FROM signals WHERE created_at >= $cutoff
+  GROUP BY signal_type
+  ```
+  Where `$cutoff24h = new Date(Date.now() - 86400000)` (computed, not interpolated)
+- Query 2 (whale stats last 24h): COUNT, AVG, MAX of `usdc_value`
+- Query 3 (largest whale last 24h): top 1 by `usdc_value`
+- Render function: formats box table to stdout
+- Refresh loop: `setInterval(render, config.dashboardRefreshMs)` when NOT `--once`
+  - Clear terminal: `process.stdout.write('\x1b[2J\x1b[H')`
+- `--once`: call `render()` once, `closeDb()`, `process.exit(0)`
 
-**Task 8.7 — `src/backtest/runner.test.ts`**
-- Correct SQL query issued (signal fetch with date range)
-- `LEFT JOIN markets` for resolution lookup
-- Correct call to `BacktestEvaluator.evaluate()`
-- Zero signals returned gracefully
+**Task 6.3 — `src/analytics/heat-map.ts`**
+- Argv parsing: `--hours N` (default 24)
+- Validate: positive integer, 1–168 (7 days max)
+- Compute cutoff: `new Date(Date.now() - hours * 3600 * 1000)` — bound param
+- Query:
+  ```sql
+  SELECT s.token_id, m.question, m.slug,
+         COUNT(*)::int AS signal_count,
+         COUNT(*) FILTER (WHERE s.signal_type = 'WHALE_TRADE')::int AS whale_count,
+         MAX(s.confidence) AS max_conf
+  FROM signals s
+  LEFT JOIN markets m ON s.token_id = m.token_id
+  WHERE s.created_at >= $cutoff
+  GROUP BY s.token_id, m.question, m.slug
+  ORDER BY signal_count DESC
+  LIMIT 20
+  ```
+- Bar: `"█".repeat(Math.round((count / maxCount) * 8)).padEnd(8, "░")`
+- Render and exit (`--once` implicit — heatmap is always a single snapshot)
 
-**Task 8.8 — `src/config.test.ts` additions**
-- Each of the 7 new Phase 3 vars reads its env var
-- Each falls back to the correct default when env var unset
-- Removed Phase 1 vars no longer appear on `config`
+**Task 6.4 — Update `package.json` scripts**
+```json
+"leaderboard": "tsc && node dist/analytics/leaderboard.js",
+"dashboard": "tsc && node dist/analytics/signal-dashboard.js",
+"heatmap": "tsc && node dist/analytics/heat-map.js"
+```
+
+**Task 6.5 — Create `analytics-results/.gitkeep`**
+- Empty file; add `analytics-results/*.json` to `.gitignore`
+
+---
+
+### Chunk 7 — Tests (Phase 4)
+
+All tests in `src/neg-risk/` colocated with source. All mock DB and HTTP.
+
+**Task 7.1 — `src/neg-risk/group-resolver.test.ts`** (≥ 7 tests)
+1. Valid group (3 tokens, sizes all ≥ 10): `sumBid=0.95`, `sumAsk=1.05` → `isValid=true`
+2. Invalid group — sumBid > 1.05: tokens with overlapping high bids → `isValid=false`
+3. Invalid group — sumAsk > 1.20: `isValid=false` (LAW-MINOR-3 upper bound)
+4. Invalid group — single token: `isValid=false`
+5. Groups by conditionId: 2 conditionIds → 2 separate groups returned
+6. Empty book for one token: defaults to `bestBid=0, bestAsk=1.0`
+7. Dust quote filter: ask at top of book but `size < 10` → walk ladder; if no tradeable ask → `bestAsk=1.0`
+8. Valid group exactly at bounds: `sumAsk=1.20` → `isValid=true`; `sumAsk=1.21` → `isValid=false`
+
+**Task 7.2 — `src/neg-risk/arb-detector.test.ts`** (≥ 9 tests)
+1. ARB signal fires: 3 tokens, `sumAsk=0.90` → `arbSpread=-0.10 < -0.02` → signal emitted
+2. ARB signal NOT fired: `sumAsk=0.99` → `arbSpread=-0.01 >= -0.02` → `[]`
+3. OUTLIER signal fires (BULLISH): mock 24h history, token underpriced by 4σ → `NEG_RISK_OUTLIER, BULLISH`
+4. OUTLIER signal fires (BEARISH): token overpriced by 4σ → `NEG_RISK_OUTLIER, BEARISH`
+5. Cooldown suppresses second evaluate() within `cooldownMs` for same conditionId
+6. Invalid group (`isValid=false`): `return []` immediately
+7. Price history < 5 points: outlier check skipped, only ARB can fire
+8. stddev = 0: outlier skipped (division guard)
+9. Confidence scaling: `arbSpread=-0.10` → `min(1.0, 0.10/0.05) = 1.0`; deviation=3.5 → `min(1.0, 3.5/5.0)=0.70`
+10. Both ARB + OUTLIER can fire in same evaluate() call (two signals in array)
+
+**Task 7.3 — `src/neg-risk/neg-risk-engine.test.ts`** (≥ 6 tests)
+1. `handleBookUpdate` re-evaluates correct group (conditionId A re-evaluated; B unchanged)
+2. `handleBookUpdate` silently returns when group not yet cached (startup race guard)
+3. Alert emitted to console.log on arb detection (spy on emitAlert)
+4. WebhookEmitter called with purple embed color `0x9B59B6` on signal
+5. `start()` runs immediate `refresh()` (detector.evaluate called after start)
+6. `stop()` clears the interval (refresh not called after stop + delay)
+7. `addTokenIds()` triggers debounced refresh (new tokens appear in negRiskTokenIds set)
+
+---
+
+### Chunk 8 — Tests (Phase 5)
+
+All tests in `src/analytics/` colocated with source. All mock DB.
+
+**Task 8.1 — `src/analytics/leaderboard.test.ts`** (≥ 5 tests)
+1. Correct ranking: wallet A (win_ratio=0.718) ranks above wallet B (win_ratio=0.701)
+2. min-trades filter: wallet with `trade_count=3` excluded when `--min-trades=5`
+3. min-volume filter: wallet with `total_volume_usdc=5000` excluded when `--min-volume=10000`
+4. JSON output shape: result has `proxyWallet`, `totalVolumeUsdc`, `winRatio`, `whaleTrades` fields
+5. `--json` flag: JSON goes to stdout (mocked stdout)
+6. Arg validation: `--min-trades=abc` → process.exit(1) before DB call
+
+**Task 8.2 — `src/analytics/signal-dashboard.test.ts`** (≥ 4 tests)
+1. Correct 24h and 7d counts per signal type (mock signals at different timestamps)
+2. Largest whale displays correctly (highest `usdc_value` in 24h window)
+3. `--once` flag: `render()` called exactly once, no setInterval, process exits
+4. `--days=3`: cutoff computed correctly (Date.now() - 3 * 86400000), passed as bound param
+
+**Task 8.3 — `src/analytics/heat-map.test.ts`** (≥ 4 tests)
+1. Correct ranking: market with 23 signals ranks above market with 14
+2. Bar length: max-count market gets 8 `█` chars; half-count market gets 4
+3. `--hours=12`: signals older than 12h excluded from count
+4. Arg validation: `--hours=0` → process.exit(1)
+
+---
+
+### Chunk 9 — Documentation
+
+**Task 9.1 — Update `CLAUDE.md`**
+- Add Phase 4+5 status block (target test count, coverage)
+- Add `src/neg-risk/` and `src/analytics/` to project structure
+- Add `NegRiskEngine`, `GroupResolver`, `ArbDetector` to Key Components
+- Add `pnpm leaderboard`, `pnpm dashboard`, `pnpm heatmap` to How to Run
+- Add 6 new env vars to Environment Variables table
+- Update "Not yet built" section: remove Phase 4 entry
+
+**Task 9.2 — Update `README.md`**
+- Architecture diagram: add NegRiskEngine path
+- Phase 4+5 feature descriptions
+- Config table additions
 
 ---
 
 ## Execution Order
 
 ```
-Chunk 1 (1.1 → 1.4)   ← foundation, no deps
+Chunk 1 (1.1 → 1.2)   ← types + config, no deps
+Chunk 2 (2.1 → 2.3)   ← DB query extensions (concurrent with Chunk 1)
     ↓
-Chunk 2 (2.1 → 2.2)   ← PriceImpactEvaluator (no DB dep)
-Chunk 3 (3.1 → 3.2)   ← VelocityEvaluator (concurrent with Chunk 2)
-Chunk 5 (5.1 → 5.4)   ← Backtest module (concurrent with Chunks 2+3)
+Chunk 3 (3.1 → 3.4)   ← neg-risk module (depends on Chunk 1 types + Chunk 2 queries)
     ↓
-Chunk 4 (4.1 → 4.2)   ← SignalAggregator composite (depends on Chunk 1; safe to do after 2+3)
+Chunk 4 (4.1 → 4.3)   ← pipeline changes (depends on Chunk 3)
+Chunk 5 (5.1)          ← WebhookEmitter extension (depends on Chunk 1 types; concurrent with Chunk 4)
+Chunk 6 (6.1 → 6.5)   ← analytics CLIs (depends on Chunk 1 config; concurrent with Chunk 4)
     ↓
-Chunk 6 (6.1)          ← Pipeline wiring (depends on 2, 3, 4 complete)
-Chunk 7 (7.1 → 7.2)   ← Package updates (no deps; can do anytime)
+Chunk 7 (7.1 → 7.3)   ← Phase 4 tests (depends on Chunks 3+4+5)
+Chunk 8 (8.1 → 8.3)   ← Phase 5 tests (depends on Chunk 6)
     ↓
-Chunk 8 (8.1 → 8.8)   ← All tests (some overlap with their chunks above)
-    ↓
-Chunk 9 (docs + commit sequence)
+Chunk 9 (9.1 → 9.2)   ← docs
+```
+
+Commit strategy (per spec):
+```
+feat: Phase 4 type system (NEG_RISK_ARB, NEG_RISK_OUTLIER signal types + config)
+feat: Phase 4 neg-risk group-resolver + arb-detector
+feat: Phase 4 neg-risk-engine + pipeline integration
+feat: Phase 5 analytics CLIs (leaderboard, dashboard, heatmap)
+test: Phase 4 neg-risk tests
+test: Phase 5 analytics tests
+chore: update docs for Phase 4+5
 ```
 
 ---
 
-### Chunk 9 — Docs + Commit Strategy
-
-**Task 9.1 — Update `CLAUDE.md`**
-- Update test count, coverage percentages once Phase 3 is complete
-- Add Phase 3 component summary (PriceImpactSignalEvaluator, SentimentVelocityEvaluator, backtest module)
-
-**Task 9.2 — Commit sequence on `feat/phase-3`**
-```
-feat: add Phase 3 config vars and price-history query helpers
-feat: implement PriceImpactSignalEvaluator (v2 — in-memory, no hot-path DB reads)
-feat: implement SentimentVelocityEvaluator (v2 — rolling buffers, warm-up suppression)
-feat: add composite confidence scoring to SignalAggregator (insert-then-update)
-feat: add backtesting module (runner, evaluator, report, types)
-feat: wire Phase 3 evaluators into pipeline
-chore: update docs for Phase 3
-```
-
-**Task 9.3 — Push + open PR to `main`**
-
----
-
-## Risks & Mitigations (Final)
+## Risks & Mitigations (Final, post-Law review)
 
 | Risk | Mitigation |
 |---|---|
-| Price impact evaluation on cold start (no prior price) | `priceBeforeTrade === null` guard — returns `null` silently |
-| Velocity evaluator cold-restart false positives | Warm-up suppression + bootstrap from `trades` table |
-| Composite scoring patches fail (DB error) | `updateSignalPayloads` errors are caught and logged; signal already inserted — no data loss |
-| Backtest bulk read OOM on large windows | Acceptable for Phase 3; note for Phase 4 streaming |
-| `tsc && node dist/...` backtest script requires successful compile | CI will catch build failures; local dev: run `pnpm build` first |
-| Snapshot not available at trade time (new token) | `snapshot === null` guard — returns `null` silently |
-| `priceBuckets` / `velocityTimer` removal breaking existing tests | Check for any test that imports these pipeline internals before deleting |
-| Removing legacy config vars breaking existing tests | Audit `config.priceImpactWindowSec`, `config.priceImpactMinChangePct`, `config.velocityZScoreThreshold` usage before deletion |
+| Neg-risk trade persistence accidentally skipped | Early-return placed AFTER `tradeBatch.push(trade)` — persistence always runs (LAW-MAJOR-1) |
+| Outlier fires BULLISH for overpriced token | Directional `underpricedDev` / `overpricedDev` split — correct direction per token (LAW-MAJOR-2) |
+| Dust quotes trigger false arb signals | Walk ask/bid ladder for first level with `size ≥ MIN_NEG_RISK_SIZE` (10.0) (LAW-MAJOR-3) |
+| New neg-risk markets silently missed post-startup | `addTokenIds()` wired to `markets_updated` event; debounced refresh + `clobWsPool.addTokenIds()` (LAW-MAJOR-4) |
+| SQL interval interpolation — injection / type error | All CLIs compute JS `Date` cutoff, validate args as finite positive integers, pass as bound params (LAW-MAJOR-5) |
+| `sumAsk > 1.20` (egregiously broken book) accepted as valid | Upper bound `sumAsk <= 1.20` in validity check (LAW-MINOR-3) |
+| `handleBookUpdate` throws on missing group (startup race) | Guard: if group not in cache → log debug + return (LAW-MINOR-4) |
+| Leaderboard join on whale_alerts impractical | Use `wallet_profiles` only (enriched by WalletEnricher) — documented in output and README (LAW-MINOR-5) |
+| WebhookEmitter falls back to JSON for neg-risk signals | Explicit `buildDiscordNegRiskEmbed` / `buildSlackNegRiskPayload` added (LAW-NIT-1) |
+| `ZSignalType` in signals.ts rejects new types | `SIGNAL_TYPES` in types.ts updated → `ZSignalType` auto-extends (Task 1.1) |
+| SignalAggregator rejects neg-risk types from bus | NegRiskEngine bypasses bus/aggregator entirely — inserts directly (LAW-MINOR-2) |
+| Pipeline misses neg-risk tokens in ClobWsPool | `getAllWatchlistedTokenIds()` returns all watchlisted including neg-risk (Task 2.2) |
+
+---
+
+## TODO (implementation checklist for Zoro)
+
+### Chunk 1 — Foundation
+- [ ] Task 1.1 — extend `src/events/types.ts` (NegRiskSignal, 6-way union, SIGNAL_TYPES, PipelineConfig)
+- [ ] Task 1.2 — extend `src/config.ts` + `.env.example` (6 new vars)
+
+### Chunk 2 — DB Queries
+- [ ] Task 2.1 — `getNegRiskMarketsByCondition()` in `src/db/queries/markets.ts`
+- [ ] Task 2.2 — `getAllWatchlistedTokenIds()` in `src/db/queries/markets.ts`
+- [ ] Task 2.3 — `getTokenPriceHistory24h()` in `src/db/queries/price-history.ts`
+
+### Chunk 3 — Neg-Risk Module
+- [ ] Task 3.1 — `src/neg-risk/group-resolver.ts` (size-aware, bounded validity)
+- [ ] Task 3.2 — `src/neg-risk/arb-detector.ts` (directional outlier, shared cooldown)
+- [ ] Task 3.3 — `src/neg-risk/neg-risk-engine.ts` (addTokenIds, debounce, startup guard)
+- [ ] Task 3.4 — `src/neg-risk/index.ts` (barrel)
+
+### Chunk 4 — Pipeline Integration
+- [ ] Task 4.1 — `src/sources/gamma-poller.ts` (neg-risk watchlisted=true, negRiskSet maintained)
+- [ ] Task 4.2 — `src/sources/live-data-ws-client.ts` (remove neg-risk filter)
+- [ ] Task 4.3 — `src/pipeline.ts` (tradeHandler guards, NegRiskEngine wiring, markets_updated)
+
+### Chunk 5 — WebhookEmitter
+- [ ] Task 5.1 — `src/alerts/webhook-emitter.ts` (purple neg-risk embeds)
+
+### Chunk 6 — Analytics CLIs
+- [ ] Task 6.1 — `src/analytics/leaderboard.ts` (wallet_profiles only, bound params, --json)
+- [ ] Task 6.2 — `src/analytics/signal-dashboard.ts` (cutoff as bound Date param, --once)
+- [ ] Task 6.3 — `src/analytics/heat-map.ts` (bar proportional, cutoff as bound Date param)
+- [ ] Task 6.4 — `package.json` scripts (tsc && node dist/... pattern)
+- [ ] Task 6.5 — `analytics-results/.gitkeep`
+
+### Chunk 7 — Phase 4 Tests
+- [ ] Task 7.1 — `src/neg-risk/group-resolver.test.ts` (≥8 tests incl. dust/bounds)
+- [ ] Task 7.2 — `src/neg-risk/arb-detector.test.ts` (≥10 tests incl. directional outlier)
+- [ ] Task 7.3 — `src/neg-risk/neg-risk-engine.test.ts` (≥7 tests incl. startup race + addTokenIds)
+
+### Chunk 8 — Phase 5 Tests
+- [ ] Task 8.1 — `src/analytics/leaderboard.test.ts` (≥6 tests incl. arg validation)
+- [ ] Task 8.2 — `src/analytics/signal-dashboard.test.ts` (≥4 tests incl. bound param cutoff)
+- [ ] Task 8.3 — `src/analytics/heat-map.test.ts` (≥4 tests incl. arg validation)
+
+### Chunk 9 — Docs
+- [ ] Task 9.1 — `CLAUDE.md`
+- [ ] Task 9.2 — `README.md`

@@ -83,7 +83,8 @@ export class GammaPoller extends EventEmitter {
       const m = parsed.data;
       const tokenIds = m.clobTokenIds ?? [];
       const isNegRisk = m.negRisk ?? false;
-      const watchlisted = !isNegRisk;
+      // Phase 4: neg-risk markets are now watchlisted=true (NegRiskEngine handles them)
+      const watchlisted = true;
 
       for (let i = 0; i < tokenIds.length; i++) {
         const tokenId = tokenIds[i];
@@ -98,20 +99,22 @@ export class GammaPoller extends EventEmitter {
           question: m.question ?? "",
         });
 
+        // All tokens go into watchlistSet; neg-risk tokens also go into negRiskSet
+        this.watchlistSet.add(tokenId);
         if (isNegRisk) {
           this.negRiskSet.add(tokenId);
           newNegRiskIds.push(tokenId);
         } else {
-          this.watchlistSet.add(tokenId);
           newTokenIds.push(tokenId);
+        }
 
-          // Bootstrap stats for newly added tokens
-          if (!wasWatchlisted) {
-            newlyWatchlisted.push(tokenId);
-            bootstrapMarketStats(db, tokenId, m.conditionId).catch((err) =>
-              logger.error({ err, tokenId }, "GammaPoller: stats bootstrap failed")
-            );
-          }
+        // Bootstrap stats for newly added non-neg-risk tokens only
+        // (neg-risk tokens use the cross-book model, not per-token stats)
+        if (!isNegRisk && !wasWatchlisted) {
+          newlyWatchlisted.push(tokenId);
+          bootstrapMarketStats(db, tokenId, m.conditionId).catch((err) =>
+            logger.error({ err, tokenId }, "GammaPoller: stats bootstrap failed")
+          );
         }
 
         // Upsert market stats from Gamma data

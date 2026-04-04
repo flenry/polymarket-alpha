@@ -41,6 +41,14 @@ export const config = Object.freeze({
   velocityTradeCountMultiplier: envNumber("VELOCITY_TRADE_COUNT_MULTIPLIER", 1.5),
   velocityCooldownMs: envNumber("VELOCITY_COOLDOWN_MS", 120_000),
   compositeWindowMs: envNumber("COMPOSITE_WINDOW_MS", 60_000),
+  // Phase 4 — Neg-Risk Cross-Book Pricing
+  negRiskRefreshIntervalMs: envNumber("NEG_RISK_REFRESH_INTERVAL_MS", 120_000),
+  negRiskArbThreshold: envNumber("NEG_RISK_ARB_THRESHOLD", -0.02),
+  negRiskCooldownMs: envNumber("NEG_RISK_COOLDOWN_MS", 60_000),
+  // Phase 5 — Analytics & Observability
+  dashboardRefreshMs: envNumber("DASHBOARD_REFRESH_MS", 30_000),
+  leaderboardMinTrades: envNumber("LEADERBOARD_MIN_TRADES", 5),
+  leaderboardTopN: envNumber("LEADERBOARD_TOP_N", 20),
   logLevel: process.env.LOG_LEVEL ?? "info",
 });
 

@@ -55,7 +55,7 @@ describe("GammaPoller", () => {
     db = makeDb();
   });
 
-  it("neg_risk market stored with watchlisted=false", async () => {
+  it("neg_risk market stored with watchlisted=true (Phase 4: NegRiskEngine handles them)", async () => {
     const poller = new GammaPoller({
       db,
       pollIntervalMs: 60000,
@@ -66,16 +66,8 @@ describe("GammaPoller", () => {
     await poller.start();
     poller.stop();
 
-    // Check that upsertMarket was called with watchlisted=false for neg_risk token
-    const insertCalls = (db.insert as ReturnType<typeof vi.fn>).mock.calls;
-    expect(insertCalls.length).toBeGreaterThan(0);
-
-    // Find the call for markets table
-    const marketCall = insertCalls.find(() => true);
-    expect(marketCall).toBeDefined();
-
-    // The neg risk token should NOT be in watchlist
-    expect(poller.getWatchlist()).not.toContain("tok-neg");
+    // Phase 4: neg-risk tokens are watchlisted=true so ClobWsPool subscribes to them
+    expect(poller.getWatchlist()).toContain("tok-neg");
     expect(poller.getNegRiskIds()).toContain("tok-neg");
   });
 

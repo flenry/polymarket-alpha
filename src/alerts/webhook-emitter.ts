@@ -1,4 +1,4 @@
-import type { WhaleAlert, ImbalanceSignal, Signal } from "../events/types.js";
+import type { WhaleAlert, ImbalanceSignal, Signal, NegRiskSignal } from "../events/types.js";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
 
@@ -10,6 +10,12 @@ function isWhaleAlert(p: Payload): p is WhaleAlert {
 
 function isImbalanceSignal(p: Payload): p is ImbalanceSignal {
   return !isWhaleAlert(p) && (p as Signal).signalType === "ORDER_BOOK_IMBALANCE";
+}
+
+function isNegRiskSignal(p: Payload): p is NegRiskSignal {
+  return !isWhaleAlert(p) &&
+    ((p as Signal).signalType === "NEG_RISK_ARB" ||
+     (p as Signal).signalType === "NEG_RISK_OUTLIER");
 }
 
 function truncateWallet(wallet: string, len = 12): string {
@@ -138,6 +144,41 @@ function buildSlackImbalancePayload(signal: ImbalanceSignal): object {
   return { blocks: [{ type: "section", text: { type: "mrkdwn", text } }] };
 }
 
+function buildDiscordNegRiskEmbed(signal: NegRiskSignal): object {
+  const isArb = signal.signalType === "NEG_RISK_ARB";
+  const deviationField = signal.arbSpread != null
+    ? { name: "Arb Spread", value: signal.arbSpread.toFixed(4), inline: true }
+    : { name: "Price Deviation", value: `${(signal.priceDeviation ?? 0).toFixed(2)}\u03c3`, inline: true };
+  return {
+    embeds: [{
+      title: isArb ? "\u2697\ufe0f Neg-Risk Arb Detected" : "\ud83d\udcca Neg-Risk Outlier Detected",
+      description: `Condition: ${signal.conditionIdGroup}`,
+      color: 0x9B59B6,
+      fields: [
+        { name: "Direction", value: signal.direction, inline: true },
+        { name: "Confidence", value: signal.confidence.toFixed(2), inline: true },
+        { name: "Group Size", value: String(signal.negRiskGroupSize), inline: true },
+        { name: "Sum Ask", value: signal.negRiskSumAsk.toFixed(4), inline: true },
+        deviationField,
+      ],
+      timestamp: new Date().toISOString(),
+    }],
+  };
+}
+
+function buildSlackNegRiskPayload(signal: NegRiskSignal): object {
+  const isArb = signal.signalType === "NEG_RISK_ARB";
+  const devStr = signal.arbSpread != null
+    ? `Arb Spread: ${signal.arbSpread.toFixed(4)}`
+    : `Deviation: ${(signal.priceDeviation ?? 0).toFixed(2)}\u03c3`;
+  const text =
+    `*${isArb ? "\u2697\ufe0f Neg-Risk Arb" : "\ud83d\udcca Neg-Risk Outlier"}*\n` +
+    `Condition: ${signal.conditionIdGroup}\n` +
+    `Direction: ${signal.direction}  |  Confidence: ${signal.confidence.toFixed(2)}\n` +
+    `Group Size: ${signal.negRiskGroupSize}  |  Sum Ask: ${signal.negRiskSumAsk.toFixed(4)}  |  ${devStr}`;
+  return { blocks: [{ type: "section", text: { type: "mrkdwn", text } }] };
+}
+
 // ── WebhookEmitter ────────────────────────────────────────────────────────────
 
 export class WebhookEmitter {
@@ -169,12 +210,14 @@ export class WebhookEmitter {
   private buildDiscordPayload(p: Payload): object {
     if (isWhaleAlert(p)) return buildDiscordWhaleEmbed(p);
     if (isImbalanceSignal(p)) return buildDiscordImbalanceEmbed(p);
+    if (isNegRiskSignal(p)) return buildDiscordNegRiskEmbed(p);
     return { embeds: [{ title: "Signal", description: JSON.stringify(p), color: 0x888888 }] };
   }
 
   private buildSlackPayload(p: Payload): object {
     if (isWhaleAlert(p)) return buildSlackWhalePayload(p);
     if (isImbalanceSignal(p)) return buildSlackImbalancePayload(p);
+    if (isNegRiskSignal(p)) return buildSlackNegRiskPayload(p);
     return {
       blocks: [{ type: "section", text: { type: "mrkdwn", text: JSON.stringify(p) } }],
     };
