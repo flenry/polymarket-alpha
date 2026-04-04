@@ -16,6 +16,9 @@ Real-time Polymarket data pipeline. Ingests trade events and order book data, pe
 **Phase 6 (Dashboard) is complete and fully tested.** 480 pipeline tests + 108 dashboard tests = 588 total. Branch: `feat/dashboard`.
 **E2E tests added.** 49 Playwright E2E tests covering all 5 pages. Branch: `feat/dashboard-e2e`.
 **Seed script added.** `pnpm seed` backfills the DB with real Polymarket data. 541 pipeline+seeder tests passing. Branch: `cr/20260404-seed-backfill`.
+**Dashboard refactored (tabs + auto-sync).** `serve-dashboard.ts` now has tab navigation and background market sync. 542 tests passing. Branch: `cr/20260404-dashboard-tabs-autosync`.
+**Dashboard tabs + auto-sync verified.** Stale server process (old pre-tabs version) killed and restarted with updated source. All API enrichment confirmed working: whale alerts show `marketQuestion` + full `wallet`, recent trades show `marketQuestion` + full `proxyWallet`. 542 tests passing. Branch: `cr/20260404-dashboard-tabs-autosync`.
+**CR hygiene fixes applied.** Fixed 5 TypeScript errors (`sync-markets.ts` events interface, `seed.ts` raw-SQL inserts for partitioned tables). Deleted 3 junk debug scripts (`debug-insert.ts`, `test-insert.ts`, `recreate-alerts.ts`). Added `pnpm serve-dashboard` script to `package.json`. Added `.pi/`, `apps/dashboard/.env.local`, `apps/dashboard/test-results/` to `.gitignore` and removed from git tracking. `pnpm typecheck` now clean (0 errors). Branch: `cr/20260404-dashboard-tabs-autosync`.
 
 ---
 
@@ -208,6 +211,19 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 - ✅ `pnpm-workspace.yaml` monorepo setup; `pnpm dashboard:dev` / `pnpm dashboard:build` from root
 - ✅ Existing 480 pipeline tests unaffected (0 regressions)
 
+**`serve-dashboard.ts` refactored — tab navigation + auto-sync (branch: `cr/20260404-dashboard-tabs-autosync`).**
+- ✅ 542 pipeline tests passing (46 test files, +1 over seed script)
+- ✅ Tab-based UI: Markets | Whale Alerts | Trades | Wallets (CSS show/hide, no extra requests)
+- ✅ Summary cards stay above tabs; 10s client-side auto-refresh unchanged
+- ✅ Background market sync inlined from `sync-markets.ts` — fires on startup, then every 5 min
+- ✅ Reuses module-level `pool`/`db` — no second connection pool
+- ✅ `/api/sync-status` endpoint: `{ lastSyncAt, syncInProgress, syncErrorCount }`
+- ✅ Top-bar sync status indicator: green dot (live), pulsing yellow (syncing), red (error + retry count)
+- ✅ Client polls `/api/sync-status` every 5s independently
+- ✅ Full wallet addresses in Wallets tab (no truncation)
+- ✅ `/api/summary` alerts enriched with `marketQuestion`, `marketOutcome`, `wallet` (full address from `tradeLookupKey`)
+- ✅ `/api/recent-trades` trades enriched with `marketQuestion`, `marketOutcome`; `proxyWallet` is full address (no truncation)
+
 ### Two separate imbalance evaluators — distinct trigger paths
 
 | Evaluator | Path | File | Cooldown | Confidence formula |
@@ -252,7 +268,11 @@ pnpm dashboard --days=3 --once
 pnpm heatmap                  # market heat map (last 24h)
 pnpm heatmap --hours=48
 
-# Dashboard
+# Script dashboard (lightweight, single-file HTTP server on port 3456)
+pnpm serve-dashboard          # or: npx ts-node src/scripts/serve-dashboard.ts
+# Serves tab UI (Markets | Whale Alerts | Trades | Wallets) + background market sync every 5 min
+
+# Next.js App Router dashboard
 pnpm dashboard:dev            # start Next.js dev server at http://localhost:3000
 pnpm dashboard:build          # production build
 ```
@@ -265,8 +285,8 @@ docker compose up -d
 ## How to Test
 
 ```bash
-pnpm test              # unit tests (all 480, 44 test files) — pipeline only
-cd apps/dashboard && pnpm test  # dashboard tests (84 tests, 8 test files)
+pnpm test              # unit tests (all 542, 46 test files) — pipeline only
+cd apps/dashboard && pnpm test  # dashboard tests (108 tests, 8 test files)
 pnpm test:coverage     # with v8 coverage report
 pnpm typecheck         # tsc --noEmit
 pnpm db:generate       # generate drizzle migrations (idempotent after init)
@@ -312,4 +332,4 @@ pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql direct
 
 ---
 
-Last updated: 2026-04-04 (E2E — 480 pipeline + 108 dashboard unit + 49 Playwright E2E = 637 total)
+Last updated: 2026-04-04 (CR hygiene — 0 TS errors, deleted 3 junk debug scripts, added pnpm serve-dashboard, gitignore .pi/ + dashboard env/test-results, 542 tests passing)
