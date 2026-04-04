@@ -15,7 +15,8 @@
     "db:migrate": "drizzle-kit migrate",
     "db:migrate:partitions": "psql $DATABASE_URL -f drizzle/0002_partition_trades.sql",
     "typecheck": "tsc --noEmit",
-    "typecheck:all": "tsc -p tsconfig.test.json"
+    "typecheck:all": "tsc -p tsconfig.test.json",
+    "backtest": "tsc && node dist/backtest/runner.js"
   },
   "dependencies": {
     "drizzle-orm": "^0.40.0",
