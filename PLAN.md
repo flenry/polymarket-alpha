@@ -1,10 +1,14 @@
 # Plan: Phase 3 — Signal Intelligence & Backtesting
 
-> **Board-reviewed** — Robin's research brief for the full Phase 3 build.
+> **Board-reviewed & Law-approved** — synthesised from Robin's research brief, Vegapunk's architecture
+> review, and Law's critique. All MAJOR and MINOR findings addressed inline.
 > Zoro implements. Usopp tests. Law approves architecture decisions.
 
 ## Goal
-Deliver two new signal evaluators (`PriceImpactSignal` v2, `SentimentVelocitySignal` v2 — fully replacing the Phase 1 stubs), composite confidence scoring in `SignalAggregator`, a four-file backtesting module (`src/backtest/`), pipeline wiring for all new components, and ≥ 95% test coverage across all new code, with all existing 357 tests continuing to pass.
+Deliver two new signal evaluators (`PriceImpactSignalEvaluator` v2, `SentimentVelocityEvaluator` v2 —
+fully replacing the Phase 1 stubs), composite confidence scoring in `SignalAggregator`, a four-file
+backtesting module (`src/backtest/`), pipeline wiring for all new components, and ≥ 95% test coverage
+across all new code, with all existing 357 tests continuing to pass.
 
 ## Branch
 `feat/phase-3` (created from `main` at 58ed40d)
@@ -30,102 +34,223 @@ Deliver two new signal evaluators (`PriceImpactSignal` v2, `SentimentVelocitySig
 | `src/signals/price-impact-signal.ts` | Full rewrite — replace Phase 1 stub with Phase 3 algorithm |
 | `src/signals/velocity-signal.ts` | Full rewrite — replace Phase 1 stub with Phase 3 algorithm |
 | `src/processors/signal-aggregator.ts` | Add composite confidence scoring (in-memory map + enriched payload) |
-| `src/pipeline.ts` | Wire PriceImpactSignal v2 + SentimentVelocitySignal v2 |
-| `src/config.ts` | Add 7 Phase 3 env vars |
+| `src/pipeline.ts` | Wire PriceImpactSignalEvaluator v2 + SentimentVelocityEvaluator v2 |
+| `src/config.ts` | Add 7 Phase 3 env vars; remove legacy Phase 1 vars superseded by Phase 3 |
 | `.env.example` | Add Phase 3 env vars |
 | `package.json` | Add `backtest` script |
+| `src/events/types.ts` | Update `VelocitySignal` type (rename `velocityZScore` → `tradeCountVelocity`, remove Phase 1 fields) |
 
 ### What is NEW (create from scratch)
+- `src/db/queries/price-history.ts`
 - `src/backtest/types.ts`
 - `src/backtest/runner.ts`
 - `src/backtest/evaluator.ts`
 - `src/backtest/report.ts`
-- `src/signals/price-impact-signal.test.ts` — **replace** existing tests (spec algorithm change)
-- `src/signals/velocity-signal.test.ts` — **replace** existing tests (spec algorithm change)
+- `backtest-results/.gitkeep`
+- `src/db/queries/price-history.test.ts`
+- `src/signals/price-impact-signal.test.ts` — **replace** Phase 1 stub tests
+- `src/signals/velocity-signal.test.ts` — **replace** Phase 1 stub tests
 - `src/processors/signal-aggregator.test.ts` — extend (composite scoring additions only)
-- `src/backtest/runner.test.ts`
 - `src/backtest/evaluator.test.ts`
 - `src/backtest/report.test.ts`
+- `src/backtest/runner.test.ts`
 
 ---
 
-## Critical Architecture Decisions
+## Board Findings Resolved
 
-### Decision 1: Signal algorithm replacement, not incremental change
+### [LAW-MAJOR-1] Composite scoring — insert-then-update design selected
 
-The Phase 1 stubs (`evaluatePriceImpact`, `evaluateVelocity`) have **different algorithms** from the Phase 3 spec:
+**Finding:** `SignalAggregator.handleSignal()` sees one signal at a time; prior signals are
+already committed to the DB when a corroborating signal arrives. The original plan required
+enriching "each participating signal" — which is impossible with an insert-only path.
 
-| Property | Phase 1 stub | Phase 3 spec |
-|---|---|---|
-| `evaluatePriceImpact` trigger | Price % change window | `actualImpact / expectedImpact > threshold` (anomaly score) |
-| `evaluatePriceImpact` inputs | `priceHistory[]` + `liquidityUsdc` | `TradeEvent` + `order_book_snapshots` + `price_history` (DB) |
-| `evaluateVelocity` trigger | Z-score on 5-min buckets | `\|priceVelocity\| > threshold AND tradeCountVelocity > multiplier` |
-| `evaluateVelocity` architecture | Pure function, called every 5min | Class with in-memory rolling buffer per token, event-driven |
+**Resolution — Insert-then-update design:**
 
-**Resolution:** Both files are completely replaced. The existing function signatures `evaluatePriceImpact()` and `evaluateVelocity()` are abandoned. New exports are **classes**: `PriceImpactSignalEvaluator` and `SentimentVelocityEvaluator`. The old tests are entirely replaced. `pipeline.ts` call sites are updated.
+1. `SignalAggregator` maintains `private compositeMap: Map<tokenId, CompositeWindow>` where
+   `CompositeWindow = { signals: Array<{id: bigint, type: SignalType, confidence: number, createdAt: number}>, windowStart: number }`.
+2. **On each `handleSignal()` call:**
+   a. Insert the signal into DB via `insertSignal()` → obtain `insertedId: bigint`.
+   b. Register the new signal in `compositeMap[tokenId]` with its `id` and metadata.
+   c. Purge entries older than `COMPOSITE_WINDOW_MS` from the window.
+   d. If the window now has ≥ 2 signals: compute `compositeConfidence` and PATCH the `payload`
+      jsonb column of **all signals in the window** (including the one just inserted and all prior
+      ones) via a single SQL `UPDATE signals SET payload = payload || $patch WHERE id = ANY($ids)`.
+   e. Log: `[COMPOSITE] tokenId: <score>, signals: [<types>]`.
+3. A new query helper `updateSignalPayloads(db, ids, patch)` is added to `src/db/queries/signals.ts`.
+4. The `compositeScore` field is merged into the `payload` jsonb of each participating signal row.
 
-### Decision 2: `PriceImpactSignalEvaluator` requires DB access (async)
+This means: the first signal in a window receives `compositeScore` retroactively when the second
+signal arrives; the second and subsequent signals receive it immediately. This fully satisfies the
+spec requirement that every participating signal carries the composite score.
 
-The spec requires fetching `order_book_snapshots` (max age 60s) and `price_history` (last 2 records) from the DB. This is an **async, DB-read operation** on the hot trade path.
+### [LAW-MAJOR-2] Backtest runner — `createDb()` does not exist
 
-**Resolution:**
-- `PriceImpactSignalEvaluator` is a class injected with `db`
-- `evaluate(trade: TradeEvent): Promise<PriceImpactSignal | null>` — called on `trade` events
-- DB reads: `getLatestBook(db, tokenId)` for snapshot, `getRecentPriceHistory(db, tokenId, limit=2)` for price history
-- Stale snapshot guard: `if (Date.now() - snapshot.capturedAt.getTime() > 60_000)` → skip + warn
-- Insufficient history guard: `if (priceHistory.length < 2)` → skip (no warn needed, expected at startup)
-- Requires a new query function: `getRecentPriceHistory(db, tokenId, limit)` in `src/db/queries/signals.ts` or a new file
+**Finding:** `src/db/client.ts` exports `getDb()`, `db`, and `closeDb()` only. No `createDb()`.
 
-**New query needed:** `src/db/queries/price-history.ts` — `getRecentPriceHistory(db, tokenId, limit)` using `price_history` table ordered by `recorded_at DESC LIMIT limit`.
+**Resolution:** `runner.ts` uses `getDb()` (for the DB instance) and `closeDb()` (for teardown).
+No new exports are added to `src/db/client.ts`. The plan reference to `createDb()` is removed
+everywhere.
 
-### Decision 3: `SentimentVelocityEvaluator` is a stateful class with in-memory rolling buffer
+### [LAW-MAJOR-3] Backtest runner — `tsx` not in devDependencies, no new packages allowed
 
-The spec states: "In-memory rolling buffer per token — no DB reads on hot path." This means it is **not a pure function** like the Phase 1 stub.
+**Finding:** `node --import tsx/esm src/backtest/runner.ts` requires `tsx`, which is absent
+from `package.json`. No new packages are permitted.
 
-**Resolution:**
-- `SentimentVelocityEvaluator` is a class with `private priceBuffer: Map<TokenId, PriceRecord[]>` and `private tradeBuffer: Map<TokenId, TradeRecord[]>`
-- `recordPrice(tokenId, price, timestamp)` — called from `price_change` and `last_trade_price` events
-- `recordTrade(tokenId, timestamp)` — called from `trade` events
-- `evaluate(tokenId): SentimentVelocitySignal | null` — called when needed (on `trade` event or on a timer)
-- Rolling window: only records within `VELOCITY_WINDOW_SECONDS` (default 300s) are kept
-- Prior window: same-length window immediately preceding the current window for trade count comparison
-- Bootstrap on startup: query `price_history` table to pre-populate buffers (separate `bootstrap(tokenIds)` method)
+**Resolution:** The `backtest` script compiles first then runs compiled JS:
+```json
+"backtest": "tsc && node dist/backtest/runner.js"
+```
+`runner.ts` is a standard TypeScript file under `src/`, compiled by the existing `tsc` config.
+CLI arg parsing uses `process.argv` with `process.env` variables as the stable interface — no
+third-party arg parsers.
 
-### Decision 4: Pipeline wiring replaces old call sites
+### [LAW-MAJOR-4] PriceImpactSignalEvaluator — async DB reads on the trade hot path cause timing races
 
-The old pipeline wired `evaluatePriceImpact` inside the `SnapshotWriter` callback (REST timer path) and `evaluateVelocity` inside a 5-min `setInterval`. Both are removed and replaced:
+**Finding:** `price_history` is written asynchronously by `PriceHistoryWriter`. At the moment
+a `TradeEvent` arrives, the triggering price move may not yet be committed to `price_history`.
 
-| Old wiring | New wiring |
-|---|---|
-| `evaluatePriceImpact()` called in `SnapshotWriter` callback | `priceImpactEvaluator.evaluate(trade)` called in `tradeHandler1` (or separate handler) — async |
-| `evaluateVelocity()` called in 5-min `setInterval` | `velocityEvaluator.evaluate(tokenId)` called in `tradeHandler1` (after `recordTrade`) |
+**Resolution — In-memory price state, no hot-path DB reads:**
 
-Both new evaluators write signals to the bus: `bus.emit("signal", signal)`. `SignalAggregator` handles persistence.
+`PriceImpactSignalEvaluator` does **not** read `price_history` from DB on the hot path. Instead:
 
-### Decision 5: Composite scoring is purely in-memory, no new signal type
+- It is injected with **two price values directly at call time**:
+  `evaluate(trade, priceBeforeTrade, priceNow, snapshot)`.
+- `priceBeforeTrade` = the last price recorded *before* the current trade (maintained in-memory by
+  pipeline in `recentPrices` map).
+- `priceNow` = the current trade's `priceUsdc`.
+- `snapshot` = a `SnapshotRecord | null` passed in from `snapshotWriter.getLatestBook()` (already
+  in-memory in the pipeline).
+- DB reads (snapshot and price history) are **not** performed inside `evaluate()`.
+- The evaluator remains a **pure class with no DB dependency**; it receives all data as parameters.
 
-The spec explicitly states: "Do NOT create a new signal type for composite — per PRD §10 deferral note, just enrich the payload."
+This eliminates the race entirely. `priceBeforeTrade` is captured inside `tradeHandler1` from
+`recentPrices.get(tokenId)` (last entry) **before** recording the new price; `priceNow` is
+`trade.priceUsdc`. The snapshot is obtained from `snapshotWriter.getLatestBook(tokenId)`.
 
-**Resolution:**
-- `SignalAggregator` maintains `private compositeMap: Map<TokenId, { signals: Array<{type: SignalType, confidence: number, createdAt: Date}>, windowStart: number }>`
-- On each `handleSignal()` call (before DB insert), check for co-occurring signals within `COMPOSITE_WINDOW_MS`
-- If 2+ co-occurring: compute `compositeConfidence = mean(confidences) * (1 + 0.15 * (count - 1))`, add `compositeScore` to `signal.payload`
-- Log: `[COMPOSITE] tokenId: <score>, signals: [<types>]`
-- Purge stale entries: remove entries where `windowStart < Date.now() - COMPOSITE_WINDOW_MS`
-- Window starts from the **first** signal of a group for that tokenId
+The DB query file `src/db/queries/price-history.ts` is **still created** (for the bootstrap path
+in `SentimentVelocityEvaluator` and for backtest) but is **not called** on the hot path by
+`PriceImpactSignalEvaluator`.
 
-### Decision 6: Backtest module is standalone, no pipeline dependency
+**Pipeline sequencing contract (explicit, addresses LAW-MINOR-2):**
 
-`BacktestRunner` is a CLI entry point that creates its own `db` connection. It does **not** import or instantiate `startPipeline()`.
+```
+tradeHandler1(trade):
+  1. priceBeforeTrade = recentPrices.get(trade.tokenId)?.at(-1)?.price ?? null
+  2. snapshot = snapshotWriter.getLatestBook(trade.tokenId)
+  3. recordPrice(trade.tokenId, trade.priceUsdc)          ← updates recentPrices
+  4. recordBucketPrice(trade.tokenId, trade.priceUsdc)
+  5. tradeBatch.push(trade)  + flush if full
+  6. velocityEvaluator.recordTrade(trade.tokenId, Date.now())
+  7. (fire-and-forget) priceImpactEvaluator.evaluate(trade, priceBeforeTrade, priceNow, snapshot)
+       .then(sig => { if (sig) bus.emit("signal", sig) })
+       .catch(err => logger.error(err))
+  8. velocityEvaluator.evaluate(trade.tokenId) → if signal, bus.emit("signal", signal)
+```
 
-**Resolution:**
-- `src/backtest/runner.ts` has a `main()` function that: (1) parses CLI args, (2) creates DB client via `createDb()` from `src/db/client.ts`, (3) queries `signals` + `markets` tables, (4) calls `BacktestEvaluator`, (5) calls `BacktestReport`, (6) closes DB
-- `pnpm backtest` script invokes `runner.ts` directly
-- No mocked DB in runner.ts — test with a mock DB injected via parameter
+Step 1 captures the price **before** step 3 updates it. "Evaluate" at step 7 uses `priceBeforeTrade`
+and `trade.priceUsdc` — both available synchronously. No DB read is needed or performed.
 
-### Decision 7: `getRecentPriceHistory` query placement
+### [LAW-MAJOR-5] SentimentVelocityEvaluator — cold restart distorts `tradeCountVelocity`
 
-Rather than adding to the already-complex `signals.ts` query file, add to `src/db/queries/snapshots.ts` (already handles snapshot reads) — or create a dedicated `src/db/queries/price-history.ts`. **Decision: new file `src/db/queries/price-history.ts`** to keep responsibilities clean.
+**Finding:** After restart, `tradeBuffer` starts empty. The prior-window trade count will be 0,
+causing `tradeCountVelocity = currentCount / max(0,1) = currentCount` which is always ≥ 1.5× and
+would produce false positives on startup.
+
+**Resolution — warm-up suppression + trade bootstrap:**
+
+Two complementary mitigations:
+
+1. **Bootstrap from DB:** `SentimentVelocityEvaluator.bootstrap(db, tokenIds)` queries the
+   `trades` table for timestamps within the last `2 * VELOCITY_WINDOW_SECONDS` for each token
+   and pre-populates `tradeBuffer`. Query: `SELECT traded_at FROM trades WHERE token_id = $1
+   AND traded_at >= NOW() - interval '$n seconds' ORDER BY traded_at ASC`.
+   Called once at pipeline startup, after DB is available.
+
+2. **Warm-up suppression:** A `private warmUntil: Map<TokenId, number>` records the time at
+   which both current and prior trade windows will have been fully populated in-memory.
+   - On first `recordTrade(tokenId, ts)` for a token that has **no bootstrap data**, set
+     `warmUntil[tokenId] = ts + 2 * VELOCITY_WINDOW_SECONDS * 1000`.
+   - In `evaluate(tokenId)`, return `null` if `Date.now() < warmUntil[tokenId]`.
+   - If bootstrap data is present for both windows, `warmUntil` is not set (bootstrap covers it).
+   - The price buffer already initialises from DB on bootstrap; cold price buffer is also guarded
+     by `currentPrices.length < 2` check.
+
+### [LAW-MAJOR-6] Backtest `recall` metric — definition was ambiguous and non-computable
+
+**Finding:** `recall = correct / total resolvable` is only a filtered precision metric if the
+only inputs are fired signals + resolutions. True recall requires knowing all eligible prediction
+opportunities, not just the ones the system fired on.
+
+**Resolution — rename to `resolvedHitRate`, document contract precisely:**
+
+The metric is renamed `resolvedHitRate` throughout:
+```
+resolvedHitRate = signalsWithCorrectDirection / signalsWithAnyResolution
+```
+
+Where:
+- `signalsWithAnyResolution` = fired signals (within backtest window) whose `tokenId` has a
+  resolved `markets` row (`winner IS NOT NULL`).
+- `signalsWithCorrectDirection` = subset of the above where signal direction matches the winner
+  outcome.
+
+This is a **hit rate on resolved markets** — meaningful, computable from the available data,
+and accurately named. The `BacktestMetrics` type replaces `recall` with `resolvedHitRate`.
+
+The backtest report table header is updated accordingly:
+```
+  Signal Type         Precision  HitRate  F1     Fired
+```
+F1 is computed as: `2 * precision * resolvedHitRate / (precision + resolvedHitRate)`.
+
+### [LAW-MINOR-1] Depth mapping inversion — BUY should consume ask depth, not bid depth
+
+**Finding:** A BUY order consumes resting ask-side liquidity. Using `bidDepthUsdc` for BUY
+inverts the microstructure relationship and distorts anomaly scores.
+
+**Resolution — corrected depth mapping:**
+```
+depthUsdc = side=BUY  ? snapshot.askDepthUsdc   // BUY consumes asks
+          : side=SELL ? snapshot.bidDepthUsdc    // SELL consumes bids
+```
+This is the standard market microstructure convention. The algorithm reference below reflects this
+corrected mapping. The original PRD had this backwards; the plan overrides it.
+
+### [LAW-MINOR-2] Pipeline sequencing contract
+
+Addressed under LAW-MAJOR-4. The explicit step-by-step order in `tradeHandler1` is the binding
+implementation contract.
+
+### [LAW-MINOR-3] Path typo — `events/types.ts` → `src/events/types.ts`
+
+**Resolution:** All references in this plan use `src/events/types.ts`.
+
+### [LAW-NIT-1] `velocityZScore` field name obsolete
+
+**Resolution:** `VelocitySignal` in `src/events/types.ts` is updated:
+- Remove: `velocityZScore`, `hourlyPriceChangePct`, `baselineStdDev` (Phase 1 vocabulary)
+- Add: `tradeCountVelocity: number` (the new semantic field — the ratio of current/prior window
+  trade counts, also stored as `strength` in the base signal)
+- The `payload` jsonb will carry: `priceVelocityPctPerMin`, `tradeCountVelocity`,
+  `windowSeconds`, `windowStartPrice`, `latestPrice`
+
+### [VEGAPUNK] Fire-and-forget wrapper for async evaluation
+
+**Resolution:** `priceImpactEvaluator.evaluate(...)` is invoked with:
+```typescript
+priceImpactEvaluator.evaluate(trade, priceBeforeTrade, priceNow, snapshot)
+  .then(sig => { if (sig) bus.emit("signal", sig); })
+  .catch(err => logger.error({ err }, "Pipeline: price impact eval failed"));
+```
+This prevents unhandled promise rejections while not back-pressuring WS ingestion.
+The call is placed **after** `recordPrice()` so the buffer is updated, but `priceBeforeTrade`
+is captured **before** `recordPrice()` as specified in the sequencing contract.
+
+### [VEGAPUNK] `getRecentPriceHistory` — Drizzle v0.40 API
+
+Uses `.select().from(priceHistory).where(eq(...)).orderBy(desc(...)).limit(n)` — standard Drizzle
+chained query API, compatible with `drizzle-orm ^0.40.0`.
 
 ---
 
@@ -133,101 +258,211 @@ Rather than adding to the already-complex `signals.ts` query file, add to `src/d
 
 ### PriceImpactSignalEvaluator
 
-**Inputs per trade:**
-- `TradeEvent`: `{ tokenId, side, valueUsdc, priceUsdc }`
-- DB: latest `order_book_snapshots` row for `tokenId` (max age 60s)
-- DB: 2 most recent `price_history` rows for `tokenId` (ordered by `recorded_at DESC`)
+**Signature:** `evaluate(trade: TradeEvent, priceBeforeTrade: number | null, priceNow: number, snapshot: SnapshotRecord | null): Promise<PriceImpactSignal | null>`
+
+> Note: signature is `async` only to allow future DB use in non-hot paths; the hot-path impl
+> is synchronous internally.
+
+**Inputs:**
+- `trade`: `{ tokenId, conditionId, side, valueUsdc, priceUsdc }`
+- `priceBeforeTrade`: last recorded price from `recentPrices` before this trade (may be `null` on cold start)
+- `priceNow`: `trade.priceUsdc`
+- `snapshot`: result of `snapshotWriter.getLatestBook(tokenId)` (may be `null`)
 
 **Algorithm:**
 ```
-// 1. Fetch snapshot (max 60s old)
-snapshot = getLatestBook(db, tokenId)
-if (!snapshot || Date.now() - snapshot.capturedAt > 60_000) → skip + warn
+// 1. Guard: need a snapshot
+if (!snapshot) → skip (no warn; expected on cold start)
 
-// 2. Fetch price history (need at least 2)
-history = getRecentPriceHistory(db, tokenId, 2)
-if (history.length < 2) → skip silently
+// 2. Staleness guard
+if (Date.now() - snapshot.capturedAt.getTime() > 60_000) → skip + warn
 
-// 3. Expected impact
-depthUsdc = side=BUY ? snapshot.bidDepthUsdc : snapshot.askDepthUsdc
-if (depthUsdc === 0) → skip (division guard)
+// 3. Guard: need prior price
+if (priceBeforeTrade === null || priceBeforeTrade === 0) → skip silently
+
+// 4. Depth lookup — CORRECTED (LAW-MINOR-1)
+depthUsdc = trade.side === "BUY" ? snapshot.askDepthUsdc : snapshot.bidDepthUsdc
+if (!depthUsdc || depthUsdc === 0) → skip (division guard)
+
+// 5. Expected impact
 expectedImpact = trade.valueUsdc / depthUsdc
 
-// 4. Actual impact
-priceBeforeTrade = history[1].price  (older of the two)
-priceNow = history[0].price           (newer of the two)
-actualImpact = abs(priceNow - priceBeforeTrade) / priceBeforeTrade
+// 6. Actual impact
+actualImpact = Math.abs(priceNow - priceBeforeTrade) / priceBeforeTrade
 
-// 5. Anomaly score
+// 7. Anomaly score
 score = actualImpact / expectedImpact
-if (score <= PRICE_IMPACT_ANOMALY_THRESHOLD) → no signal
+if (score <= config.priceImpactAnomalyThreshold) → null
 
-// 6. Cooldown per token
-if (Date.now() - lastEmit[tokenId] < PRICE_IMPACT_COOLDOWN_MS) → skip
+// 8. Cooldown per token
+if (Date.now() - lastEmit.get(tokenId) < config.priceImpactCooldownMs) → null
 
-// 7. Direction
-direction = side=BUY ? BULL : BEAR
-
-// 8. Confidence
+// 9. Direction, confidence, signal
+direction = trade.side === "BUY" ? "BULLISH" : "BEARISH"
 confidence = min(1.0, (score - threshold) / threshold)
 ```
 
-**Note on direction mapping:** The spec says `BUY → BULL`, `SELL → BEAR`. But the existing `SignalDirection` type uses `"BULLISH"` / `"BEARISH"` / `"NEUTRAL"`. Use `"BULLISH"` and `"BEARISH"` — the spec shorthand is informal.
-
-**Note on `order_book_snapshots` query:** The `getLatestBook()` function in `snapshots.ts` already does `ORDER BY captured_at DESC LIMIT 1`. We re-use it.
-
-**Note on `price_history` table schema:** `price_history` has columns `token_id`, `price`, `recorded_at`. The query returns rows ordered by `recorded_at DESC`.
+**Payload fields:** `{ score, expectedImpact, actualImpact, depthUsdc, valueUsdc, priceBeforeTrade, priceNow, snapshotAgeMs }`
 
 ### SentimentVelocityEvaluator
 
 **State per token:**
 ```
-priceBuffer: Array<{ price, timestamp }>  // records within [now - VELOCITY_WINDOW_SECONDS*2, now]
-tradeBuffer: Array<{ timestamp }>          // same window range (doubled for prior window)
-lastEmit: Map<tokenId, timestamp>          // cooldown
+priceBuffer: Map<TokenId, Array<{ price: number; timestamp: number }>>
+tradeBuffer: Map<TokenId, Array<{ timestamp: number }>>
+lastEmit:    Map<TokenId, number>
+warmUntil:   Map<TokenId, number>   ← warm-up suppression
 ```
 
-**Algorithm on `evaluate(tokenId)`:**
+**Algorithm on `evaluate(tokenId: TokenId): VelocitySignal | null`:**
 ```
 now = Date.now()
-windowMs = VELOCITY_WINDOW_SECONDS * 1000
+windowMs = config.velocityWindowSeconds * 1000
+
+// Warm-up guard (LAW-MAJOR-5)
+if (warmUntil.get(tokenId) > now) → null
 
 // Current window: [now - windowMs, now]
-currentPrices = priceBuffer.filter(p => p.timestamp >= now - windowMs)
+currentPrices = priceBuffer[tokenId].filter(p => p.timestamp >= now - windowMs)
 if (currentPrices.length < 2) → null
 
+windowStartPrice = currentPrices[0].price
 latestPrice = currentPrices[last].price
-windowStartPrice = currentPrices[first].price
 if (windowStartPrice === 0) → null
 
 // Price velocity: % per minute
-priceVelocity = (latestPrice - windowStartPrice) / windowStartPrice / VELOCITY_WINDOW_SECONDS * 60
+priceVelocity = (latestPrice - windowStartPrice) / windowStartPrice
+              / config.velocityWindowSeconds * 60
 
-if (|priceVelocity| <= VELOCITY_PRICE_THRESHOLD) → null
+if (|priceVelocity| <= config.velocityPriceThreshold) → null
 
 // Trade count velocity
-currentTrades = tradeBuffer.filter(t => t.timestamp >= now - windowMs)
-priorTrades = tradeBuffer.filter(t => t.timestamp >= now - 2*windowMs AND t.timestamp < now - windowMs)
-currentTradeRate = currentTrades.length
-priorTradeRate = priorTrades.length (if 0, treat as 1 to avoid div/0)
-tradeCountVelocity = currentTradeRate / max(priorTradeRate, 1)
+currentTrades = tradeBuffer[tokenId].filter(t => t.timestamp >= now - windowMs)
+priorTrades   = tradeBuffer[tokenId].filter(t => t.timestamp >= now - 2*windowMs
+                                               && t.timestamp <  now - windowMs)
+tradeCountVelocity = currentTrades.length / max(priorTrades.length, 1)
 
-if (tradeCountVelocity <= VELOCITY_TRADE_COUNT_MULTIPLIER) → null
+if (tradeCountVelocity <= config.velocityTradeCountMultiplier) → null
 
 // Cooldown
-if (Date.now() - lastEmit[tokenId] < VELOCITY_COOLDOWN_MS) → null
+if (now - lastEmit.get(tokenId) < config.velocityCooldownMs) → null
 
-// Direction
+// Direction, confidence, signal
 direction = priceVelocity > 0 ? "BULLISH" : "BEARISH"
+confidence = min(1.0, |priceVelocity| / (config.velocityPriceThreshold * 3))
+strength   = tradeCountVelocity
 
-// Confidence
-confidence = min(1.0, |priceVelocity| / (VELOCITY_PRICE_THRESHOLD * 3))
-
-// Signal
-return VelocitySignal { signalType: "SENTIMENT_VELOCITY", ... strength: tradeCountVelocity }
+payload = {
+  priceVelocityPctPerMin: priceVelocity * 100,
+  tradeCountVelocity,
+  windowSeconds: config.velocityWindowSeconds,
+  windowStartPrice,
+  latestPrice
+}
 ```
 
-**Buffer management:** On each `recordPrice()` / `recordTrade()`, prune entries older than `2 * VELOCITY_WINDOW_SECONDS * 1000` (double window needed for prior-window comparison).
+**Buffer management:** On each `recordPrice()` and `recordTrade()`, prune entries older than
+`2 * windowMs` using `.filter()` — O(n) but bounded by `2 * windowSeconds * eventsPerSecond`.
+
+**Warm-up rule (detail):**
+- `bootstrap(db, tokenIds)` is called at pipeline startup. For each tokenId, it queries
+  `trades` for the last `2 * VELOCITY_WINDOW_SECONDS` seconds and pre-populates `tradeBuffer`.
+  It also queries `price_history` and pre-populates `priceBuffer`.
+- If bootstrap returns data covering both windows for a token, `warmUntil` is not set for
+  that token (sufficient history exists).
+- If bootstrap returns no data (new token), `warmUntil[tokenId] = now + 2 * windowMs`.
+
+---
+
+## Config Reference (Phase 3 additions)
+
+Add to `src/config.ts` and `.env.example`:
+
+```
+PRICE_IMPACT_ANOMALY_THRESHOLD=2.5     → config.priceImpactAnomalyThreshold
+PRICE_IMPACT_COOLDOWN_MS=30000         → config.priceImpactCooldownMs
+VELOCITY_WINDOW_SECONDS=300            → config.velocityWindowSeconds
+VELOCITY_PRICE_THRESHOLD=0.005         → config.velocityPriceThreshold
+VELOCITY_TRADE_COUNT_MULTIPLIER=1.5    → config.velocityTradeCountMultiplier
+VELOCITY_COOLDOWN_MS=120000            → config.velocityCooldownMs
+COMPOSITE_WINDOW_MS=60000              → config.compositeWindowMs
+```
+
+Legacy Phase 1 config vars superseded by Phase 3 (remove from `config.ts`):
+- `priceImpactWindowSec` (was `PRICE_IMPACT_WINDOW_SEC`) — Phase 3 evaluator does not use a window
+- `priceImpactMinChangePct` (was `PRICE_IMPACT_MIN_CHANGE_PCT`) — replaced by anomaly threshold
+- `velocityZScoreThreshold` (was `VELOCITY_Z_SCORE_THRESHOLD`) — algorithm fully replaced
+
+> **Caution:** Before removing legacy vars, confirm they are not referenced outside `pipeline.ts`
+> and `price-impact-signal.ts`. If any test imports them from `config`, update those tests.
+
+---
+
+## Backtest Module Design
+
+### Types (`src/backtest/types.ts`)
+```typescript
+export interface BacktestConfig {
+  startDate: Date;
+  endDate: Date;
+  signalTypes?: SignalType[];
+  minConfidence?: number;
+  tokenIds?: string[];
+}
+
+export interface BacktestMetrics {
+  totalFired: number;
+  totalResolved: number;    // signals with a resolved market
+  totalCorrect: number;     // resolved signals with correct direction
+  precision: number;        // totalCorrect / totalFired
+  resolvedHitRate: number;  // totalCorrect / max(totalResolved, 1)
+  f1: number;               // harmonic mean of precision and resolvedHitRate
+  avgConfidence: number;
+}
+
+export interface BacktestResult {
+  config: BacktestConfig;
+  byType: Partial<Record<SignalType, BacktestMetrics>>;
+  overall: BacktestMetrics;
+}
+
+export interface SignalOutcome {
+  signalId: bigint;
+  signalType: SignalType;
+  direction: "BULLISH" | "BEARISH";
+  confidence: number;
+  tokenId: string;
+  createdAt: Date;
+  marketWinner: boolean | null;  // null = unresolved
+}
+```
+
+### Runner (`src/backtest/runner.ts`)
+- `BacktestRunner` class with `constructor(private db: Db)` — **no `createDb()`, uses `getDb()`**
+- `run(config: BacktestConfig): Promise<BacktestResult>`
+  1. Query `signals` joined to `markets` on `token_id`:
+     `SELECT s.*, m.winner FROM signals s LEFT JOIN markets m ON s.token_id = m.token_id
+     WHERE s.created_at BETWEEN $start AND $end [AND s.signal_type = ANY($types)]
+     [AND s.confidence >= $minConf] [AND s.token_id = ANY($tokenIds)]`
+  2. Map each row to `SignalOutcome` — resolved = `winner IS NOT NULL`
+  3. Pass to `BacktestEvaluator.evaluate(outcomes, config)`
+  4. Pass result to `BacktestReport.print(result)` + `BacktestReport.writeJson(result)`
+- `main()` function parses `process.argv`:
+  `--start YYYY-MM-DD`, `--end YYYY-MM-DD`, `--signal-types TYPE,TYPE`, `--min-confidence 0.5`
+  Uses `getDb()` and `closeDb()` from `src/db/client.ts`.
+
+### Evaluator (`src/backtest/evaluator.ts`)
+- Pure function: `evaluate(outcomes: SignalOutcome[]): BacktestResult`
+- Groups by `signalType`; computes per-type and overall `BacktestMetrics`
+- Zero-division guard: `precision = totalFired > 0 ? totalCorrect / totalFired : 0`
+- `resolvedHitRate = totalResolved > 0 ? totalCorrect / totalResolved : 0`
+- `f1 = (precision + resolvedHitRate) > 0 ? 2 * p * r / (p + r) : 0`
+
+### Report (`src/backtest/report.ts`)
+- `print(result: BacktestResult): void` — formats box table to `process.stdout`
+- `writeJson(result: BacktestResult, dir?: string): string` — writes to
+  `backtest-results/{startDate}_{endDate}.json`; returns the file path
+- Column headers in table: `Signal Type`, `Precision`, `HitRate`, `F1`, `Fired`
 
 ---
 
@@ -237,476 +472,284 @@ return VelocitySignal { signalType: "SENTIMENT_VELOCITY", ... strength: tradeCou
 - Any other Phase 1 / Phase 2 source files not listed in the edit surface
 - Deployment configuration changes
 - Backtesting UI
+- Streaming/pagination for large backtest windows (noted for Phase 4; bulk read acceptable for Phase 3)
 
 ---
 
-## Tasks
+## Tasks (Atomic, Testable, Ordered)
 
-### Chunk 1: Config + New Query Layer
+### Chunk 1 — Foundation (no other dependencies)
 
-- [x] **Task 1.1: Extend `src/config.ts`**
-  - Files: `src/config.ts`
-  - Add 7 new fields (all use `envNumber()`):
-    ```typescript
-    priceImpactAnomalyThreshold: envNumber("PRICE_IMPACT_ANOMALY_THRESHOLD", 2.5),
-    priceImpactCooldownMs: envNumber("PRICE_IMPACT_COOLDOWN_MS", 30_000),
-    velocityWindowSeconds: envNumber("VELOCITY_WINDOW_SECONDS", 300),
-    velocityPriceThreshold: envNumber("VELOCITY_PRICE_THRESHOLD", 0.005),
-    velocityTradeCountMultiplier: envNumber("VELOCITY_TRADE_COUNT_MULTIPLIER", 1.5),
-    velocityCooldownMs: envNumber("VELOCITY_COOLDOWN_MS", 120_000),
-    compositeWindowMs: envNumber("COMPOSITE_WINDOW_MS", 60_000),
-    ```
-  - **Also add** to `PipelineConfig` interface in `src/events/types.ts` — but wait: `PipelineConfig` is in `types.ts` which is not in the edit surface. Check: these new fields don't need to be in `PipelineConfig` because the new evaluators read directly from `config` (not from the `PipelineConfig` interface injected into pipeline). **Resolution: do NOT add to `PipelineConfig` unless needed for pipeline unit tests.** The evaluators use `config` directly.
-  - Input: existing config shape
-  - Output: 7 new fields on frozen config object
-  - Test guidance: `src/config.test.ts` — add assertions for each new env var default and override
-  - Edge cases: `envNumber()` throws on NaN — don't set invalid defaults
+**Task 1.1 — Extend `src/config.ts`**
+- Add 7 Phase 3 config vars (see Config Reference above)
+- Remove 3 superseded Phase 1 vars (`priceImpactWindowSec`, `priceImpactMinChangePct`, `velocityZScoreThreshold`)
+- ✅ Test: `src/config.test.ts` additions — verify each new var reads its env var and falls back to default
 
-- [x] **Task 1.2: Update `.env.example`**
-  - Files: `.env.example`
-  - Add Phase 3 section with all 7 vars and defaults
-  - No test needed
+**Task 1.2 — Update `.env.example`**
+- Add Phase 3 section with all 7 new vars + defaults
+- Remove superseded Phase 1 vars
+- ✅ No tests needed (documentation file)
 
-- [x] **Task 1.3: Create `src/db/queries/price-history.ts`**
-  - Files: `src/db/queries/price-history.ts` (new)
-  - Export: `getRecentPriceHistory(db: Db, tokenId: TokenId, limit: number): Promise<Array<{ price: number; recordedAt: Date }>>`
-  - Query: `SELECT price, recorded_at FROM price_history WHERE token_id = $1 ORDER BY recorded_at DESC LIMIT $2`
-  - Use `sql` template or drizzle select — look at how `snapshots.ts` uses `db.select()` as the pattern
-  - Input: `db`, `tokenId`, `limit`
-  - Output: array of `{ price: number, recordedAt: Date }` newest-first
-  - Test guidance: `src/db/queries/price-history.test.ts` — mock `db.select()` chain, assert row mapping (numeric → number), empty result returns `[]`
-  - Edge cases: `price` column is `numeric` (string in JS) — must `Number(row.price)`
+**Task 1.3 — Update `src/events/types.ts`**
+- Update `VelocitySignal`: remove `velocityZScore`, `hourlyPriceChangePct`, `baselineStdDev`; add `tradeCountVelocity: number`
+- Update `PriceImpactSignal`: update `payload` type comment to match new fields
+- ✅ Test: TypeScript compilation (`pnpm typecheck`) must pass
+
+**Task 1.4 — Create `src/db/queries/price-history.ts`**
+- Export `getRecentPriceHistory(db, tokenId, limit)` returning `Array<{ price: number, recordedAt: Date }>`
+- Uses Drizzle `.select().from(priceHistory).where(eq(...)).orderBy(desc(...)).limit(n)` — v0.40 compatible
+- Export `getRecentTradeTimestamps(db, tokenId, windowSeconds)` returning `Array<{ tradedAt: Date }>`
+  Used by `SentimentVelocityEvaluator.bootstrap()` to pre-populate `tradeBuffer`
+- ✅ Test: `src/db/queries/price-history.test.ts` — mocked DB, correct SQL shape, ordering
 
 ---
 
-### Chunk 2: PriceImpactSignalEvaluator
+### Chunk 2 — PriceImpactSignalEvaluator (depends on Chunk 1)
 
-- [x] **Task 2.1: Rewrite `src/signals/price-impact-signal.ts`**
-  - Files: `src/signals/price-impact-signal.ts`
-  - Remove all Phase 1 code. Export `PriceImpactSignalEvaluator` class.
-  - Class interface:
-    ```typescript
-    export class PriceImpactSignalEvaluator {
-      constructor(private readonly db: Db, private readonly opts?: PriceImpactOptions) {}
-      async evaluate(trade: TradeEvent): Promise<PriceImpactSignal | null>
-    }
-    export interface PriceImpactOptions {
-      anomalyThreshold?: number;   // default config.priceImpactAnomalyThreshold
-      cooldownMs?: number;         // default config.priceImpactCooldownMs
-    }
-    ```
-  - Internal state: `private lastEmit: Map<TokenId, number>` for cooldown
-  - DB reads: `getLatestBook(db, tokenId)` + `getRecentPriceHistory(db, tokenId, 2)`
-  - Full algorithm per Decision 2 above
-  - Signal fields: `signalType: "PRICE_IMPACT_ANOMALY"`, `direction` (`BULLISH`/`BEARISH`), `confidence`, `strength: score`, `priceAtSignal: priceNow`, `payload: { score, expectedImpact, actualImpact, depthUsdc, snapshotAgeMs }`
-  - Existing interface `PriceImpactSignal` in `events/types.ts` stays unchanged — the existing fields (`priceChangePct`, `windowSeconds`, `triggeringTradeValueUsdc`) must still be populated:
-    - `priceChangePct = actualImpact * 100`
-    - `windowSeconds = 0` (not window-based anymore — set to 0 or snapshot age in seconds)
-    - `triggeringTradeValueUsdc = trade.valueUsdc`
-  - Input/Output: `TradeEvent → Promise<PriceImpactSignal | null>`
-  - Test guidance: `price-impact-signal.test.ts` — mock `getLatestBook` + `getRecentPriceHistory`, test all skip conditions, test score math, test cooldown, test confidence formula
-  - Edge cases: `depthUsdc === 0`, stale snapshot (>60s), fewer than 2 price records, division by zero in actualImpact (priceBeforeTrade=0)
+**Task 2.1 — Rewrite `src/signals/price-impact-signal.ts`**
+- Export class `PriceImpactSignalEvaluator` (no DB dependency — pure in-memory)
+- Constructor: `constructor(opts?: { threshold?: number; cooldownMs?: number })`
+- Method: `evaluate(trade: TradeEvent, priceBeforeTrade: number | null, priceNow: number, snapshot: SnapshotRecord | null): Promise<PriceImpactSignal | null>`
+- Implements corrected depth mapping (LAW-MINOR-1): `BUY → askDepthUsdc`, `SELL → bidDepthUsdc`
+- Stale snapshot guard: `Date.now() - snapshot.capturedAt.getTime() > 60_000` → skip + warn
+- Division guards: `depthUsdc === 0`, `priceBeforeTrade === 0`
+- Cooldown: `Map<TokenId, number>` per-token
+- Signal payload fields: `score`, `expectedImpact`, `actualImpact`, `depthUsdc`, `valueUsdc`, `priceBeforeTrade`, `priceNow`, `snapshotAgeMs`
+- Remove old `evaluatePriceImpact` function export entirely
 
-- [x] **Task 2.2: Replace `src/signals/price-impact-signal.test.ts`**
-  - Files: `src/signals/price-impact-signal.test.ts`
-  - Replace entirely — old tests test the Phase 1 stub algorithm
-  - Required test cases (from spec):
-    1. Anomaly fires when score > threshold
-    2. Skipped when snapshot age > 60s (log warn, no signal)
-    3. Skipped when `getRecentPriceHistory` returns < 2 records
-    4. Cooldown suppression (second call within cooldown window returns null)
-    5. Confidence scaling: `confidence = min(1.0, (score-threshold)/threshold)`, clamped at 1.0
-    6. Direction: BUY → BULLISH, SELL → BEARISH
-    7. Score below threshold → no signal
-    8. Depth = 0 → skip (division guard)
-    9. No snapshot found → skip
-    10. `opts` defaults used when not provided
-  - Mock pattern: `vi.mock("../db/queries/price-history.js", ...)` and `vi.mock("../db/queries/snapshots.js", ...)`
-  - Use `vi.fn()` for DB mock; pass `db` as `{} as Db` (queries are mocked at module level)
+**Task 2.2 — Replace `tests/signals/price-impact-signal.test.ts`**
+- Test cases:
+  - ✅ Fires when `score > threshold` (BUY, correct ask depth)
+  - ✅ Fires when `score > threshold` (SELL, correct bid depth)
+  - ✅ `BULL` direction for BUY, `BEAR` direction for SELL
+  - ✅ Returns `null` when snapshot is `null`
+  - ✅ Returns `null` + logs warn when snapshot older than 60s
+  - ✅ Returns `null` when `priceBeforeTrade` is `null`
+  - ✅ Returns `null` when `depthUsdc === 0` (division guard)
+  - ✅ Returns `null` when `score <= threshold`
+  - ✅ Cooldown suppression — second call within cooldown returns `null`
+  - ✅ Cooldown resets after `cooldownMs`
+  - ✅ Confidence scaling: `min(1.0, (score - threshold) / threshold)`
+  - ✅ Custom `threshold` and `cooldownMs` via constructor opts
 
 ---
 
-### Chunk 3: SentimentVelocityEvaluator
+### Chunk 3 — SentimentVelocityEvaluator (depends on Chunk 1)
 
-- [x] **Task 3.1: Rewrite `src/signals/velocity-signal.ts`**
-  - Files: `src/signals/velocity-signal.ts`
-  - Remove all Phase 1 code. Export `SentimentVelocityEvaluator` class.
-  - Class interface:
-    ```typescript
-    export class SentimentVelocityEvaluator {
-      constructor(private readonly opts?: VelocityOptions) {}
-      recordPrice(tokenId: TokenId, price: number, timestamp?: number): void
-      recordTrade(tokenId: TokenId, timestamp?: number): void
-      evaluate(tokenId: TokenId, conditionId: string): VelocitySignal | null
-      async bootstrap(db: Db, tokenIds: TokenId[]): Promise<void>
-    }
-    export interface VelocityOptions {
-      windowSeconds?: number;              // default config.velocityWindowSeconds
-      priceThreshold?: number;             // default config.velocityPriceThreshold
-      tradeCountMultiplier?: number;       // default config.velocityTradeCountMultiplier
-      cooldownMs?: number;                 // default config.velocityCooldownMs
-    }
-    ```
-  - Internal state:
-    - `private priceBuffers: Map<TokenId, Array<{ price: number; timestamp: number }>>`
-    - `private tradeBuffers: Map<TokenId, Array<{ timestamp: number }>>`
-    - `private lastEmit: Map<TokenId, number>`
-  - `recordPrice`: push `{ price, timestamp: timestamp ?? Date.now() }`, prune entries older than `2 * windowSeconds * 1000`
-  - `recordTrade`: push `{ timestamp: timestamp ?? Date.now() }`, prune same
-  - `evaluate`: full algorithm per Decision 3 above — returns `VelocitySignal | null`
-  - `bootstrap(db, tokenIds)`: for each tokenId, query `getRecentPriceHistory(db, tokenId, 200)` (last 200 price records) and call `recordPrice()` for each; does NOT pre-populate tradeBuffers (trades only come from live events)
-  - `VelocitySignal` existing fields must be populated:
-    - `velocityZScore: tradeCountVelocity` (reuse for strength, not a z-score anymore — note: the type field is named `velocityZScore` but Phase 3 algorithm doesn't compute z-scores; set it to `tradeCountVelocity`)
-    - `hourlyPriceChangePct: priceVelocity * 60` (velocity is per-minute, * 60 = per hour)
-    - `baselineStdDev: 0` (not computed in Phase 3 algorithm — set to 0)
-  - Input/Output: in-memory state + event-driven
-  - Test guidance: `velocity-signal.test.ts`
-  - Edge cases: empty buffers, single price point, tradeCountVelocity edge case (0 prior trades → divisor = 1)
+**Task 3.1 — Rewrite `src/signals/velocity-signal.ts`**
+- Export class `SentimentVelocityEvaluator`
+- Constructor: `constructor(opts?: { windowSeconds?: number; priceThreshold?: number; tradeCountMultiplier?: number; cooldownMs?: number })`
+- Methods:
+  - `recordPrice(tokenId: TokenId, price: number, timestamp?: number): void`
+  - `recordTrade(tokenId: TokenId, timestamp?: number): void`
+  - `evaluate(tokenId: TokenId): VelocitySignal | null`
+  - `bootstrap(db: Db, tokenIds: TokenId[]): Promise<void>`
+  - `clear(): void` — reset all buffers (for testing + shutdown)
+- Warm-up suppression: `warmUntil` map — returns `null` until both windows are warm
+- Buffer pruning: prune to `2 * windowMs` on every `recordPrice`/`recordTrade`
+- Remove old `evaluateVelocity` function export entirely
+- Signal uses `tradeCountVelocity` field (not `velocityZScore`)
 
-- [x] **Task 3.2: Replace `src/signals/velocity-signal.test.ts`**
-  - Files: `src/signals/velocity-signal.test.ts`
-  - Replace entirely — old tests test Phase 1 z-score algorithm
-  - Required test cases (from spec):
-    1. Fires when both `|priceVelocity| > threshold` AND `tradeCountVelocity > multiplier`
-    2. No fire when only price threshold met (trade count insufficient)
-    3. No fire when only trade count threshold met (price velocity insufficient)
-    4. Cooldown: second `evaluate()` call for same token within cooldown → null
-    5. Direction: positive velocity → BULLISH, negative → BEARISH
-    6. Rolling window correctly excludes records older than `windowSeconds`
-    7. Prior window correctly uses `[now-2w, now-w)` range for trade count comparison
-    8. `recordPrice()` / `recordTrade()` prune buffer at `2 * windowSeconds`
-    9. `evaluate()` returns null when fewer than 2 prices in current window
-    10. `bootstrap()` pre-populates price buffer from DB records
-  - All tests use `vi.useFakeTimers()` for deterministic timestamp control
+**Task 3.2 — Replace `tests/signals/velocity-signal.test.ts`**
+- Test cases:
+  - ✅ Fires when both price velocity and trade count velocity exceed thresholds
+  - ✅ Does NOT fire when only price velocity exceeded (trade count below multiplier)
+  - ✅ Does NOT fire when only trade count velocity exceeded (price below threshold)
+  - ✅ `BULLISH` direction when price rising, `BEARISH` when falling
+  - ✅ Cooldown suppression
+  - ✅ Returns `null` when fewer than 2 price records in current window
+  - ✅ Rolling window correctly excludes records older than `windowSeconds`
+  - ✅ Prior window trade count uses `[now-2W, now-W)` range
+  - ✅ `tradeCountVelocity` = 1 when prior window is 0 (division guard)
+  - ✅ Warm-up suppression — returns `null` before warm-up period expires
+  - ✅ `bootstrap()` pre-populates buffers and suppresses warm-up when data present
+  - ✅ Confidence: `min(1.0, |priceVelocity| / (threshold * 3))`
+  - ✅ Custom opts via constructor
 
 ---
 
-### Chunk 4: SignalAggregator — Composite Scoring
+### Chunk 4 — SignalAggregator Composite Scoring (depends on Chunk 1)
 
-- [x] **Task 4.1: Update `src/processors/signal-aggregator.ts`**
-  - Files: `src/processors/signal-aggregator.ts`
-  - Add private `compositeMap: Map<TokenId, { signals: Array<{ type: SignalType; confidence: number; createdAt: number }>; windowStart: number }>`
-  - Update `handleSignal()` to:
-    1. Before inserting to DB, call `updateCompositeMap(signal)` which:
-       - Purges entries older than `compositeWindowMs` for all tokens
-       - Adds current signal to the token's list
-       - If 2+ signals in the window: computes `compositeConfidence` and logs
-    2. If composite window has 2+ signals for this token, add `compositeScore` to `signal.payload` before insert
-  - New private method `updateCompositeMap(signal: Signal): number | null` — returns composite score or null if only 1 signal
-  - Formula: `compositeConfidence = mean(confidences) * (1 + 0.15 * (signalCount - 1))`
-  - Log format: `[COMPOSITE] tokenId: <score>, signals: [<types>]`
-  - Config: use `config.compositeWindowMs`
-  - **Preserve all existing behavior** — new code only added to `handleSignal()`
-  - Input/Output: `Signal` → enriched `payload` field before DB insert
-  - Test guidance: `signal-aggregator.test.ts` additions (do NOT replace existing tests)
-  - Edge cases: window boundary (signal at exactly `compositeWindowMs` — include or exclude; spec says "within", so exclude expired), single signal (no composite), payload immutability (spread signal before enriching to avoid mutation)
+**Task 4.1 — Update `src/processors/signal-aggregator.ts`**
+- Add `private compositeMap: Map<TokenId, CompositeWindow>` where:
+  `CompositeWindow = { signals: Array<{id: bigint, type: SignalType, confidence: number, createdAt: number}>, windowStart: number }`
+- In `handleSignal()` (after existing insert):
+  1. Capture `insertedId` from `insertSignal()` return value
+  2. Add new signal to `compositeMap[tokenId]`
+  3. Prune entries older than `config.compositeWindowMs`
+  4. If window has ≥ 2 signals:
+     - `compositeConfidence = mean(confidences) * (1 + 0.15 * (count - 1))`
+     - Build `ids = window.signals.map(s => s.id)` (includes all signals in window)
+     - Call `updateSignalPayloads(db, ids, { compositeScore: compositeConfidence })` — patches all prior rows
+     - Log: `[COMPOSITE] tokenId: <score>, signals: [<types>]`
+- Window `windowStart` is set to the timestamp of the **first** signal in the group
+- Add `updateSignalPayloads(db, ids, patch)` to `src/db/queries/signals.ts`
 
-- [x] **Task 4.2: Extend `src/processors/signal-aggregator.test.ts`**
-  - Files: `src/processors/signal-aggregator.test.ts`
-  - **Add** new describe block: `"SignalAggregator — composite confidence scoring"`
-  - Do NOT modify existing tests
-  - Required test cases (from spec):
-    1. 2 co-occurring signals → `compositeScore` added to both payloads, correct formula
-    2. 3 signals → 1.30× bonus applied (`1 + 0.15 * 2 = 1.30`)
-    3. Payload enriched: `signal.payload.compositeScore` present after insert
-    4. Single signal → no composite (no `compositeScore` in payload)
-    5. Window expiry: signal outside `compositeWindowMs` → not included in composite
-    6. Different tokenIds: composite only for matching tokenId, not cross-token
+**Task 4.2 — Extend `src/processors/signal-aggregator.test.ts`**
+- Test cases (additions only — do not break existing 357 tests):
+  - ✅ Single signal: no composite score, `updateSignalPayloads` not called
+  - ✅ Two signals within window: `compositeScore` computed + both DB rows patched
+  - ✅ Three signals: bonus factor applied `(1 + 0.15 * 2)` = 1.30
+  - ✅ Window expiry: second signal after `compositeWindowMs` does NOT combine with first
+  - ✅ Different tokenIds: separate windows, no cross-token composite
+  - ✅ Log output contains `[COMPOSITE]` with correct tokenId and types
 
 ---
 
-### Chunk 5: Backtest Module
+### Chunk 5 — Backtest Module (depends on Chunk 1)
 
-- [x] **Task 5.1: Create `src/backtest/types.ts`**
-  - Files: `src/backtest/types.ts` (new)
-  - Export interfaces:
-    ```typescript
-    export interface BacktestConfig {
-      startDate: Date;
-      endDate: Date;
-      signalTypes?: SignalType[];
-      minConfidence?: number;
-      tokenIds?: string[];
-    }
-    
-    export interface SignalOutcome {
-      signalId: number;
-      tokenId: string;
-      signalType: SignalType;
-      direction: string;
-      confidence: number;
-      createdAt: Date;
-      resolved: boolean;       // market resolved in time range
-      correct: boolean | null; // null if not resolved
-    }
-    
-    export interface SignalMetrics {
-      precision: number;       // correct / total fired (for resolved)
-      recall: number;          // correct / total resolvable
-      f1: number;
-      avgConfidence: number;
-      totalFired: number;
-      totalResolved: number;
-      totalCorrect: number;
-    }
-    
-    export interface BacktestResult {
-      config: BacktestConfig;
-      byType: Partial<Record<SignalType, SignalMetrics>>;
-      overall: SignalMetrics;
-      generatedAt: Date;
-    }
-    ```
-  - No test needed (type-only file)
+**Task 5.1 — Create `src/backtest/types.ts`**
+- All interfaces from Backtest Module Design above
+- Export: `BacktestConfig`, `BacktestMetrics`, `BacktestResult`, `SignalOutcome`
 
-- [x] **Task 5.2: Create `src/backtest/evaluator.ts`**
-  - Files: `src/backtest/evaluator.ts` (new)
-  - Export `BacktestEvaluator` class:
-    ```typescript
-    export class BacktestEvaluator {
-      evaluate(outcomes: SignalOutcome[]): BacktestResult["byType"] & { overall: SignalMetrics }
-    }
-    ```
-  - `evaluate()` groups outcomes by `signalType`, computes `SignalMetrics` for each group + overall
-  - Precision = `totalCorrect / totalResolved` (or 0 if `totalResolved === 0`)
-  - Recall = `totalCorrect / totalResolved` (same as precision here — recall requires knowing total positives; clarification: per spec, `recall = correct / total resolvable` where "total resolvable" = `totalResolved`. So precision ≡ recall in this formulation. Implement as-is per spec.)
-  - F1 = `2 * precision * recall / (precision + recall)` (or 0 if both are 0)
-  - avgConfidence = mean of all signal confidences in the group
-  - Input: `SignalOutcome[]`
-  - Output: `{ byType: ..., overall: ... }`
-  - Test guidance: `backtest/evaluator.test.ts` — precision/recall/f1 math, zero-division (no resolved markets → all zeros), per-type breakdown, overall aggregation
+**Task 5.2 — Create `src/backtest/evaluator.ts`**
+- Pure function `evaluate(outcomes: SignalOutcome[], config: BacktestConfig): BacktestResult`
+- Computes per-type and overall `BacktestMetrics`
+- Uses `resolvedHitRate` (not `recall`)
+- Zero-division guards on all metrics
 
-- [x] **Task 5.3: Create `src/backtest/report.ts`**
-  - Files: `src/backtest/report.ts` (new)
-  - Export `BacktestReport` class:
-    ```typescript
-    export class BacktestReport {
-      print(result: BacktestResult): void  // stdout table
-      async save(result: BacktestResult, outputDir?: string): Promise<string>  // returns path written
-    }
-    ```
-  - `print()`: renders the box-drawing table to `process.stdout` (use `console.log`)
-  - `save()`: writes JSON to `backtest-results/{startDate}_{endDate}.json`
-    - Date format in filename: `YYYY-MM-DD` (e.g., `2025-01-01_2025-04-01.json`)
-    - Creates `backtest-results/` directory if not present (use `fs.mkdirSync` with `recursive: true`)
-  - Table format: exact box-drawing chars from spec
-  - Column widths: fixed at the widths shown in the spec
-  - Test guidance: `backtest/report.test.ts`
-    - JSON output shape matches `BacktestResult`
-    - stdout output contains expected signal type names and numeric values
-    - `save()` writes to correct path
-    - Mock `fs.writeFileSync` and `fs.mkdirSync` in tests
+**Task 5.3 — Create `src/backtest/report.ts`**
+- `print(result: BacktestResult): void` — box table to stdout
+- `writeJson(result: BacktestResult, dir?: string): string` — returns path written
+- Column order: `Signal Type | Precision | HitRate | F1 | Fired`
 
-- [x] **Task 5.4: Create `src/backtest/runner.ts`**
-  - Files: `src/backtest/runner.ts` (new)
-  - Export `BacktestRunner` class + `main()` function:
-    ```typescript
-    export class BacktestRunner {
-      constructor(private readonly db: Db) {}
-      async run(config: BacktestConfig): Promise<BacktestResult>
-    }
-    
-    // CLI entry (called when file run directly)
-    async function main(): Promise<void>
-    ```
-  - `run()`:
-    1. Query `signals` table: `WHERE created_at BETWEEN config.startDate AND config.endDate [AND signal_type IN (...)] [AND confidence >= minConfidence] [AND token_id IN (...)]`
-    2. For each signal, join to `markets` table: get `winner` field for the `tokenId`
-    3. Determine correctness:
-       - Signal direction `BULLISH` = predicted `winner = true` (Yes outcome wins)
-       - Signal direction `BEARISH` = predicted `winner = false`
-       - If `markets.winner IS NULL` → not resolved (resolved=false, correct=null)
-       - If resolved: correct = `(direction=BULLISH && winner=true) || (direction=BEARISH && winner=false)`
-    4. Build `SignalOutcome[]`, call `BacktestEvaluator.evaluate()`, call `BacktestReport.print()` + `.save()`
-  - `main()`: parse `process.argv` for `--start`, `--end`, `--signal-types`, `--min-confidence`; create DB; run; close DB
-  - Test guidance: `backtest/runner.test.ts` — mock DB (mock `execute()` or use drizzle mock), assert correct signal fetch query shape, assert `BacktestEvaluator.evaluate` called with correct outcomes, assert `BacktestReport.print` called
+**Task 5.4 — Create `src/backtest/runner.ts`**
+- `BacktestRunner` class: `constructor(private db: Db)`
+- `run(config: BacktestConfig): Promise<BacktestResult>`
+- `main()`: parses `process.argv`, calls `getDb()` / `closeDb()` (NOT `createDb()`)
+- Uses `LEFT JOIN markets` to obtain `winner` for each signal's `tokenId`
 
 ---
 
-### Chunk 6: Pipeline Wiring
+### Chunk 6 — Pipeline Wiring (depends on Chunks 2, 3, 4)
 
-- [x] **Task 6.1: Update `src/pipeline.ts`**
-  - Files: `src/pipeline.ts`
-  - Changes:
-    1. **Remove** old imports: `evaluatePriceImpact` from `price-impact-signal.js`, `evaluateVelocity` from `velocity-signal.js`
-    2. **Add** new imports: `PriceImpactSignalEvaluator` from `price-impact-signal.js`, `SentimentVelocityEvaluator` from `velocity-signal.js`, `getRecentPriceHistory` from `db/queries/price-history.js`
-    3. **Remove** `recentPrices` Map, `recordPrice()`, `priceBuckets` Map, `recordBucketPrice()` (replaced by evaluator-internal state)
-    4. **Remove** the `SnapshotWriter` callback block that called `evaluatePriceImpact()`
-    5. **Remove** the 5-min `setInterval` block that called `evaluateVelocity()`
-    6. **Instantiate**: `const priceImpactEvaluator = new PriceImpactSignalEvaluator(db)` and `const velocityEvaluator = new SentimentVelocityEvaluator()`
-    7. **Bootstrap** velocity evaluator on startup: `await velocityEvaluator.bootstrap(db, watchlistedTokenIds)` (after `getWatchlistedTokenIds`)
-    8. **Wire trade handler**: In `tradeHandler1`, after existing logic, add:
-       ```typescript
-       velocityEvaluator.recordPrice(trade.tokenId, trade.priceUsdc);
-       velocityEvaluator.recordTrade(trade.tokenId);
-       const velSignal = velocityEvaluator.evaluate(trade.tokenId, conditionIdMap.get(trade.tokenId) ?? trade.tokenId);
-       if (velSignal) bus.emit("signal", velSignal);
-       const impactSignal = await priceImpactEvaluator.evaluate(trade);
-       if (impactSignal) bus.emit("signal", impactSignal);
-       ```
-    9. **Wire book_update handler**: Also call `velocityEvaluator.recordPrice()` from `best_bid_ask` and `last_trade_price` CLOB WS events (mid-price from bid/ask, last trade price)
-    10. **Shutdown**: add `velocityEvaluator` and `priceImpactEvaluator` cleanup (if they have any timers — they don't, so no action needed)
-  - **CRITICAL**: `conditionIdMap` must be populated before `velocityEvaluator.evaluate()` is called. The existing code populates it lazily (on first `getMarketStats()` call). For the evaluate call, fall back to `tokenId` as `conditionId` when not yet populated (same as existing pattern).
-  - Test guidance: Pipeline is integration-tested via the existing `tests/` directory — no new pipeline unit tests needed. Verify pipeline test file if it exists.
-  - Edge cases: `PriceImpactSignalEvaluator.evaluate()` is async — must `await` in trade handler, handler must remain `async`
+**Task 6.1 — Update `src/pipeline.ts`**
+- Remove: `import { evaluatePriceImpact } from "./signals/price-impact-signal.js"`
+- Remove: `import { evaluateVelocity } from "./signals/velocity-signal.js"`
+- Remove: `recentPrices` map, `recordPrice()`, `PRICE_WINDOW_MS` (replaced by evaluator-internal state)
+  > **Note:** Keep `recordBucketPrice` and `priceBuckets` only if still needed — they are NOT
+  > needed after Phase 3 since `SentimentVelocityEvaluator` manages its own `priceBuffer`.
+  > Remove `priceBuckets`, `BUCKET_MS`, `MAX_BUCKETS`, `recordBucketPrice`, and the `velocityTimer`
+  > `setInterval` block.
+- Add: `import { PriceImpactSignalEvaluator } from "./signals/price-impact-signal.js"`
+- Add: `import { SentimentVelocityEvaluator } from "./signals/velocity-signal.js"`
+- Instantiate: `const priceImpactEvaluator = new PriceImpactSignalEvaluator()`
+- Instantiate: `const velocityEvaluator = new SentimentVelocityEvaluator()`
+- Bootstrap: after `gammaPoller.start()`, call `velocityEvaluator.bootstrap(db, watchlistedTokenIds)` (non-blocking, catch errors)
+- Wire `best_bid_ask` and `last_trade_price` → `velocityEvaluator.recordPrice(tokenId, price)`
+- In `tradeHandler1`:
+  1. Capture `priceBeforeTrade` from evaluator's last known price (see sequencing contract)
+  2. Call `velocityEvaluator.recordTrade(tokenId)` and `velocityEvaluator.recordPrice(tokenId, trade.priceUsdc)`
+  3. Fire-and-forget `priceImpactEvaluator.evaluate(trade, priceBeforeTrade, trade.priceUsdc, snapshot)` → emit signal
+  4. Sync call `velocityEvaluator.evaluate(tokenId)` → emit signal if not null
+- Remove `velocityTimer` setInterval (velocity evaluated per-trade now, not on a timer)
+- In `shutdown()`: call `velocityEvaluator.clear()`
+- Remove bus listener registrations for old handlers that no longer exist
 
 ---
 
-### Chunk 7: Package.json + `backtest-results/` directory
+### Chunk 7 — Package + Output Directory (no dependencies)
 
-- [x] **Task 7.1: Add `backtest` script to `package.json`**
-  - Files: `package.json`
-  - Add: `"backtest": "node --import tsx/esm src/backtest/runner.ts"`
-  - No test needed
+**Task 7.1 — Add `backtest` script to `package.json`**
+```json
+"backtest": "tsc && node dist/backtest/runner.js"
+```
 
-- [x] **Task 7.2: Create `backtest-results/.gitkeep`**
-  - Files: `backtest-results/.gitkeep` (new empty file)
-  - Add `backtest-results/*.json` to `.gitignore` (keep the directory, ignore output files)
-  - No test needed
-
----
-
-### Chunk 8: Testing
-
-- [x] **Task 8.1: `src/db/queries/price-history.test.ts`** (new)
-  - Test: correct SQL query shape, row mapping, empty result
-  - Mock: `db.select().from().where().orderBy().limit()` chain
-
-- [x] **Task 8.2: `src/signals/price-impact-signal.test.ts`** (replace)
-  - See Task 2.2
-
-- [x] **Task 8.3: `src/signals/velocity-signal.test.ts`** (replace)
-  - See Task 3.2
-
-- [x] **Task 8.4: `src/processors/signal-aggregator.test.ts`** (extend)
-  - See Task 4.2
-
-- [x] **Task 8.5: `src/backtest/evaluator.test.ts`** (new)
-  - Test precision/recall/f1 math with known inputs
-  - Zero-division: `totalResolved = 0` → all zeros, no NaN
-  - Per-type breakdown and overall aggregation
-  - Multiple signal types mixed
-
-- [x] **Task 8.6: `src/backtest/report.test.ts`** (new)
-  - Mock `fs.mkdirSync`, `fs.writeFileSync`
-  - Assert JSON structure matches `BacktestResult`
-  - Assert stdout contains expected signal type names
-  - Assert filename format `YYYY-MM-DD_YYYY-MM-DD.json`
-
-- [x] **Task 8.7: `src/backtest/runner.test.ts`** (new)
-  - Mock DB with `vi.fn()` for `execute` calls
-  - Assert signal query includes date range filter
-  - Assert `BacktestEvaluator.evaluate()` called with correct `SignalOutcome[]`
-  - Assert resolved/unresolved market mapping correct
-  - Test `--start`, `--end` CLI arg parsing in `main()`
-
-- [x] **Task 8.8: `src/config.test.ts` additions**
-  - Add assertions for 7 new Phase 3 env vars (default values + override)
+**Task 7.2 — Create `backtest-results/.gitkeep`**
+- Empty file to track the output directory in git
+- Add `backtest-results/*.json` to `.gitignore` (keep `.gitkeep`, ignore results)
 
 ---
 
-### Chunk 9: Docs + Commit Strategy
+### Chunk 8 — Tests (depends on respective implementation chunks)
 
-- [x] **Task 9.1: Update `CLAUDE.md`**
-  - Add Phase 3 section to current state
-  - Update test counts (target: 357 + new tests)
-  - Add new env vars to environment variables table
+**Task 8.1 — `src/db/queries/price-history.test.ts`**
+- `getRecentPriceHistory`: returns rows ordered DESC, limits correctly, returns `[]` on no rows
+- `getRecentTradeTimestamps`: returns timestamps within window, excludes older records
 
-- [x] **Task 9.2: Commit sequence on `feat/phase-3`**
-  ```
-  feat: add getRecentPriceHistory query + Phase 3 config
-  feat: PriceImpactSignalEvaluator (DB-backed anomaly detection)
-  feat: SentimentVelocityEvaluator (in-memory rolling window)
-  feat: SignalAggregator composite confidence scoring
-  feat: backtest module (runner, evaluator, report, types)
-  feat: wire Phase 3 evaluators in pipeline.ts
-  chore: update docs for Phase 3
-  ```
+**Task 8.2 — `src/signals/price-impact-signal.test.ts`** (already specified in Task 2.2)
 
-- [x] **Task 9.3: Push + open PR to `main`**
+**Task 8.3 — `src/signals/velocity-signal.test.ts`** (already specified in Task 3.2)
+
+**Task 8.4 — `src/processors/signal-aggregator.test.ts`** (already specified in Task 4.2)
+
+**Task 8.5 — `src/backtest/evaluator.test.ts`**
+- Precision/resolvedHitRate/f1 math with known inputs
+- Zero-division: `totalFired = 0` → all metrics 0
+- Zero-division: `totalResolved = 0` → `resolvedHitRate = 0`
+- Per-type breakdown correctness
+- Mixed signal types in one result
+
+**Task 8.6 — `src/backtest/report.test.ts`**
+- JSON output shape matches `BacktestResult`
+- JSON written to correct path
+- Stdout table contains expected column headers
+- `HitRate` column (not `Recall`) is present in output
+
+**Task 8.7 — `src/backtest/runner.test.ts`**
+- Correct SQL query issued (signal fetch with date range)
+- `LEFT JOIN markets` for resolution lookup
+- Correct call to `BacktestEvaluator.evaluate()`
+- Zero signals returned gracefully
+
+**Task 8.8 — `src/config.test.ts` additions**
+- Each of the 7 new Phase 3 vars reads its env var
+- Each falls back to the correct default when env var unset
+- Removed Phase 1 vars no longer appear on `config`
 
 ---
 
 ## Execution Order
 
-Dependencies must be respected:
-
-1. **Task 1.1** (config) — no deps
-2. **Task 1.2** (.env.example) — no deps
-3. **Task 1.3** (price-history query) — no deps
-4. **Task 5.1** (backtest/types.ts) — no deps
-5. **Task 2.1** (PriceImpactSignalEvaluator) — depends on 1.1, 1.3
-6. **Task 3.1** (SentimentVelocityEvaluator) — depends on 1.1, 1.3 (bootstrap uses price-history query)
-7. **Task 4.1** (SignalAggregator composite) — depends on 1.1
-8. **Task 5.2** (BacktestEvaluator) — depends on 5.1
-9. **Task 5.3** (BacktestReport) — depends on 5.1, 5.2
-10. **Task 5.4** (BacktestRunner) — depends on 5.1, 5.2, 5.3
-11. **Task 6.1** (pipeline wiring) — depends on 2.1, 3.1
-12. **Task 7.1** (package.json script) — depends on 5.4
-13. **Task 7.2** (backtest-results dir) — no deps
-14. **All tests** — depend on their respective implementation tasks
-
----
-
-## Risks & Unknowns
-
-### Risk 1: `PriceImpactSignal` type field mismatch
-The existing `PriceImpactSignal` interface has `priceChangePct`, `windowSeconds`, `triggeringTradeValueUsdc`. The new algorithm doesn't naturally produce these. Resolution documented in Task 2.1 — set them to derived/dummy values to preserve the type contract without changing `events/types.ts`.
-
-### Risk 2: Phase 1 price-impact and velocity tests break on algorithm change
-The existing `price-impact-signal.test.ts` and `velocity-signal.test.ts` test the Phase 1 stub algorithms. These tests will fail once the implementations are replaced. **This is expected** — both test files are completely replaced in Tasks 2.2 and 3.2. Zoro must replace them before running `pnpm test`.
-
-### Risk 3: Hot-path async in tradeHandler1
-`PriceImpactSignalEvaluator.evaluate()` does 2 DB reads per trade. On high-throughput markets this could back-pressure the trade pipeline. Mitigation: keep the DB calls non-blocking (fire and continue), wrap in try/catch that only warns. Do NOT `await` inside the synchronous portion of the handler — restructure as a separate async handler registered independently.
-
-### Risk 4: `SentimentVelocityEvaluator.bootstrap()` DB query volume
-Querying 200 price records for each of 200 watchlisted tokens on startup = up to 40,000 rows. This is a startup-only cost and acceptable, but Zoro should batch these queries (query all tokens at once with `WHERE token_id IN (...)` + subquery for `LIMIT per token`) if performance is a concern. Simple approach: sequential per-token queries with `await Promise.all()` batching.
-
-### Risk 5: `markets.winner` field semantics
-The schema has `winner: boolean` on the `markets` table (from `src/db/schema.ts`). For a binary Yes/No market, `winner = true` means "Yes" won. But signal direction is `BULLISH`/`BEARISH` relative to a trade side. A `BUY` on the "Yes" token is bullish — it's a bet that `winner = true`. A `BUY` on the "No" token (negRisk) is also a `BUY` but is bearish on the outcome. **Mitigation**: For Phase 3, assume all tokens in the watchlist are non-negRisk (consistent with Phase 1/2 architecture). The correctness mapping `BULLISH → winner=true` is valid for non-negRisk tokens only.
-
-### Risk 6: Backtest `signals` query with date range on partitioned table
-`trades` is partitioned. `signals` is NOT partitioned (see schema). `ORDER BY created_at` with `BETWEEN` on `signals` will do a full table scan without a date-range partition pruning. This is acceptable for a CLI backtest tool — not on the hot path.
+```
+Chunk 1 (1.1 → 1.4)   ← foundation, no deps
+    ↓
+Chunk 2 (2.1 → 2.2)   ← PriceImpactEvaluator (no DB dep)
+Chunk 3 (3.1 → 3.2)   ← VelocityEvaluator (concurrent with Chunk 2)
+Chunk 5 (5.1 → 5.4)   ← Backtest module (concurrent with Chunks 2+3)
+    ↓
+Chunk 4 (4.1 → 4.2)   ← SignalAggregator composite (depends on Chunk 1; safe to do after 2+3)
+    ↓
+Chunk 6 (6.1)          ← Pipeline wiring (depends on 2, 3, 4 complete)
+Chunk 7 (7.1 → 7.2)   ← Package updates (no deps; can do anytime)
+    ↓
+Chunk 8 (8.1 → 8.8)   ← All tests (some overlap with their chunks above)
+    ↓
+Chunk 9 (docs + commit sequence)
+```
 
 ---
 
-## Board Questions for Law (Architecture/Strategy Trade-offs)
+### Chunk 9 — Docs + Commit Strategy
 
-1. **Composite scoring placement:** The spec says enrich the `payload` column before insert. But `handleSignal()` currently receives the `Signal` object and spreads it into `insertSignal()`. To enrich `payload`, we need to mutate or create a new `Signal` with an updated `payload`. Is `{ ...signal, payload: { ...signal.payload, compositeScore } }` the right pattern, or should `insertSignal()` accept an extra `extraPayload` parameter?
+**Task 9.1 — Update `CLAUDE.md`**
+- Update test count, coverage percentages once Phase 3 is complete
+- Add Phase 3 component summary (PriceImpactSignalEvaluator, SentimentVelocityEvaluator, backtest module)
 
-2. **PriceImpactEvaluator on the trade hot path:** 2 DB reads per trade is risky under load. Should it fire-and-forget (no `await` in the trade handler — just detach the async work) or should there be an internal queue/buffer for evaluation work?
+**Task 9.2 — Commit sequence on `feat/phase-3`**
+```
+feat: add Phase 3 config vars and price-history query helpers
+feat: implement PriceImpactSignalEvaluator (v2 — in-memory, no hot-path DB reads)
+feat: implement SentimentVelocityEvaluator (v2 — rolling buffers, warm-up suppression)
+feat: add composite confidence scoring to SignalAggregator (insert-then-update)
+feat: add backtesting module (runner, evaluator, report, types)
+feat: wire Phase 3 evaluators into pipeline
+chore: update docs for Phase 3
+```
 
-3. **`VelocitySignal.velocityZScore` field name:** The Phase 3 algorithm doesn't compute a z-score — it computes `tradeCountVelocity`. Should we rename the field in `events/types.ts` (but that would change the type) or just populate it with `tradeCountVelocity` and note the semantic drift? The spec says "Do NOT change `src/db/schema.ts`" — `events/types.ts` is not mentioned in the edit surface constraints.
-
-4. **Backtest resolution correctness for multi-outcome markets:** The current schema has one row per token (Yes/No are separate rows). If a market has `winner=true` on the "Yes" token and `winner=false` on the "No" token, a `BULLISH` signal on the "No" token would be incorrectly counted as correct (`winner=true` but signal is on the "No" side). Does the backtest need to account for `outcomeIndex` when computing correctness?
+**Task 9.3 — Push + open PR to `main`**
 
 ---
 
-## TODO
-- [ ] Task 1.1 — Extend `src/config.ts` (7 Phase 3 fields)
-- [ ] Task 1.2 — Update `.env.example`
-- [ ] Task 1.3 — Create `src/db/queries/price-history.ts`
-- [ ] Task 2.1 — Rewrite `src/signals/price-impact-signal.ts`
-- [ ] Task 2.2 — Replace `src/signals/price-impact-signal.test.ts`
-- [ ] Task 3.1 — Rewrite `src/signals/velocity-signal.ts`
-- [ ] Task 3.2 — Replace `src/signals/velocity-signal.test.ts`
-- [ ] Task 4.1 — Update `src/processors/signal-aggregator.ts` (composite scoring)
-- [ ] Task 4.2 — Extend `src/processors/signal-aggregator.test.ts`
-- [ ] Task 5.1 — Create `src/backtest/types.ts`
-- [ ] Task 5.2 — Create `src/backtest/evaluator.ts`
-- [ ] Task 5.3 — Create `src/backtest/report.ts`
-- [ ] Task 5.4 — Create `src/backtest/runner.ts`
-- [ ] Task 6.1 — Update `src/pipeline.ts`
-- [ ] Task 7.1 — Add `backtest` script to `package.json`
-- [ ] Task 7.2 — Create `backtest-results/.gitkeep`
-- [ ] Task 8.1 — `src/db/queries/price-history.test.ts`
-- [ ] Task 8.2 — `src/signals/price-impact-signal.test.ts` (replace)
-- [ ] Task 8.3 — `src/signals/velocity-signal.test.ts` (replace)
-- [ ] Task 8.4 — `src/processors/signal-aggregator.test.ts` (extend)
-- [ ] Task 8.5 — `src/backtest/evaluator.test.ts`
-- [ ] Task 8.6 — `src/backtest/report.test.ts`
-- [ ] Task 8.7 — `src/backtest/runner.test.ts`
-- [ ] Task 8.8 — `src/config.test.ts` (Phase 3 additions)
-- [ ] Task 9.1 — Update `CLAUDE.md`
-- [ ] Task 9.2 — Commit sequence
-- [ ] Task 9.3 — Push + open PR to `main`
+## Risks & Mitigations (Final)
+
+| Risk | Mitigation |
+|---|---|
+| Price impact evaluation on cold start (no prior price) | `priceBeforeTrade === null` guard — returns `null` silently |
+| Velocity evaluator cold-restart false positives | Warm-up suppression + bootstrap from `trades` table |
+| Composite scoring patches fail (DB error) | `updateSignalPayloads` errors are caught and logged; signal already inserted — no data loss |
+| Backtest bulk read OOM on large windows | Acceptable for Phase 3; note for Phase 4 streaming |
+| `tsc && node dist/...` backtest script requires successful compile | CI will catch build failures; local dev: run `pnpm build` first |
+| Snapshot not available at trade time (new token) | `snapshot === null` guard — returns `null` silently |
+| `priceBuckets` / `velocityTimer` removal breaking existing tests | Check for any test that imports these pipeline internals before deleting |
+| Removing legacy config vars breaking existing tests | Audit `config.priceImpactWindowSec`, `config.priceImpactMinChangePct`, `config.velocityZScoreThreshold` usage before deletion |
