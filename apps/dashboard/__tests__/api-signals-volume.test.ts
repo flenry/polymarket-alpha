@@ -125,4 +125,13 @@ describe("GET /api/signals/volume", () => {
     const { buckets } = res.body as unknown as { buckets: { hour: string }[] };
     expect(buckets[0].hour).toBe("2024-01-01T10:00:00.000Z");
   });
+
+  it("returns 500 on DB error", async () => {
+    mockQuery.mockRejectedValue(new Error("DB down"));
+
+    const req = makeRequest();
+    const res = await GET(req);
+    expect(res.status).toBe(500);
+    expect((res.body as unknown as { error: string }).error).toBeTruthy();
+  });
 });
