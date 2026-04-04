@@ -1,0 +1,10 @@
+"use strict";(()=>{var e={};e.id=810,e.ids=[810],e.modules={399:e=>{e.exports=require("next/dist/compiled/next-server/app-page.runtime.prod.js")},517:e=>{e.exports=require("next/dist/compiled/next-server/app-route.runtime.prod.js")},5900:e=>{e.exports=require("pg")},899:(e,r,t)=>{t.r(r),t.d(r,{originalPathname:()=>g,patchFetch:()=>m,requestAsyncStorage:()=>c,routeModule:()=>l,serverHooks:()=>h,staticGenerationAsyncStorage:()=>d});var a={};t.r(a),t.d(a,{GET:()=>p});var o=t(5982),s=t(690),n=t(6585),u=t(6884),i=t(4077);async function p(e){let r=parseInt(e.nextUrl.searchParams.get("hours")??"24",10);if(isNaN(r)||r<1)return u.NextResponse.json({error:"Invalid hours parameter"},{status:400});r=Math.min(r,168);let t=`
+    SELECT
+      date_trunc('hour', created_at) AS hour,
+      signal_type AS type,
+      COUNT(*)::integer AS count
+    FROM signals
+    WHERE created_at >= NOW() - $1 * INTERVAL '1 hour'
+    GROUP BY hour, signal_type
+    ORDER BY hour ASC
+  `;try{let e=(await i.d.query(t,[r])).rows.map(e=>({hour:e.hour instanceof Date?e.hour.toISOString():String(e.hour),type:e.type,count:e.count}));return u.NextResponse.json({buckets:e})}catch(e){return console.error("[api/signals/volume] DB error:",e),u.NextResponse.json({error:"Failed to fetch signal volume"},{status:500})}}let l=new o.AppRouteRouteModule({definition:{kind:s.x.APP_ROUTE,page:"/api/signals/volume/route",pathname:"/api/signals/volume",filename:"route",bundlePath:"app/api/signals/volume/route"},resolvedPagePath:"/Users/cedric/code/polymarket-alpha/apps/dashboard/app/api/signals/volume/route.ts",nextConfigOutput:"",userland:a}),{requestAsyncStorage:c,staticGenerationAsyncStorage:d,serverHooks:h}=l,g="/api/signals/volume/route";function m(){return(0,n.patchFetch)({serverHooks:h,staticGenerationAsyncStorage:d})}}};var r=require("../../../../webpack-runtime.js");r.C(e);var t=e=>r(r.s=e),a=r.X(0,[609,202,77],()=>t(899));module.exports=a})();

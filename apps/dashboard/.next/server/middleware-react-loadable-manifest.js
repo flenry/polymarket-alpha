@@ -1,0 +1,1 @@
+self.__REACT_LOADABLE_MANIFEST='{"components/signal-sparkline.tsx -> ./signal-sparkline-inner":{"id":39670,"files":["static/chunks/768.2df76e3450d0bf16.js","static/chunks/670.506b0aaec7cff33b.js"]}}';
