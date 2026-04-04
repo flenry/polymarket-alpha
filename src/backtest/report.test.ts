@@ -97,11 +97,12 @@ describe("BacktestReport — writeJson", () => {
 
 describe("BacktestReport — print (stdout)", () => {
   let stdoutOutput = "";
-  let stdoutSpy: ReturnType<typeof vi.spyOn>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let stdoutSpy: any;
 
   beforeEach(() => {
     stdoutOutput = "";
-    stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+    stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
       stdoutOutput += String(chunk);
       return true;
     });

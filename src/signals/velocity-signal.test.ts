@@ -60,16 +60,15 @@ function populate(
 
   for (let i = 0; i < priorCount; i++) {
     const ts = now - 2 * windowMs + i * 1000;
-    ev.tradeBuffer.get(TOKEN) ?? ev["tradeBuffer"].set(TOKEN, []);
-    (ev as unknown as { tradeBuffer: Map<string, { timestamp: number }[]> }).tradeBuffer
-      .get(TOKEN)!
-      .push({ timestamp: ts });
+    const tb = (ev as unknown as { tradeBuffer: Map<string, { timestamp: number }[]> }).tradeBuffer;
+    if (!tb.has(TOKEN)) tb.set(TOKEN, []);
+    tb.get(TOKEN)!.push({ timestamp: ts });
   }
   for (let i = 0; i < currentCount; i++) {
     const ts = now - windowMs + i * 1000;
-    (ev as unknown as { tradeBuffer: Map<string, { timestamp: number }[]> }).tradeBuffer
-      .get(TOKEN)!
-      .push({ timestamp: ts });
+    const tb = (ev as unknown as { tradeBuffer: Map<string, { timestamp: number }[]> }).tradeBuffer;
+    if (!tb.has(TOKEN)) tb.set(TOKEN, []);
+    tb.get(TOKEN)!.push({ timestamp: ts });
   }
   // Disable warm-up for this token
   (ev as unknown as { warmUntil: Map<string, number> }).warmUntil.delete(TOKEN);

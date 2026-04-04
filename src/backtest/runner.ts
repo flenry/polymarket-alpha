@@ -8,7 +8,7 @@ import { print, writeJson } from "./report.js";
 
 type Db = NodePgDatabase<typeof schema>;
 
-interface SignalRow {
+interface SignalRow extends Record<string, unknown> {
   id: string;
   signal_type: string;
   direction: string;
