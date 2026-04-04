@@ -305,9 +305,7 @@ describe("WebhookEmitter", () => {
       priceAtSignal: 0.5,
       createdAt: new Date(),
       payload: {},
-      velocityZScore: 3.1,
-      hourlyPriceChangePct: 5.2,
-      baselineStdDev: 1.7,
+      tradeCountVelocity: 3.1,
     };
 
     const emitter = new WebhookEmitter({
@@ -338,9 +336,7 @@ describe("WebhookEmitter", () => {
       priceAtSignal: 0.5,
       createdAt: new Date(),
       payload: {},
-      velocityZScore: 3.1,
-      hourlyPriceChangePct: 5.2,
-      baselineStdDev: 1.7,
+      tradeCountVelocity: 3.1,
     };
 
     const emitter = new WebhookEmitter({

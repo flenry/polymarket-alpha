@@ -33,9 +33,14 @@ export const config = Object.freeze({
   walletEnrichmentTimeoutMs: envNumber("WALLET_ENRICHMENT_TIMEOUT_MS", 5_000),
   walletEnrichmentRateLimitRps: envNumber("WALLET_ENRICHMENT_RATE_LIMIT_RPS", 2),
   walletEnrichmentRecencyHours: envNumber("WALLET_ENRICHMENT_RECENCY_HOURS", 24),
-  priceImpactWindowSec: envNumber("PRICE_IMPACT_WINDOW_SEC", 60),
-  priceImpactMinChangePct: envNumber("PRICE_IMPACT_MIN_CHANGE_PCT", 2.0),
-  velocityZScoreThreshold: envNumber("VELOCITY_Z_SCORE_THRESHOLD", 2.0),
+  // Phase 3 — Signal Intelligence
+  priceImpactAnomalyThreshold: envNumber("PRICE_IMPACT_ANOMALY_THRESHOLD", 2.5),
+  priceImpactCooldownMs: envNumber("PRICE_IMPACT_COOLDOWN_MS", 30_000),
+  velocityWindowSeconds: envNumber("VELOCITY_WINDOW_SECONDS", 300),
+  velocityPriceThreshold: envNumber("VELOCITY_PRICE_THRESHOLD", 0.005),
+  velocityTradeCountMultiplier: envNumber("VELOCITY_TRADE_COUNT_MULTIPLIER", 1.5),
+  velocityCooldownMs: envNumber("VELOCITY_COOLDOWN_MS", 120_000),
+  compositeWindowMs: envNumber("COMPOSITE_WINDOW_MS", 60_000),
   logLevel: process.env.LOG_LEVEL ?? "info",
 });
 

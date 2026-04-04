@@ -53,3 +53,18 @@
 - Two separate imbalance evaluators with independent `lastEmits` maps — no shared cooldown state between REST and WS paths
 - Policy: wallet enrichment only for `emitSignal=true` alerts (persisted alerts only)
 - No new npm packages added (token-bucket implemented inline)
+2026-04-04 11:41:07 - [VEGAPUNK] Phase 3 architecture reviewed. PLAN.md updated.
+
+## 2026-04-04 — Law: Phase 3 plan stress test
+
+**Workflow**: Architecture review / feasibility analysis  
+**Verdict**: CHANGES REQUIRED before implementation
+
+**Key flags:**
+- Composite scoring plan cannot satisfy the requirement to enrich all participating signals without either buffering inserts or adding a DB update path for prior signals.
+- Backtest runner plan references a non-existent `createDb()` API and a `tsx` runtime that is not currently installed, so the proposed CLI path will fail as written.
+- PriceImpact v2 on the trade hot path is exposed to ordering/race issues because `price_history` persistence is asynchronous; the “last 2 DB records” may not include the triggering move.
+- SentimentVelocity bootstrap currently seeds price history only; trade-count velocity remains cold after restart and will skew early signals unless trades are also bootstrapped or warm-up is enforced.
+- Backtest “recall” is not well-defined from fired signals alone; either redefine the metric or expand the dataset used by the evaluator.
+
+**Next step**: Amend PLAN.md before Zoro starts Phase 3 so the implementation target is internally consistent and testable.

@@ -2,22 +2,40 @@ import type { TypedEventBus } from "../events/bus.js";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as schema from "../db/schema.js";
 import { insertWhaleAlert } from "../db/queries/whales.js";
-import { insertSignal } from "../db/queries/signals.js";
+import { insertSignal, updateSignalPayloads } from "../db/queries/signals.js";
 import { SIGNAL_TYPES } from "../events/types.js";
-import type { Signal, WhaleAlert } from "../events/types.js";
+import type { Signal, WhaleAlert, TokenId, SignalType } from "../events/types.js";
+import { config } from "../config.js";
 import { logger } from "../logger.js";
 
 type Db = NodePgDatabase<typeof schema>;
+
+interface CompositeEntry {
+  id: bigint;
+  type: SignalType;
+  confidence: number;
+  createdAt: number;
+}
+
+interface CompositeWindow {
+  signals: CompositeEntry[];
+  windowStart: number;
+}
 
 export class SignalAggregator {
   private readonly whaleHandler: (alert: WhaleAlert) => Promise<void>;
   private readonly signalHandler: (signal: Signal) => Promise<void>;
 
+  private readonly compositeMap = new Map<TokenId, CompositeWindow>();
+  private readonly compositeWindowMs: number;
+
   constructor(
     private readonly bus: TypedEventBus,
     private readonly db: Db,
-    private readonly onWhaleInserted?: (alert: WhaleAlert, id: bigint) => void
+    private readonly onWhaleInserted?: (alert: WhaleAlert, id: bigint) => void,
+    opts?: { compositeWindowMs?: number }
   ) {
+    this.compositeWindowMs = opts?.compositeWindowMs ?? config.compositeWindowMs;
     // Bind handlers as named references so they can be removed by stop()
     this.whaleHandler = async (alert) => {
       try {
@@ -84,6 +102,48 @@ export class SignalAggregator {
       signal = { ...signal, confidence: Math.min(1.0, Math.max(0.0, signal.confidence)) };
     }
 
-    await insertSignal(this.db, signal);
+    const inserted = await insertSignal(this.db, signal);
+    if (!inserted) return;
+
+    // ── Composite confidence scoring ──────────────────────────────────────
+    const { tokenId } = signal;
+    const now = Date.now();
+
+    // Get or initialise window
+    let window = this.compositeMap.get(tokenId);
+    if (!window) {
+      window = { signals: [], windowStart: now };
+      this.compositeMap.set(tokenId, window);
+    }
+
+    // Purge entries older than compositeWindowMs
+    window.signals = window.signals.filter(
+      (s) => now - s.createdAt <= this.compositeWindowMs
+    );
+
+    // Register the newly inserted signal
+    window.signals.push({
+      id: inserted.id,
+      type: signal.signalType,
+      confidence: signal.confidence,
+      createdAt: now,
+    });
+
+    if (window.signals.length >= 2) {
+      const count = window.signals.length;
+      const meanConf =
+        window.signals.reduce((sum, s) => sum + s.confidence, 0) / count;
+      const compositeScore = meanConf * (1 + 0.15 * (count - 1));
+
+      const ids = window.signals.map((s) => s.id);
+      const types = window.signals.map((s) => s.type);
+
+      logger.info(`[COMPOSITE] tokenId: ${tokenId}: ${compositeScore.toFixed(4)}, signals: [${types.join(", ")}]`);
+
+      // Patch all participating signal rows with compositeScore
+      updateSignalPayloads(this.db, ids, { compositeScore }).catch((err) =>
+        logger.warn({ err }, "SignalAggregator: composite patch failed")
+      );
+    }
   }
 }

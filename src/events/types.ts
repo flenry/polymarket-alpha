@@ -149,9 +149,8 @@ export interface PriceImpactSignal extends BaseSignal {
 
 export interface VelocitySignal extends BaseSignal {
   signalType: "SENTIMENT_VELOCITY";
-  velocityZScore: number;
-  hourlyPriceChangePct: number;
-  baselineStdDev: number;
+  /** Ratio of current-window trade count to prior-window trade count */
+  tradeCountVelocity: number;
 }
 
 export type Signal = WhaleSignal | ImbalanceSignal | PriceImpactSignal | VelocitySignal;
@@ -197,9 +196,13 @@ export interface PipelineConfig {
   reconnectMaxMs: number;
   minLiquidityUsdc: number;
   imbalanceRatioThreshold: number;
-  priceImpactWindowSec: number;
-  priceImpactMinChangePct: number;
-  velocityZScoreThreshold: number;
+  priceImpactAnomalyThreshold: number;
+  priceImpactCooldownMs: number;
+  velocityWindowSeconds: number;
+  velocityPriceThreshold: number;
+  velocityTradeCountMultiplier: number;
+  velocityCooldownMs: number;
+  compositeWindowMs: number;
   logLevel: string;
   databaseUrl: string;
 }

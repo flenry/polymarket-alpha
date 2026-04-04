@@ -47,6 +47,24 @@ export async function insertSignal(
   return { id: BigInt(rows[0].id) };
 }
 
+/**
+ * Patch the payload jsonb column of multiple signal rows by merging in `patch`.
+ * Uses `payload || $patch` (jsonb concat operator) so existing fields are preserved.
+ * No-op if `ids` is empty.
+ */
+export async function updateSignalPayloads(
+  db: Db,
+  ids: bigint[],
+  patch: Record<string, unknown>
+): Promise<void> {
+  if (ids.length === 0) return;
+  await db.execute(sql`
+    UPDATE signals
+    SET payload = COALESCE(payload, '{}'::jsonb) || ${JSON.stringify(patch)}::jsonb
+    WHERE id = ANY(ARRAY[${sql.join(ids.map((id) => sql`${String(id)}::bigint`), sql`, `)}])
+  `);
+}
+
 export async function getRecentSignals(
   db: Db,
   limitHours = 1

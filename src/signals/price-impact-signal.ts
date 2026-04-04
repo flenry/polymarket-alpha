@@ -1,69 +1,102 @@
-import type { PriceImpactSignal, TokenId } from "../events/types.js";
+import type { PriceImpactSignal, TradeEvent, TokenId } from "../events/types.js";
+import type { SnapshotRecord } from "../db/queries/snapshots.js";
 import { config } from "../config.js";
+import { logger } from "../logger.js";
 
-export interface PricePoint {
-  price: number;
-  recordedAt: Date;
-}
+export class PriceImpactSignalEvaluator {
+  private readonly threshold: number;
+  private readonly cooldownMs: number;
+  private readonly lastEmit = new Map<TokenId, number>();
 
-export interface PriceImpactOptions {
-  windowSec?: number;
-  minChangePct?: number;
-  minLiquidityUsdc?: number;
-}
+  constructor(opts?: { threshold?: number; cooldownMs?: number }) {
+    this.threshold = opts?.threshold ?? config.priceImpactAnomalyThreshold;
+    this.cooldownMs = opts?.cooldownMs ?? config.priceImpactCooldownMs;
+  }
 
-/**
- * Evaluate price impact over the last windowSec seconds.
- * Returns a PriceImpactSignal or null.
- */
-export function evaluatePriceImpact(
-  tokenId: TokenId,
-  conditionId: string,
-  priceHistory: PricePoint[],
-  triggeringTradeValueUsdc: number,
-  liquidityUsdc: number,
-  opts: PriceImpactOptions = {}
-): PriceImpactSignal | null {
-  const windowSec = opts.windowSec ?? config.priceImpactWindowSec;
-  const minChangePct = opts.minChangePct ?? config.priceImpactMinChangePct;
-  const minLiquidityUsdc = opts.minLiquidityUsdc ?? config.minLiquidityUsdc;
+  /**
+   * Evaluate whether a trade triggered an anomalous price impact.
+   *
+   * All data is passed in — no DB reads on the hot path.
+   *
+   * @param trade          - The trade event
+   * @param priceBeforeTrade - Last recorded price before this trade (null on cold start)
+   * @param priceNow       - Current trade price (trade.priceUsdc)
+   * @param snapshot       - Most recent order-book snapshot (null if unavailable)
+   */
+  async evaluate(
+    trade: TradeEvent,
+    priceBeforeTrade: number | null,
+    priceNow: number,
+    snapshot: SnapshotRecord | null
+  ): Promise<PriceImpactSignal | null> {
+    const { tokenId, conditionId } = trade;
 
-  // Bootstrap guard: need at least 2 data points
-  if (priceHistory.length < 2) return null;
+    // 1. Guard: need a snapshot
+    if (!snapshot) return null;
 
-  const priceStart = priceHistory[0].price;
-  const priceEnd = priceHistory[priceHistory.length - 1].price;
+    // 2. Staleness guard (60s)
+    const snapshotAgeMs = Date.now() - snapshot.capturedAt.getTime();
+    if (snapshotAgeMs > 60_000) {
+      logger.warn({ tokenId, snapshotAgeMs }, "PriceImpactSignalEvaluator: stale snapshot, skipping");
+      return null;
+    }
 
-  if (priceStart <= 0) return null;
+    // 3. Guard: need prior price
+    if (priceBeforeTrade === null || priceBeforeTrade === 0) return null;
 
-  const changePct = Math.abs(priceEnd - priceStart) / priceStart * 100;
+    // 4. Corrected depth mapping: BUY consumes ask-side, SELL consumes bid-side (LAW-MINOR-1)
+    const depthUsdc =
+      trade.side === "BUY" ? (snapshot.askDepthUsdc ?? null) : (snapshot.bidDepthUsdc ?? null);
 
-  if (changePct < minChangePct) return null;
+    if (!depthUsdc || depthUsdc === 0) return null;
 
-  // Liquidity guard
-  if (liquidityUsdc < minLiquidityUsdc) return null;
+    // 5. Expected impact = value traded / available depth
+    const expectedImpact = trade.valueUsdc / depthUsdc;
 
-  const direction = priceEnd > priceStart ? "BULLISH" : "BEARISH" as const;
-  const confidence = Math.min(1.0, changePct / 10);
+    // 6. Actual impact = |Δprice| / priceBeforeTrade
+    const actualImpact = Math.abs(priceNow - priceBeforeTrade) / priceBeforeTrade;
 
-  return {
-    signalType: "PRICE_IMPACT_ANOMALY",
-    tokenId,
-    conditionId,
-    direction,
-    confidence,
-    strength: changePct,
-    priceAtSignal: priceEnd,
-    createdAt: new Date(),
-    payload: {
-      priceStart,
-      priceEnd,
-      changePct,
-      windowSec,
-      triggeringTradeValueUsdc,
-    },
-    priceChangePct: changePct,
-    windowSeconds: windowSec,
-    triggeringTradeValueUsdc,
-  };
+    // 7. Anomaly score
+    const score = expectedImpact === 0 ? 0 : actualImpact / expectedImpact;
+    if (score <= this.threshold) return null;
+
+    // 8. Cooldown per token
+    const lastFired = this.lastEmit.get(tokenId) ?? 0;
+    if (Date.now() - lastFired < this.cooldownMs) return null;
+
+    // 9. Build signal
+    const direction = trade.side === "BUY" ? "BULLISH" : "BEARISH";
+    const confidence = Math.min(1.0, (score - this.threshold) / this.threshold);
+
+    this.lastEmit.set(tokenId, Date.now());
+
+    return {
+      signalType: "PRICE_IMPACT_ANOMALY",
+      tokenId,
+      conditionId,
+      direction,
+      confidence,
+      strength: score,
+      priceAtSignal: priceNow,
+      createdAt: new Date(),
+      payload: {
+        score,
+        expectedImpact,
+        actualImpact,
+        depthUsdc,
+        valueUsdc: trade.valueUsdc,
+        priceBeforeTrade,
+        priceNow,
+        snapshotAgeMs,
+      },
+      priceChangePct: actualImpact * 100,
+      windowSeconds: 0,
+      triggeringTradeValueUsdc: trade.valueUsdc,
+    };
+  }
+
+  /** Reset cooldown for a specific token — useful in tests. */
+  resetCooldown(tokenId: TokenId): void {
+    this.lastEmit.delete(tokenId);
+  }
 }
