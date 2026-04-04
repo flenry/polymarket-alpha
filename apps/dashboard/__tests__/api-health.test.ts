@@ -41,7 +41,7 @@ describe("GET /api/health", () => {
     // All 6 queries should have been called
     expect(mockQuery).toHaveBeenCalledTimes(6);
 
-    const body = res.body as HealthResponse;
+    const body = res.body as unknown as HealthResponse;
     expect(body.lastTradeAt).toBe(NOW.toISOString());
     expect(body.lastSnapshotAt).toBe(NOW.toISOString());
     expect(body.lastMarketRefreshAt).toBe(NOW.toISOString());
@@ -61,7 +61,7 @@ describe("GET /api/health", () => {
       .mockResolvedValueOnce({ rows: [{ cnt: 0 }] });
 
     const res = await GET();
-    expect((res.body as HealthResponse).shardsConnected).toBeNull();
+    expect((res.body as unknown as HealthResponse).shardsConnected).toBeNull();
   });
 
   it("handles null MAX timestamps (no data in tables)", async () => {
@@ -74,7 +74,7 @@ describe("GET /api/health", () => {
       .mockResolvedValueOnce({ rows: [{ cnt: 0 }] });
 
     const res = await GET();
-    const body = res.body as HealthResponse;
+    const body = res.body as unknown as HealthResponse;
     expect(body.lastTradeAt).toBeNull();
     expect(body.lastSnapshotAt).toBeNull();
     expect(body.lastMarketRefreshAt).toBeNull();
@@ -87,7 +87,7 @@ describe("GET /api/health", () => {
 
     const res = await GET();
     expect(res.status).toBe(500);
-    expect((res.body as { error: string }).error).toBeTruthy();
+    expect((res.body as unknown as { error: string }).error).toBeTruthy();
   });
 
   it("queries MAX(traded_at) from trades", async () => {

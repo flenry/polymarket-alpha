@@ -77,7 +77,7 @@ describe("GET /api/markets", () => {
     const res = await GET(req);
     expect(res.status).toBe(200);
 
-    const { markets } = res.body as {
+    const { markets } = res.body as unknown as {
       markets: { token_id: string; top_signal_type: string | null }[];
     };
     expect(markets).toHaveLength(2);
@@ -92,7 +92,7 @@ describe("GET /api/markets", () => {
 
     const req = makeRequest();
     const res = await GET(req);
-    const { markets } = res.body as {
+    const { markets } = res.body as unknown as {
       markets: { token_id: string; top_signal_type: string | null }[];
     };
     expect(markets[0].top_signal_type).toBeNull();
@@ -136,7 +136,7 @@ describe("GET /api/markets", () => {
 
     const req = makeRequest();
     const res = await GET(req);
-    const { markets } = res.body as { markets: { top_signal_type: string | null }[] };
+    const { markets } = res.body as unknown as { markets: { top_signal_type: string | null }[] };
     // The API correctly returns whatever the DB returns from deterministic ORDER BY
     expect(markets[0].top_signal_type).toBe("BOOK_IMBALANCE");
   });

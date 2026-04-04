@@ -150,7 +150,7 @@ describe("GET /api/alerts", () => {
     const req = makeRequest();
     const res = await GET(req);
     expect(res.status).toBe(500);
-    expect((res.body as { error: string }).error).toBeTruthy();
+    expect((res.body as unknown as { error: string }).error).toBeTruthy();
   });
 
   it("ALERT_TRADE_JOIN_SQL is used in query (not partial join)", () => {

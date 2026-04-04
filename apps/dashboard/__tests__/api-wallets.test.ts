@@ -163,7 +163,7 @@ describe("GET /api/wallets/[address]/alerts", () => {
 
     const res = await getWalletAlerts(req, params as { params: { address: string } });
     expect(res.status).toBe(200);
-    expect((res.body as { alerts: unknown[] }).alerts).toHaveLength(1);
+    expect((res.body as unknown as { alerts: unknown[] }).alerts).toHaveLength(1);
   });
 
   it("returns empty alerts for unknown address", async () => {
@@ -177,7 +177,7 @@ describe("GET /api/wallets/[address]/alerts", () => {
 
     const res = await getWalletAlerts(req, params as { params: { address: string } });
     expect(res.status).toBe(200);
-    expect((res.body as { alerts: unknown[] }).alerts).toHaveLength(0);
+    expect((res.body as unknown as { alerts: unknown[] }).alerts).toHaveLength(0);
   });
 
   it("uses ALERT_TRADE_JOIN_SQL (full-tuple join)", async () => {

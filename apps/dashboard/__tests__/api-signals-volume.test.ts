@@ -55,7 +55,7 @@ describe("GET /api/signals/volume", () => {
     const res = await GET(req);
     expect(res.status).toBe(200);
 
-    const { buckets } = res.body as { buckets: { hour: string; type: string; count: number }[] };
+    const { buckets } = res.body as unknown as { buckets: { hour: string; type: string; count: number }[] };
     expect(buckets).toHaveLength(2);
     expect(buckets[0].type).toBe("WHALE_TRADE");
     expect(buckets[0].count).toBe(3);
@@ -117,7 +117,7 @@ describe("GET /api/signals/volume", () => {
 
     const req = makeRequest();
     const res = await GET(req);
-    const { buckets } = res.body as { buckets: { hour: string }[] };
+    const { buckets } = res.body as unknown as { buckets: { hour: string }[] };
     expect(buckets[0].hour).toBe("2024-01-01T10:00:00.000Z");
   });
 });
