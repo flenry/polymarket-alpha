@@ -1,990 +1,721 @@
-# Plan: Phase 4 + Phase 5 — Neg-Risk Cross-Book Pricing + Analytics & Observability
-
-> **Board-reviewed & Law-approved** — synthesised from Robin's research brief, Vegapunk's
-> architecture review, and Law's strategic critique. All MAJOR and MINOR findings from the
-> Law review are addressed inline. Zoro implements. Usopp tests. Law approves decisions.
+# Plan: Polymarket Alpha Dashboard (Phase 6 / UI)
+# Board-reviewed revision — 2026-04-04
 
 ## Goal
-Ship a fully tested, type-clean implementation of Phase 4 (neg-risk cross-book arb/outlier signal
-engine) and Phase 5 (wallet leaderboard, signal dashboard, market heat-map CLIs) on branch
-`feat/phase-4-5`, with a PR to `main`. All 414 existing tests must continue to pass. Target
-≥ 470 tests total (+56). Zero TypeScript errors.
-
-## Branch
-`feat/phase-4-5` (created from `main` at Phase 3 merge)
+A production-ready read-only Next.js 14 dashboard at `apps/dashboard/` that surfaces live whale alerts, signals, market heat map, wallet leaderboard, and pipeline health by reading the existing Postgres DB — with Vitest unit tests for all API routes and utilities, pushed as `feat/dashboard` and opened as a PR to main.
 
 ---
 
-## Project Status
-**EXISTING project — Phase 1 + Phase 2 + Phase 3 complete.** 414 tests, 95.88% stmt / 94.64% branch.
-
----
-
-## Board Findings Resolved
-
-### [LAW-MAJOR-1] Neg-risk trade routing — early-return must NOT skip persistence
-
-**Finding:** The original plan's `tradeHandler1` would have added an early-return for neg-risk
-tokens at the top, which would accidentally drop neg-risk trades before they are persisted to
-the `trades` table.
-
-**Resolution — split persistence from signal evaluation:**
-
-In `tradeHandler1`, do NOT early-return for neg-risk tokens before the trade batch push.
-Instead:
-```
-tradeHandler1(trade):
-  1. tradeBatch.push(trade)   ← always, including neg-risk
-  2. (flush if batch full)    ← always
-  3. if (negRiskSet.has(trade.tokenId)) return  ← return HERE (after persist path)
-  4. ... velocity / price-impact evaluation for non-neg-risk only ...
-```
-
-In `tradeHandler2` (WhaleDetector path), the same guard applies:
-```
-tradeHandler2(trade):
-  1. if (negRiskSet.has(trade.tokenId)) return  ← top-of-handler; no DB write needed here
-```
-
-Neg-risk trades ARE persisted to `trades` (for analytics, wallet profiling, backtest).
-They are NOT evaluated by WhaleDetector, PriceImpactSignalEvaluator, or SentimentVelocityEvaluator.
-
-### [LAW-MAJOR-2] Outlier detection — direction-aware logic
-
-**Finding:** The original `max(|price - mean| / stddev)` selector would fire `"BULLISH"` on an
-overpriced token (negative spread from the group's perspective) — wrong direction.
-
-**Resolution — direction-aware outlier detection:**
-
-The `ArbDetector.evaluate()` outlier path uses a **directional filter**:
-- Compute `priceDeviation = (mean24h - token.bestAsk) / stddev` for each token
-  (positive → token is underpriced relative to its 24h mean)
-- `outlierToken = token with max(priceDeviation)` where `priceDeviation > 0`
-- Fire `NEG_RISK_OUTLIER` only when `priceDeviation > 3.0` (underpriced by 3σ)
-- Direction is always `"BULLISH"` (underpriced token is a buy opportunity)
-- To fire a `"BEARISH"` outlier signal (overpriced): `(token.bestAsk - mean24h) / stddev > 3.0`
-  — For Phase 4 MVP, emit `BEARISH` for overpriced tokens too, with `direction = "BEARISH"`
-  and use the token with max overpriced-deviation as the outlier
-
-**Algorithm (Phase 4 MVP, symmetric):**
-```
-for each token in group:
-  history = getTokenPriceHistory24h(db, token.tokenId)
-  if history.length < 5: skip
-  mean   = avg(history.prices)
-  stddev = populationStddev(history.prices)
-  if stddev === 0: skip
-
-  underpricedDev = (mean - token.bestAsk) / stddev   // + means underpriced
-  overpricedDev  = (token.bestAsk - mean) / stddev   // + means overpriced
-
-Select outlier = token with max(|underpricedDev|) among tokens where |dev| > 3.0
-If underpricedDev > 3.0  → direction = "BULLISH"
-If overpricedDev  > 3.0  → direction = "BEARISH"
-```
-
-Confidence: `min(1.0, maxDeviation / 5.0)`
-
-### [LAW-MAJOR-3] Arb detection — size-aware minimum to filter dust quotes
-
-**Finding:** Arb detection based on `bids[0]` / `asks[0]` top-of-book prices ignores executable
-size. A dust quote (e.g. ask size = 0.01) would trigger a false positive arb signal.
-
-**Resolution — minimum size guard on top-of-book:**
-
-In `GroupResolver.resolveGroups()`, when mapping books to `NegRiskToken`:
-```
-bestAsk = asks[0]?.price ?? 1
-bestAskSize = asks[0]?.size ?? 0
-
-// If best ask size < MIN_NEG_RISK_SIZE, use next ask or treat as 1.0
-const MIN_NEG_RISK_SIZE = 10.0   // minimum 10 tokens notional to count as tradeable
-if (bestAskSize < MIN_NEG_RISK_SIZE) {
-  // Walk ask ladder to find first level with sufficient size
-  const tradeable = asks.find(a => a.size >= MIN_NEG_RISK_SIZE)
-  bestAsk = tradeable?.price ?? 1.0   // if no tradeable ask, treat as worst-case (1.0)
-}
-```
-
-This means `sumAsk` reflects prices where at least `MIN_NEG_RISK_SIZE` tokens are available.
-`MIN_NEG_RISK_SIZE` is a constant (not a config var for Phase 4 MVP) — set to `10.0`.
-
-`bestBid` uses the same guard (minimum bid size before counting as a liquid bid):
-```
-if (bids[0]?.size ?? 0 < MIN_NEG_RISK_SIZE) bestBid = 0
-else bestBid = bids[0].price
-```
-
-### [LAW-MAJOR-4] Group membership — dynamic refresh on `markets_updated`
-
-**Finding:** `NegRiskEngine.start(negRiskTokenIds)` seeds from a static array at startup. As
-`GammaPoller` discovers new neg-risk markets, those tokens are silently missed by the engine.
-Also, newly-discovered neg-risk tokens are not subscribed in `ClobWsPool`.
-
-**Resolution — refresh neg-risk membership on `markets_updated`:**
-
-`NegRiskEngine` is wired to `GammaPoller`'s `markets_updated` event in `pipeline.ts`:
-```ts
-gammaPoller.on("markets_updated", (_newTokenIds: TokenId[], newNegRiskIds: TokenId[]) => {
-  if (newNegRiskIds.length > 0) {
-    negRiskEngine.addTokenIds(newNegRiskIds);
-    clobWsPool.addTokenIds(newNegRiskIds);   // subscribe new neg-risk tokens to CLOB WS
-  }
-});
-```
-
-`NegRiskEngine.addTokenIds(ids: string[]): void`:
-- Adds new IDs to `this.negRiskTokenIds` set
-- Triggers a debounced `refresh()` (debounce 2000ms to batch rapid updates)
-- Does NOT restart the interval — new tokens will be picked up on the next scheduled refresh
-  OR the next `BookUpdateEvent` for those tokens
-
-The initial call to `negRiskEngine.start()` uses `gammaPoller.getNegRiskIds()` (populated
-synchronously after `gammaPoller.start()` completes). Subsequent additions come via `addTokenIds`.
-
-### [LAW-MAJOR-5] Analytics SQL — parse cutoffs in Node, not string interpolation
-
-**Finding:** Interpolating `--days` / `--hours` into SQL interval strings (`INTERVAL '${days} days'`)
-is fragile and wrong for CLI inputs.
-
-**Resolution — compute JS Date cutoff, pass as bound parameter:**
-
-All analytics CLIs compute the cutoff as a `Date` object in Node:
-```ts
-// In leaderboard.ts / signal-dashboard.ts / heat-map.ts:
-const days = parseInt(argv.days ?? "7", 10);
-if (!Number.isFinite(days) || days <= 0) throw new Error("--days must be a positive integer");
-const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-
-// Then in the query:
-.where(gte(signals.createdAt, cutoff))   // Drizzle ORM
-// OR raw SQL:
-sql`WHERE created_at >= ${cutoff.toISOString()}::timestamptz`
-```
-
-All three CLIs validate their numeric args before issuing any query. Invalid args throw a
-usage error before DB connection is opened.
-
-### [LAW-MINOR-1] Must-have contradiction — `src/validation/schemas.ts` vs `src/events/types.ts`
-
-**Finding:** The must-have list said "extend `src/validation/schemas.ts`" but Task 1.2 said
-no change needed. Contradictory.
-
-**Resolution — definitive answer:**
-
-`src/validation/schemas.ts` does NOT need to change. The `ZSignalType` enum used in
-`src/db/queries/signals.ts` is built from `SIGNAL_TYPES` in `src/events/types.ts` directly.
-Extending `SIGNAL_TYPES` in `events/types.ts` (Task 1.1) automatically propagates to
-`ZSignalType`. No separate change to `validation/schemas.ts` is required.
-
-The must-have is updated: "Extend `src/events/types.ts` and `src/db/queries/signals.ts`
-(via SIGNAL_TYPES propagation) with two new types."
-
-### [LAW-MINOR-2] `SignalAggregator` guard — pick one design
-
-**Finding:** The must-have required updating `SignalAggregator`'s `SIGNAL_TYPES` guard, but
-the architecture bypasses `SignalAggregator` for neg-risk signals entirely.
-
-**Resolution — independent subsystem design selected:**
-
-`NegRiskEngine` is a fully independent subsystem. It calls `insertSignal()` directly (bypassing
-the event bus and `SignalAggregator`). `SignalAggregator` is NOT updated. Consequently:
-- `SIGNAL_TYPES` guard in `SignalAggregator.handleSignal()` does NOT need `NEG_RISK_ARB` or
-  `NEG_RISK_OUTLIER` added — those types will never reach `SignalAggregator`.
-- `ZSignalType` in `signals.ts` DOES need to include both new types (for `insertSignal`'s
-  Zod validation of signals written directly by `NegRiskEngine`).
-- The must-have requiring `SignalAggregator` guard update is removed.
-- No webhook routing is added to the bus signal handler; `NegRiskEngine` calls
-  `webhookEmitter.send()` directly.
-
-### [LAW-MINOR-3] Group validity upper bound on `sumAsk`
-
-**Finding:** `sumAsk >= 0.95 && sumBid <= 1.05` allows obviously broken books like `sumAsk=1.40`.
-
-**Resolution — add explicit upper bound:**
-
-```
-isValid = sumBid <= 1.05 && sumAsk >= 0.95 && sumAsk <= 1.20 && tokens.length >= 2
-```
-
-The `sumAsk <= 1.20` guard filters groups with egregiously overpriced books (20% above fair
-value suggests data integrity issues or extreme market conditions where arb calculations would
-not be meaningful). Empirical upper bound: legitimate neg-risk groups rarely exceed 1.10 even
-during high volatility.
-
-### [LAW-MINOR-4] `handleBookUpdate` — missing group guard for startup races
-
-**Finding:** `handleBookUpdate` assumes `evt.book.conditionId` maps cleanly to a cached group,
-but the first `refresh()` may not have completed when early book updates arrive.
-
-**Resolution — queue or ignore with debug logging:**
-
-```ts
-handleBookUpdate(evt: BookUpdateEvent): void {
-  if (!this.negRiskTokenIds.has(evt.book.tokenId)) return;   // not a neg-risk token
-  const group = this.groups.get(evt.book.conditionId);
-  if (!group) {
-    logger.debug({ conditionId: evt.book.conditionId }, "NegRiskEngine: group not yet resolved, skipping BookUpdateEvent");
-    return;   // group will be populated on next refresh(); no queue needed (low frequency)
-  }
-  // ... partial update + evaluate
-}
-```
-
-Test: `"book update arrives before first refresh completes"` — should silently return, no throw.
-
-### [LAW-MINOR-5] Leaderboard — sourced from `wallet_profiles` only
-
-**Finding:** The original spec promised joins with `whale_alerts` and `signals` for the
-leaderboard, but the practical join is impractical (whale_alerts lacks a direct proxy_wallet
-column for SQL JOIN).
-
-**Resolution — documented trade-off:**
-
-Phase 5 leaderboard is sourced from `wallet_profiles` only. `wallet_profiles` is maintained by
-`WalletEnricher` and already tracks `trade_count`, `win_ratio`, `total_volume_usdc`, and
-`whale_trade_count`. This is the correct data source for correctness and simplicity.
-
-**This trade-off is documented explicitly:**
-- In the leaderboard CLI output header: `# Source: wallet_profiles (enriched by WalletEnricher)`
-- In CLAUDE.md / README.md Phase 5 description
-
-### [LAW-NIT-1] WebhookEmitter — add explicit neg-risk payload builders
-
-**Finding:** The fallback `JSON.stringify` branch in `WebhookEmitter` is safe but should not
-be relied on long-term for neg-risk signals.
-
-**Resolution:** Task 6.1 adds explicit `buildDiscordNegRiskEmbed()` and `buildSlackNegRiskPayload()`
-builders with purple color `0x9B59B6`. The fallback remains as defensive code for any future
-unknown signal types.
-
----
-
-## Must-Haves (corrected post-Law review)
-
-- `NegRiskEngine` produces `NEG_RISK_ARB` and `NEG_RISK_OUTLIER` signals stored in `signals` table
-- `GroupResolver` correctly groups neg-risk tokens by conditionId, validates price sum with
-  both lower and upper bounds (`0.95 ≤ sumAsk ≤ 1.20`, `sumBid ≤ 1.05`, `tokens.length ≥ 2`),
-  and applies minimum ask-size guard to filter dust quotes
-- `ArbDetector` fires arb signal when spread < -0.02, fires directionally-correct outlier signal
-  (BULLISH for underpriced, BEARISH for overpriced), respects per-conditionId cooldown
-- Neg-risk tokens watchlisted=true in DB; neg-risk trade persistence is NOT skipped (only
-  signal evaluation is gated); neg-risk tokens flow to CLOB WS
-- Newly discovered neg-risk tokens from `markets_updated` are dynamically added to
-  `NegRiskEngine` and `ClobWsPool` (not just seeded at startup)
-- `WebhookEmitter.send()` has explicit purple-embed builders for neg-risk signal types
-- Three analytics CLIs use parsed JS Date cutoffs (not interpolated SQL intervals), validate
-  numeric args, and follow the `tsc && node dist/...` pattern (no tsx)
-- All Phase 4 + Phase 5 tests pass; no regressions in existing 414 tests
-- Config extended with 6 new env vars
-- Signal type union in `src/events/types.ts` extended with two new types; `SIGNAL_TYPES` array
-  updated so `ZSignalType` in `signals.ts` accepts `NEG_RISK_ARB` and `NEG_RISK_OUTLIER`
-- Docs updated: CLAUDE.md, README.md, `.env.example`
+## Must-Haves (goal-backward)
+- [ ] Monorepo workspace configured (`pnpm-workspace.yaml`, root `package.json` scripts)
+- [ ] `apps/dashboard/` bootstrapped with Next.js 14 App Router, Tailwind, shadcn/ui, strict TypeScript
+- [ ] DB connection layer in `lib/db.ts` (singleton pool, imports shared Drizzle schema)
+- [ ] 5 API routes returning correct data with correct query logic
+- [ ] 5 pages with correct components, SWR polling, and layout
+- [ ] `lib/utils.ts` helpers: `formatUSDC`, `formatAddress`, `timeAgo`
+- [ ] Vitest unit tests for all API routes + utils (mock Drizzle)
+- [ ] 0 TypeScript errors in dashboard (`tsc --noEmit`)
+- [ ] Existing 480 root tests continue to pass (no regressions)
+- [ ] CLAUDE.md and README.md updated for Phase 6
 
 ---
 
 ## Out of Scope
-
-- No new DB tables — schema.ts is frozen; signals table handles arbitrary signalType strings
-- No drizzle migrations — drizzle/ directory untouched
-- Phase 1/2/3 source files untouched, **except**: `pipeline.ts`, `config.ts`, `.env.example`,
-  `gamma-poller.ts`, `live-data-ws-client.ts`, `clob-ws-pool.ts`, `events/types.ts`,
-  `db/queries/markets.ts`, `db/queries/price-history.ts`, `alerts/webhook-emitter.ts`
-- No new npm packages; all CLIs use Node.js built-ins + existing deps
-- Real network calls in tests (all mocked)
-- `SignalAggregator` is NOT modified (NegRiskEngine is fully independent)
-- `src/validation/schemas.ts` is NOT modified
+- Authentication / multi-user access
+- Dark mode
+- Playwright / E2E tests
+- Any changes to `src/` pipeline files
+- Any changes to `drizzle/` migration files
+- Real-time WebSocket in dashboard (polling via SWR is sufficient)
+- Mobile optimization beyond basic responsive layout
 
 ---
 
-## Codebase State (as of Phase 3)
+## Board-Reviewed Technical Decisions
 
-### What is LOCKED — must not change
-- `src/db/schema.ts`
-- `drizzle/` directory
-- `src/processors/signal-aggregator.ts` (no changes for Phase 4)
-- `src/validation/schemas.ts` (no changes needed)
-- All Phase 1/2/3 source files not listed in the edit surface below
+### LAW-MAJOR-1 — whale_alerts JOIN strategy (CORRECTED)
 
-### Allowed edit surface (Phase 4+5 may touch these files)
+**Problem**: `transaction_hash` is non-unique in `trades` (partial fills share the same hash).
+A join on `transaction_hash + token_id` alone can fan out to multiple rows and return
+wrong `side`/`proxy_wallet` values.
 
-| File | Permitted change |
-|---|---|
-| `src/events/types.ts` | Add `NEG_RISK_ARB`, `NEG_RISK_OUTLIER` to `SignalType`, `SIGNAL_TYPES`, `Signal` union; add `NegRiskSignal` interface; add `PipelineConfig` Phase 4+5 fields |
-| `src/config.ts` | Add 6 Phase 4+5 env vars |
-| `.env.example` | Add Phase 4+5 sections |
-| `src/db/queries/markets.ts` | Add `getNegRiskMarketsByCondition()`, `getAllWatchlistedTokenIds()` |
-| `src/db/queries/price-history.ts` | Add `getTokenPriceHistory24h()` |
-| `src/sources/gamma-poller.ts` | Flip neg-risk `watchlisted = true`; maintain `negRiskSet` |
-| `src/sources/live-data-ws-client.ts` | Remove neg-risk filter block |
-| `src/pipeline.ts` | Wire NegRiskEngine; add neg-risk guards; wire `markets_updated` → `addTokenIds` |
-| `src/alerts/webhook-emitter.ts` | Add explicit neg-risk payload builders (purple embeds) |
-| `package.json` | Add `leaderboard`, `dashboard`, `heatmap` scripts |
+**Fix**: The `trade_lookup_key` column encodes the full dedup tuple:
+`"txHash|tokenId|proxyWallet|tradedAt|priceUsdc|sizeTokens"`. Use all six parts for the join.
 
-### What is NEW (create from scratch)
-- `src/neg-risk/group-resolver.ts`
-- `src/neg-risk/arb-detector.ts`
-- `src/neg-risk/neg-risk-engine.ts`
-- `src/neg-risk/index.ts` (barrel)
-- `src/analytics/leaderboard.ts`
-- `src/analytics/signal-dashboard.ts`
-- `src/analytics/heat-map.ts`
-- `analytics-results/.gitkeep`
-- `src/neg-risk/group-resolver.test.ts`
-- `src/neg-risk/arb-detector.test.ts`
-- `src/neg-risk/neg-risk-engine.test.ts`
-- `src/analytics/leaderboard.test.ts`
-- `src/analytics/signal-dashboard.test.ts`
-- `src/analytics/heat-map.test.ts`
+**Implementation**: Raw SQL helper function `getAlertHydrationQuery()` in
+`apps/dashboard/lib/alert-hydration.ts` — uses `split_part` to extract each field
+and joins on all six columns with proper casts:
 
----
-
-## Architecture
-
-### Neg-Risk Pipeline Flow (Phase 4)
-
-```
-GammaPoller      → upserts all markets with watchlisted=TRUE (including neg-risk)
-                 → maintains negRiskSet for routing
-LiveDataWsClient → all trades flow through (neg-risk filter removed)
-ClobWsPool       → neg-risk tokenIds included in connect() call
-pipeline.ts      → tradeHandler1: persist all trades; guard signal evaluation for neg-risk
-                 → tradeHandler2: guard at top (neg-risk trades skip WhaleDetector)
-                 → bus.on("book_update") → NegRiskEngine.handleBookUpdate()
-                 → gammaPoller.on("markets_updated") → negRiskEngine.addTokenIds() + clobWsPool.addTokenIds()
-NegRiskEngine    → GroupResolver → ArbDetector → insertSignal + AlertEmitter + WebhookEmitter
+```sql
+LEFT JOIN trades t ON
+  t.transaction_hash = split_part(wa.trade_lookup_key, '|', 1)
+  AND t.token_id     = split_part(wa.trade_lookup_key, '|', 2)
+  AND t.proxy_wallet = split_part(wa.trade_lookup_key, '|', 3)
+  AND t.traded_at    = split_part(wa.trade_lookup_key, '|', 4)::timestamptz
+  AND t.price_usdc   = split_part(wa.trade_lookup_key, '|', 5)::numeric
+  AND t.size_tokens  = split_part(wa.trade_lookup_key, '|', 6)::numeric
+  AND t.traded_at   >= NOW() - INTERVAL '90 days'
 ```
 
-### Analytics Pipeline Flow (Phase 5)
+This guarantees at most one matching trade row per alert (exactly the dedup key).
+The `AND t.traded_at >= NOW() - INTERVAL '90 days'` bound on the partitioned column
+remains for partition pruning.
 
-```
-pnpm leaderboard/dashboard/heatmap
-  → tsc && node dist/analytics/xxx.js
-  → parse CLI args (validate numeric, compute JS Date cutoff)
-  → getDb() → query with Drizzle / raw SQL (bound params)
-  → render ASCII table to stdout
-  → (leaderboard) write JSON to analytics-results/
-  → closeDb() → process.exit(0)
-```
+### LAW-MAJOR-2 — wallets API filter (CORRECTED)
 
-### NegRiskEngine Internal Design
+**Problem**: Filtering on `trade_count >= $minTrades` ranks wallets whose win rate is
+statistically immature (zero resolved positions counts the same as a veteran).
 
-```
-NegRiskEngine
-  ├── GroupResolver (queries DB + ClobRestClient.batchGetBooks)
-  ├── ArbDetector   (pure evaluation, DB for price history only)
-  ├── groups: Map<ConditionId, NegRiskGroup>   ← cache
-  ├── negRiskTokenIds: Set<TokenId>            ← for routing in handleBookUpdate
-  ├── refreshTimer                              ← setInterval(refresh, refreshIntervalMs)
-  └── debounce timer                            ← for addTokenIds batch refresh
+**Fix**: Filter on `resolved_trade_count >= $minTrades` (default 3). Keep `trade_count`
+as a separate display column. Order by `win_ratio DESC NULLS LAST`.
+
+```sql
+WHERE resolved_trade_count >= $minTrades
+  AND total_volume_usdc >= $minVolume
+ORDER BY win_ratio DESC NULLS LAST
 ```
 
----
+`wallet_profiles.resolved_trade_count` and `wallet_profiles.win_ratio` exist in
+schema (lines 344–346 of `src/db/schema.ts`). This is exactly what they are for.
 
-## Config Reference (Phase 4+5 additions)
+### LAW-MAJOR-3 — signals sparkline data source (SPECIFIED)
 
-Add to `src/config.ts` and `.env.example`:
+**Problem**: `/api/signals` is a flat list capped at 200 rows. Deriving a 24h per-hour
+sparkline from that list is incorrect (it samples, not aggregates).
 
-```
-# Phase 4
-NEG_RISK_REFRESH_INTERVAL_MS=120000   → config.negRiskRefreshIntervalMs
-NEG_RISK_ARB_THRESHOLD=-0.02          → config.negRiskArbThreshold   (negative — fire when arbSpread < this)
-NEG_RISK_COOLDOWN_MS=60000            → config.negRiskCooldownMs
-
-# Phase 5
-DASHBOARD_REFRESH_MS=30000            → config.dashboardRefreshMs
-LEADERBOARD_MIN_TRADES=5              → config.leaderboardMinTrades
-LEADERBOARD_TOP_N=20                  → config.leaderboardTopN
-```
-
-`NEG_RISK_ARB_THRESHOLD=-0.02`: `Number("-0.02") = -0.02`. Comparison: `arbSpread < config.negRiskArbThreshold`
-where `arbSpread = sumAsk - 1.0`. Fire when `sumAsk < 0.98`.
-
----
-
-## Algorithm Reference
-
-### GroupResolver — `resolveGroups()`
+**Fix**: Add a dedicated route `/api/signals/volume` that returns a proper bucketed
+time-series aggregate:
 
 ```
-1. getNegRiskMarketsByCondition(db)           → NegRiskMarketRow[]
-2. Group by conditionId (Map<string, row[]>)
-3. For each group:
-   a. clobClient.batchGetBooks(tokenIds)      → OrderBook[]
-   b. Map books to NegRiskToken:
-      - For each token, walk ask ladder for first ask with size ≥ MIN_NEG_RISK_SIZE (10.0)
-        → bestAsk = ladder price, or 1.0 if no tradeable ask
-      - For bid: bestBid = bids[0]?.size >= MIN_NEG_RISK_SIZE ? bids[0].price : 0
-   c. sumBid = sum(token.bestBid)
-   d. sumAsk = sum(token.bestAsk)
-   e. isValid = sumBid <= 1.05
-             && sumAsk >= 0.95
-             && sumAsk <= 1.20
-             && tokens.length >= 2
-4. Return NegRiskGroup[]
+GET /api/signals/volume?hours=24
+Response: { buckets: { hour: string, type: string, count: number }[] }
 ```
 
-### ArbDetector — `evaluate(group: NegRiskGroup)`
-
-```
-Guard: if (!group.isValid || group.tokens.length < 2) return []
-
-impliedProb  = group.sumAsk
-arbSpread    = impliedProb - 1.0
-dominantToken = tokens.reduce(maxByBestAsk)
-
-Cooldown: if (now - lastEmit.get(conditionId) < cooldownMs) return []
-
-signals = []
-
-// --- ARB signal ---
-if (arbSpread < config.negRiskArbThreshold) {     // arbThreshold = -0.02
-  confidence = min(1.0, abs(arbSpread) / 0.05)
-  signals.push(buildArbSignal(dominantToken, group, arbSpread, confidence))
-}
-
-// --- OUTLIER signal ---
-for each token in group:
-  history = getTokenPriceHistory24h(db, token.tokenId)
-  if history.length < 5: continue
-  mean   = avg(history)
-  stddev = populationStddev(history)
-  if stddev === 0: continue
-  underpricedDev = (mean - token.bestAsk) / stddev    // + = underpriced
-  overpricedDev  = (token.bestAsk - mean) / stddev    // + = overpriced
-
-Pick maxDev = max(underpricedDev, overpricedDev) across all tokens
-if maxDev > 3.0:
-  direction  = underpricedDev >= overpricedDev ? "BULLISH" : "BEARISH"
-  confidence = min(1.0, maxDev / 5.0)
-  signals.push(buildOutlierSignal(outlierToken, group, maxDev, direction, confidence))
-
-if signals.length > 0:
-  lastEmit.set(conditionId, now)   ← shared cooldown
-
-return signals
+SQL:
+```sql
+SELECT
+  date_trunc('hour', created_at) AS hour,
+  signal_type AS type,
+  COUNT(*)::integer AS count
+FROM signals
+WHERE created_at >= NOW() - $hours * INTERVAL '1 hour'
+GROUP BY hour, signal_type
+ORDER BY hour ASC
 ```
 
-### Analytics CLIs — Arg Parsing Pattern
+`signal-sparkline.tsx` receives `data: { hour: string, type: string, count: number }[]`
+from this route via a separate SWR fetch — not derived from the table data.
 
-```ts
-// Safe numeric arg parsing (all three CLIs):
-const raw = process.argv.find(a => a.startsWith("--days="))?.split("=")[1] ?? "7";
-const days = parseInt(raw, 10);
-if (!Number.isFinite(days) || days <= 0 || days > 365) {
-  console.error("--days must be a positive integer (1–365)");
-  process.exit(1);
-}
-const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-// Pass cutoff as bound parameter to Drizzle / sql`...${cutoff.toISOString()}::timestamptz`
+### LAW-MINOR-4 — topSignalType determinism (SPECIFIED)
+
+**Problem**: "Subquery or `mode()` aggregate" has undefined tie behavior, making the
+heat map badge nondeterministic and test fixtures flaky.
+
+**Fix**: Deterministic rule encoded into the SQL plan:
+
+> **Top signal type = highest COUNT in window; ties break by highest MAX(confidence),
+> then lexical order on signal_type.**
+
+SQL:
+```sql
+SELECT DISTINCT ON (s.token_id)
+  s.token_id,
+  s.signal_type AS top_signal_type
+FROM signals s
+WHERE s.created_at >= NOW() - $hours * INTERVAL '1 hour'
+  AND s.token_id IN (<the top-20 token IDs from the outer query>)
+GROUP BY s.token_id, s.signal_type
+ORDER BY s.token_id, COUNT(*) DESC, MAX(s.confidence) DESC NULLS LAST, s.signal_type ASC
 ```
 
----
+This must be tested with fixture data that has a tie — assert the correct winner.
 
-## Tasks (Atomic, Testable, Ordered)
+### LAW-MINOR-5 — shadcn/ui component strategy (SPECIFIED)
 
-### Chunk 1 — Type System + Config Foundation (no dependencies)
+**Problem**: Package versions were placeholders and the component sourcing strategy
+was unresolved (init vs. vendor).
 
-**Task 1.1 — Extend `src/events/types.ts`**
-- Add `"NEG_RISK_ARB"` and `"NEG_RISK_OUTLIER"` to `SignalType` union
-- Add both to `SIGNAL_TYPES` readonly array
-- Add `NegRiskSignal` interface extending `BaseSignal`:
-  ```ts
-  export interface NegRiskSignal extends BaseSignal {
-    signalType: "NEG_RISK_ARB" | "NEG_RISK_OUTLIER";
-    arbSpread?: number;          // for ARB signals
-    priceDeviation?: number;     // for OUTLIER signals
-    negRiskGroupSize: number;
-    negRiskSumBid: number;
-    negRiskSumAsk: number;
-    conditionIdGroup: string;    // the group conditionId
-  }
-  ```
-- Add `NegRiskSignal` to `Signal` union type (6-way union)
-- Add Phase 4+5 fields to `PipelineConfig` interface:
-  `negRiskRefreshIntervalMs`, `negRiskArbThreshold`, `negRiskCooldownMs`,
-  `dashboardRefreshMs`, `leaderboardMinTrades`, `leaderboardTopN`
-- ✅ Test: `pnpm typecheck` passes; `SIGNAL_TYPES.length === 6`
+**Fix**: Use exact pinned versions. Vendor generated shadcn/ui component files into
+`apps/dashboard/components/ui/`. Do NOT run `shadcn-ui init` at build time — instead,
+write the component files directly (Brook generates them; Zoro does not need to run
+`npx shadcn-ui@latest init`). This keeps the build deterministic in any workspace.
 
-**Task 1.2 — Extend `src/config.ts` + `.env.example`**
-- Add 6 new config vars with defaults (see Config Reference)
-- Use `envNumber("NEG_RISK_ARB_THRESHOLD", -0.02)` — `Number("-0.02")` parses correctly
-- ✅ Test: `src/config.test.ts` additions — each var reads its env var and falls back to default
+**Pinned versions** (exact, not `^`):
 
----
-
-### Chunk 2 — DB Query Extensions (no dependencies)
-
-**Task 2.1 — Add `getNegRiskMarketsByCondition()` to `src/db/queries/markets.ts`**
-- Query: `SELECT token_id, condition_id, question, slug FROM markets WHERE neg_risk = true AND closed = false`
-- Returns: `NegRiskMarketRow[]` (type defined in query file, imported by GroupResolver)
-  ```ts
-  export interface NegRiskMarketRow {
-    tokenId: string;
-    conditionId: string;
-    question: string;
-    slug: string | null;
-  }
-  ```
-- Application-layer grouping by conditionId (not SQL GROUP BY)
-- ✅ Test: `src/db/queries/markets.test.ts` — returns correct rows, empty when no neg-risk markets
-
-**Task 2.2 — Add `getAllWatchlistedTokenIds()` to `src/db/queries/markets.ts`**
-- Query: returns all `tokenId` where `watchlisted = true` (no negRisk filter)
-- Distinct from existing `getWatchlistedTokenIds` (which may filter negRisk)
-- Used by pipeline.ts for `clobWsPool.connect()` so neg-risk tokens get CLOB WS book updates
-- ✅ Test: returns both neg-risk and non-neg-risk watchlisted tokens
-
-**Task 2.3 — Add `getTokenPriceHistory24h()` to `src/db/queries/price-history.ts`**
-- Query: `price_history` table, `event_type = 'last_trade'` only (not best_bid_ask — too noisy)
-- Returns: `Array<{ price: number; recordedAt: Date }>` for last 24h, ordered ASC
-- Uses Drizzle `.where(and(eq(priceHistory.eventType, 'last_trade'), gte(priceHistory.recordedAt, cutoff24h)))` — no SQL interval interpolation
-- ✅ Test: `src/db/queries/price-history.test.ts` — correct filter, ordering, 24h boundary
-
----
-
-### Chunk 3 — Neg-Risk Module (`src/neg-risk/`)
-
-**Task 3.1 — `src/neg-risk/group-resolver.ts`**
-- Class `GroupResolver`, constructor: `(db: Db, clobClient: ClobRestClient)`
-- Method `resolveGroups(): Promise<NegRiskGroup[]>`
-- Exports:
-  ```ts
-  export interface NegRiskToken {
-    tokenId: string;
-    conditionId: string;
-    bestBid: number;
-    bestAsk: number;
-    question: string;
-  }
-  export interface NegRiskGroup {
-    conditionId: string;
-    tokens: NegRiskToken[];
-    sumBid: number;
-    sumAsk: number;
-    isValid: boolean;
-  }
-  ```
-- Algorithm (see Architecture Reference above):
-  - Size-aware top-of-book: walk ask/bid ladder for `MIN_NEG_RISK_SIZE = 10.0` guard
-  - Validity bounds: `sumBid <= 1.05 && sumAsk >= 0.95 && sumAsk <= 1.20 && tokens.length >= 2`
-- Edge cases:
-  - Empty book (no asks for a token): `bestAsk = 1.0`, `bestBid = 0`
-  - Single-token group: `isValid = false`
-  - batchGetBooks returns partial results: missing tokens default to `bestBid=0, bestAsk=1`
-
-**Task 3.2 — `src/neg-risk/arb-detector.ts`**
-- Class `ArbDetector`, constructor: `(db: Db, opts?: { arbThreshold?: number; cooldownMs?: number })`
-- Method `evaluate(group: NegRiskGroup): Promise<NegRiskSignal[]>`
-- Direction-aware outlier (LAW-MAJOR-2 fix): BULLISH for underpriced, BEARISH for overpriced
-- All edge cases handled (see Algorithm Reference above):
-  - Invalid group: `return []`
-  - Price history < 5 points: skip outlier
-  - stddev = 0: skip outlier (division guard)
-  - cooldown shared per conditionId (both signals suppressed together — acceptable for MVP)
-- Signal `tokenId`: ARB uses `dominantToken.tokenId`; OUTLIER uses `outlierToken.tokenId`
-- Signal `conditionId`: both use `group.conditionId`
-
-**Task 3.3 — `src/neg-risk/neg-risk-engine.ts`**
-- Class `NegRiskEngine`:
-  ```ts
-  constructor(
-    db: Db,
-    clobClient: ClobRestClient,
-    alertEmitter: AlertEmitter,
-    webhookEmitter: WebhookEmitter,
-    opts?: { refreshIntervalMs?: number }
-  )
-  ```
-- Private state:
-  - `resolver: GroupResolver`
-  - `detector: ArbDetector`
-  - `groups: Map<ConditionId, NegRiskGroup>`
-  - `negRiskTokenIds: Set<string>`
-  - `refreshTimer: ReturnType<typeof setInterval> | null`
-  - `debounceTimer: ReturnType<typeof setTimeout> | null`
-- `start(negRiskTokenIds: string[]): void`
-  - Populates `negRiskTokenIds` set, runs immediate `refresh()`, starts interval
-- `stop(): void` — clears interval and debounce timer
-- `addTokenIds(ids: string[]): void`
-  - Adds new IDs to set; triggers debounced `refresh()` (2000ms debounce)
-- `handleBookUpdate(evt: BookUpdateEvent): void`
-  - Guard: if token not in `negRiskTokenIds` → return
-  - Guard: if group not in cache → log debug + return (startup race — LAW-MINOR-4 fix)
-  - Partial update: mutate `group.tokens[i].bestBid/bestAsk` for matching tokenId
-  - Recompute `group.sumBid` and `group.sumAsk` and `group.isValid`
-  - Fire-and-forget `detector.evaluate(group)` → emit signals
-- `refresh(): Promise<void>`
-  - `resolveGroups()` → update `this.groups` cache
-  - For each valid group: `detector.evaluate(group)` → for each signal: insert + alert + webhook
-- `private emitAlert(signal: NegRiskSignal): void`
-  - Prints `[NEG-RISK] ${signal.signalType} conditionId=${signal.conditionIdGroup} conf=${signal.confidence.toFixed(2)}`
-
-**Task 3.4 — `src/neg-risk/index.ts` (barrel)**
-```ts
-export { NegRiskEngine } from "./neg-risk-engine.js";
-export type { NegRiskGroup, NegRiskToken } from "./group-resolver.js";
-```
-
----
-
-### Chunk 4 — Pipeline Changes (depends on Chunk 3)
-
-**Task 4.1 — Update `src/sources/gamma-poller.ts`**
-- Change: `const watchlisted = !isNegRisk;` → `const watchlisted = true;`
-- Maintain `negRiskSet.add(tokenId)` for all neg-risk tokens (still tracked for routing)
-- Change: neg-risk tokens now also added to `watchlistSet` for ClobWsPool subscription:
-  ```ts
-  this.watchlistSet.add(tokenId);
-  if (isNegRisk) this.negRiskSet.add(tokenId);
-  ```
-  Remove the `if (isNegRisk) { ... } else { ... }` exclusive branching
-- Stats bootstrap for neg-risk tokens: SKIP (neg-risk tokens use cross-book model, not single-token stats)
-  Keep bootstrap only for non-neg-risk newly-watchlisted tokens
-- ✅ Test: existing GammaPoller tests still pass; add test for neg-risk token having `watchlisted=true`
-
-**Task 4.2 — Update `src/sources/live-data-ws-client.ts`**
-- Remove the neg-risk filter block:
-  ```ts
-  // REMOVE:
-  if (this.options.negRiskSet.has(tokenId)) { continue; }
-  ```
-- Keep the `negRiskSet` field in `options` type (backward-compat — tests that pass it still compile)
-- ✅ Test: existing tests pass; add test that neg-risk tokenId trade events are NOT filtered
-
-**Task 4.3 — Update `src/pipeline.ts`**
-
-Routing changes:
-- **Trade persistence**: neg-risk trades flow to `tradeBatch.push(trade)` unchanged
-- **`tradeHandler1`**: after `tradeBatch.push(trade)`, add:
-  ```ts
-  if (negRiskSet.has(trade.tokenId)) return;   // signal evaluation only — persistence already done
-  ```
-- **`tradeHandler2`**: at top of handler:
-  ```ts
-  if (negRiskSet.has(trade.tokenId)) return;   // neg-risk whale detection skipped
-  ```
-
-NegRiskEngine wiring:
-```ts
-// After gammaPoller.start():
-const negRiskEngine = new NegRiskEngine(db, clobClient, alertEmitter, webhookEmitter,
-  { refreshIntervalMs: config.negRiskRefreshIntervalMs });
-negRiskEngine.start(gammaPoller.getNegRiskIds());
-
-// markets_updated handler — dynamic membership (LAW-MAJOR-4 fix):
-gammaPoller.on("markets_updated", (_newTokenIds: TokenId[], newNegRiskIds: TokenId[]) => {
-  if (newNegRiskIds.length > 0) {
-    negRiskEngine.addTokenIds(newNegRiskIds);
-    clobWsPool.addTokenIds(newNegRiskIds);
-  }
-});
-
-// book_update routing:
-const negRiskBookHandler = (evt: BookUpdateEvent) => negRiskEngine.handleBookUpdate(evt);
-bus.on("book_update", negRiskBookHandler);
-```
-
-ClobWsPool — include neg-risk tokens:
-- Use `getAllWatchlistedTokenIds(db)` (new query from Task 2.2) instead of `getWatchlistedTokenIds`
-  to pass ALL watchlisted tokens (including neg-risk) to `clobWsPool.connect()`
-
-Shutdown:
-```ts
-negRiskEngine.stop();
-bus.off("book_update", negRiskBookHandler);
-```
-
----
-
-### Chunk 5 — WebhookEmitter Extension (depends on Task 1.1)
-
-**Task 5.1 — Update `src/alerts/webhook-emitter.ts`**
-- Add type guard: `isNegRiskSignal(p: Payload): p is NegRiskSignal`
-  ```ts
-  function isNegRiskSignal(p: Payload): p is NegRiskSignal {
-    return !isWhaleAlert(p) &&
-      ((p as Signal).signalType === "NEG_RISK_ARB" ||
-       (p as Signal).signalType === "NEG_RISK_OUTLIER");
-  }
-  ```
-- Add `buildDiscordNegRiskEmbed(signal: NegRiskSignal): object`:
-  ```ts
-  {
-    embeds: [{
-      title: signal.signalType === "NEG_RISK_ARB"
-        ? "⚗️ Neg-Risk Arb Detected"
-        : "📊 Neg-Risk Outlier Detected",
-      description: `Condition: ${signal.conditionIdGroup}`,
-      color: 0x9B59B6,  // purple
-      fields: [
-        { name: "Direction", value: signal.direction, inline: true },
-        { name: "Confidence", value: signal.confidence.toFixed(2), inline: true },
-        { name: "Group Size", value: String(signal.negRiskGroupSize), inline: true },
-        { name: "Sum Ask", value: signal.negRiskSumAsk.toFixed(4), inline: true },
-        signal.arbSpread != null
-          ? { name: "Arb Spread", value: signal.arbSpread.toFixed(4), inline: true }
-          : { name: "Price Deviation", value: (signal.priceDeviation ?? 0).toFixed(2) + "σ", inline: true },
-      ],
-      timestamp: new Date().toISOString(),
-    }]
-  }
-  ```
-- Add `buildSlackNegRiskPayload(signal: NegRiskSignal): object` — mrkdwn text equivalent
-- Wire into `buildDiscordPayload()` and `buildSlackPayload()` before the generic fallback
-- `Payload` type alias: extend to include `NegRiskSignal`
-- ✅ Test: purple color used for both neg-risk types; fallback NOT hit for NEG_RISK_ARB/OUTLIER
-
----
-
-### Chunk 6 — Analytics CLIs (`src/analytics/`)
-
-All CLIs follow the `backtest/runner.ts` pattern. Scripts: `tsc && node dist/analytics/xxx.js`.
-
-**Task 6.1 — `src/analytics/leaderboard.ts`**
-- Argv parsing: `--min-trades N` (default: `config.leaderboardMinTrades`), `--min-volume N`
-  (default 10000), `--top N` (default: `config.leaderboardTopN`), `--json`
-- Validate: all numeric args are positive finite integers before DB connection
-- Query (wallet_profiles only — LAW-MINOR-5 decision, documented in output header):
-  ```sql
-  SELECT proxy_wallet, total_volume_usdc, trade_count, win_ratio, win_count,
-         resolved_trade_count, whale_trade_count
-  FROM wallet_profiles
-  WHERE trade_count >= $minTrades AND total_volume_usdc >= $minVolume
-  ORDER BY win_ratio DESC, total_volume_usdc DESC
-  LIMIT $topN
-  ```
-- Output: ASCII box table with header `# Source: wallet_profiles (enriched by WalletEnricher)`
-- If `--json`: write JSON to `analytics-results/leaderboard_{timestamp}.json` AND stdout
-- If NOT `--json`: table to stdout, JSON to file only
-- Create `analytics-results/` via `fs.mkdirSync(dir, { recursive: true })`
-- Pattern: `main()` async function, `getDb()` / `closeDb()` from `src/db/client.ts`
-
-**Task 6.2 — `src/analytics/signal-dashboard.ts`**
-- Argv parsing: `--days N` (default 7), `--once`
-- Validate days: positive integer, 1–365
-- Compute cutoff: `new Date(Date.now() - days * 24 * 60 * 60 * 1000)` — pass as bound param
-- Query 1 (per-type counts):
-  ```sql
-  SELECT signal_type,
-         COUNT(*) FILTER (WHERE created_at >= $cutoff24h) AS last_24h,
-         COUNT(*) FILTER (WHERE created_at >= $cutoff) AS last_nd,
-         AVG(confidence) FILTER (WHERE created_at >= $cutoff) AS avg_conf
-  FROM signals WHERE created_at >= $cutoff
-  GROUP BY signal_type
-  ```
-  Where `$cutoff24h = new Date(Date.now() - 86400000)` (computed, not interpolated)
-- Query 2 (whale stats last 24h): COUNT, AVG, MAX of `usdc_value`
-- Query 3 (largest whale last 24h): top 1 by `usdc_value`
-- Render function: formats box table to stdout
-- Refresh loop: `setInterval(render, config.dashboardRefreshMs)` when NOT `--once`
-  - Clear terminal: `process.stdout.write('\x1b[2J\x1b[H')`
-- `--once`: call `render()` once, `closeDb()`, `process.exit(0)`
-
-**Task 6.3 — `src/analytics/heat-map.ts`**
-- Argv parsing: `--hours N` (default 24)
-- Validate: positive integer, 1–168 (7 days max)
-- Compute cutoff: `new Date(Date.now() - hours * 3600 * 1000)` — bound param
-- Query:
-  ```sql
-  SELECT s.token_id, m.question, m.slug,
-         COUNT(*)::int AS signal_count,
-         COUNT(*) FILTER (WHERE s.signal_type = 'WHALE_TRADE')::int AS whale_count,
-         MAX(s.confidence) AS max_conf
-  FROM signals s
-  LEFT JOIN markets m ON s.token_id = m.token_id
-  WHERE s.created_at >= $cutoff
-  GROUP BY s.token_id, m.question, m.slug
-  ORDER BY signal_count DESC
-  LIMIT 20
-  ```
-- Bar: `"█".repeat(Math.round((count / maxCount) * 8)).padEnd(8, "░")`
-- Render and exit (`--once` implicit — heatmap is always a single snapshot)
-
-**Task 6.4 — Update `package.json` scripts**
 ```json
-"leaderboard": "tsc && node dist/analytics/leaderboard.js",
-"dashboard": "tsc && node dist/analytics/signal-dashboard.js",
-"heatmap": "tsc && node dist/analytics/heat-map.js"
+{
+  "dependencies": {
+    "next": "14.2.3",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "swr": "2.2.5",
+    "recharts": "2.12.7",
+    "drizzle-orm": "0.40.0",
+    "pg": "8.13.3",
+    "@radix-ui/react-dialog": "1.1.4",
+    "@radix-ui/react-select": "2.1.4",
+    "@radix-ui/react-progress": "1.1.1",
+    "@radix-ui/react-slot": "1.1.2",
+    "@radix-ui/react-tabs": "1.1.3",
+    "@radix-ui/react-separator": "1.1.1",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "tailwind-merge": "2.6.0",
+    "lucide-react": "0.475.0"
+  },
+  "devDependencies": {
+    "typescript": "5.7.3",
+    "@types/node": "22.13.10",
+    "@types/react": "18.3.18",
+    "@types/react-dom": "18.3.5",
+    "@types/pg": "8.11.11",
+    "tailwindcss": "3.4.17",
+    "postcss": "8.5.3",
+    "autoprefixer": "10.4.20",
+    "vitest": "3.1.1",
+    "@vitejs/plugin-react": "4.3.4"
+  }
+}
 ```
 
-**Task 6.5 — Create `analytics-results/.gitkeep`**
-- Empty file; add `analytics-results/*.json` to `.gitignore`
+**shadcn components to vendor into `components/ui/`**:
+- `button.tsx` — Button
+- `card.tsx` — Card, CardHeader, CardContent, CardTitle
+- `badge.tsx` — Badge
+- `table.tsx` — Table, TableHeader, TableBody, TableRow, TableHead, TableCell
+- `select.tsx` — Select, SelectTrigger, SelectContent, SelectItem
+- `tabs.tsx` — Tabs, TabsList, TabsTrigger, TabsContent
+- `skeleton.tsx` — Skeleton
+- `sheet.tsx` — Sheet, SheetContent, SheetHeader, SheetTitle (wallet side panel)
+- `progress.tsx` — Progress (confidence bar)
+- `slider.tsx` — Slider (min confidence filter)
+
+### Dashboard tsconfig
+Use `moduleResolution: bundler` (Next.js 14 standard). Root `tsconfig.json` uses
+`NodeNext` — these are independent; the dashboard is its own compilation unit.
+Relative import `../../src/db/schema.ts` resolves natively under `bundler`.
+
+### pg singleton in Next.js
+Use `globalThis.__pgPool` guard in `lib/db.ts` to prevent connection leaks during
+hot reload in dev.
+
+### Recharts SSR
+`signal-sparkline.tsx` must use `dynamic(() => import('./signal-sparkline-inner'), { ssr: false })`.
 
 ---
 
-### Chunk 7 — Tests (Phase 4)
+## Tasks
 
-All tests in `src/neg-risk/` colocated with source. All mock DB and HTTP.
+### Chunk 1: Monorepo Setup
 
-**Task 7.1 — `src/neg-risk/group-resolver.test.ts`** (≥ 7 tests)
-1. Valid group (3 tokens, sizes all ≥ 10): `sumBid=0.95`, `sumAsk=1.05` → `isValid=true`
-2. Invalid group — sumBid > 1.05: tokens with overlapping high bids → `isValid=false`
-3. Invalid group — sumAsk > 1.20: `isValid=false` (LAW-MINOR-3 upper bound)
-4. Invalid group — single token: `isValid=false`
-5. Groups by conditionId: 2 conditionIds → 2 separate groups returned
-6. Empty book for one token: defaults to `bestBid=0, bestAsk=1.0`
-7. Dust quote filter: ask at top of book but `size < 10` → walk ladder; if no tradeable ask → `bestAsk=1.0`
-8. Valid group exactly at bounds: `sumAsk=1.20` → `isValid=true`; `sumAsk=1.21` → `isValid=false`
+- [ ] **Task 1.1**: Create `pnpm-workspace.yaml` at repo root
+  - Files: `pnpm-workspace.yaml` (new)
+  - Content:
+    ```yaml
+    packages:
+      - 'apps/*'
+      - '.'
+    ```
+  - Test: `cat pnpm-workspace.yaml` shows correct content
+  - Outcome: `pnpm install` from root resolves both packages
 
-**Task 7.2 — `src/neg-risk/arb-detector.test.ts`** (≥ 9 tests)
-1. ARB signal fires: 3 tokens, `sumAsk=0.90` → `arbSpread=-0.10 < -0.02` → signal emitted
-2. ARB signal NOT fired: `sumAsk=0.99` → `arbSpread=-0.01 >= -0.02` → `[]`
-3. OUTLIER signal fires (BULLISH): mock 24h history, token underpriced by 4σ → `NEG_RISK_OUTLIER, BULLISH`
-4. OUTLIER signal fires (BEARISH): token overpriced by 4σ → `NEG_RISK_OUTLIER, BEARISH`
-5. Cooldown suppresses second evaluate() within `cooldownMs` for same conditionId
-6. Invalid group (`isValid=false`): `return []` immediately
-7. Price history < 5 points: outlier check skipped, only ARB can fire
-8. stddev = 0: outlier skipped (division guard)
-9. Confidence scaling: `arbSpread=-0.10` → `min(1.0, 0.10/0.05) = 1.0`; deviation=3.5 → `min(1.0, 3.5/5.0)=0.70`
-10. Both ARB + OUTLIER can fire in same evaluate() call (two signals in array)
+- [ ] **Task 1.2**: Add dashboard scripts to root `package.json`
+  - Files: `package.json` (modify scripts only)
+  - Add:
+    ```json
+    "dashboard:dev": "pnpm --filter dashboard dev",
+    "dashboard:build": "pnpm --filter dashboard build"
+    ```
+  - Test: `pnpm dashboard:dev --help` does not error on script resolution
+  - Outcome: `pnpm dashboard:dev` launches dashboard from repo root
 
-**Task 7.3 — `src/neg-risk/neg-risk-engine.test.ts`** (≥ 6 tests)
-1. `handleBookUpdate` re-evaluates correct group (conditionId A re-evaluated; B unchanged)
-2. `handleBookUpdate` silently returns when group not yet cached (startup race guard)
-3. Alert emitted to console.log on arb detection (spy on emitAlert)
-4. WebhookEmitter called with purple embed color `0x9B59B6` on signal
-5. `start()` runs immediate `refresh()` (detector.evaluate called after start)
-6. `stop()` clears the interval (refresh not called after stop + delay)
-7. `addTokenIds()` triggers debounced refresh (new tokens appear in negRiskTokenIds set)
+- [ ] **Task 1.3**: Add `NEXT_PUBLIC_DASHBOARD_POLL_INTERVAL_MS` to root `.env.example`
+  - Files: `.env.example` (append)
+  - Outcome: env example documents the new var
 
 ---
 
-### Chunk 8 — Tests (Phase 5)
+### Chunk 2: Dashboard Scaffold
 
-All tests in `src/analytics/` colocated with source. All mock DB.
+- [ ] **Task 2.1**: Create `apps/dashboard/package.json`
+  - Files: `apps/dashboard/package.json` (new)
+  - Use exact pinned versions from LAW-MINOR-5 above
+  - Scripts: `dev`, `build`, `test`, `typecheck`
+  - Outcome: `pnpm install` in `apps/dashboard/` installs all deps
 
-**Task 8.1 — `src/analytics/leaderboard.test.ts`** (≥ 5 tests)
-1. Correct ranking: wallet A (win_ratio=0.718) ranks above wallet B (win_ratio=0.701)
-2. min-trades filter: wallet with `trade_count=3` excluded when `--min-trades=5`
-3. min-volume filter: wallet with `total_volume_usdc=5000` excluded when `--min-volume=10000`
-4. JSON output shape: result has `proxyWallet`, `totalVolumeUsdc`, `winRatio`, `whaleTrades` fields
-5. `--json` flag: JSON goes to stdout (mocked stdout)
-6. Arg validation: `--min-trades=abc` → process.exit(1) before DB call
+- [ ] **Task 2.2**: Create `apps/dashboard/tsconfig.json`
+  - Files: `apps/dashboard/tsconfig.json` (new)
+  - Key settings: `"moduleResolution": "bundler"`, `"strict": true`
+  - Extends Next.js 14 defaults (`next/typescript`)
+  - Paths: `"@/*": ["./*"]`
+  - Include: `["**/*.ts", "**/*.tsx", "../../src/db/schema.ts"]`
+  - Outcome: TypeScript resolves shared schema and all internal paths
 
-**Task 8.2 — `src/analytics/signal-dashboard.test.ts`** (≥ 4 tests)
-1. Correct 24h and 7d counts per signal type (mock signals at different timestamps)
-2. Largest whale displays correctly (highest `usdc_value` in 24h window)
-3. `--once` flag: `render()` called exactly once, no setInterval, process exits
-4. `--days=3`: cutoff computed correctly (Date.now() - 3 * 86400000), passed as bound param
+- [ ] **Task 2.3**: Create `apps/dashboard/next.config.ts`
+  - Files: `apps/dashboard/next.config.ts` (new)
+  - Minimal Next.js 14 config; no custom webpack needed
+  - Outcome: Next.js 14 builds without errors
 
-**Task 8.3 — `src/analytics/heat-map.test.ts`** (≥ 4 tests)
-1. Correct ranking: market with 23 signals ranks above market with 14
-2. Bar length: max-count market gets 8 `█` chars; half-count market gets 4
-3. `--hours=12`: signals older than 12h excluded from count
-4. Arg validation: `--hours=0` → process.exit(1)
+- [ ] **Task 2.4**: Create `apps/dashboard/tailwind.config.ts`
+  - Files: `apps/dashboard/tailwind.config.ts` (new)
+  - Content patterns: `["./app/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}"]`
+  - Extend: `fontFamily: { sans: ['var(--font-inter)', 'sans-serif'] }`
+  - Outcome: Tailwind processes all component files
+
+- [ ] **Task 2.5**: Create `apps/dashboard/.env.local.example`
+  - Content:
+    ```
+    DATABASE_URL=postgres://localhost:5432/polymarket_alpha
+    NEXT_PUBLIC_DASHBOARD_POLL_INTERVAL_MS=5000
+    ```
+  - Outcome: New devs know exactly what env vars to set
+
+- [ ] **Task 2.6**: Create `apps/dashboard/lib/db.ts` — DB connection
+  - `globalThis.__pgPool` singleton guard
+  - `pg.Pool` from `DATABASE_URL`
+  - `drizzle(pool, { schema })` — schema imported from `../../src/db/schema.ts`
+  - Export `db` and `pool`
+  - Outcome: All API routes share one pool
+
+- [ ] **Task 2.7**: Create `apps/dashboard/lib/alert-hydration.ts`
+  - Exports `ALERT_TRADE_JOIN_SQL` — the full-tuple join SQL string (see LAW-MAJOR-1)
+  - This is the ONLY place the join is defined; API routes import and use it
+  - Outcome: Join logic is DRY and testable in isolation
+
+- [ ] **Task 2.8**: Create `apps/dashboard/lib/utils.ts` — shared helpers
+  - `formatUSDC(value: number | null | undefined): string`
+    → `"$127,400"` (≥$1k: 0 decimals), `"$500.50"` (<$1k: 2 decimals), `"—"` for null
+  - `formatAddress(address: string | null | undefined): string`
+    → `"0xABCD…1234"` (first 6 + last 4); passthrough if ≤12 chars; `"—"` for null
+  - `timeAgo(date: Date | string | null | undefined): string`
+    → "just now", "2 min ago", "3h ago", "1d ago"; `"—"` for null
+  - `cn(...inputs: ClassValue[]): string` — tailwind-merge + clsx
+  - Edge cases: all three display helpers return `"—"` for null/undefined
+  - Outcome: Consistent formatting across all components
+
+- [ ] **Task 2.9**: Vendor shadcn/ui components into `apps/dashboard/components/ui/`
+  - Files: `button.tsx`, `card.tsx`, `badge.tsx`, `table.tsx`, `select.tsx`, `tabs.tsx`,
+    `skeleton.tsx`, `sheet.tsx`, `progress.tsx`, `slider.tsx`
+  - Write each file directly (do not run `npx shadcn-ui init`)
+  - Outcome: All 10 shadcn primitives available as deterministic source files
+
+- [ ] **Task 2.10**: Create root layout `apps/dashboard/app/layout.tsx`
+  - Inter font via `next/font/google`
+  - `slate-50` background, flex row: `<Sidebar />` (fixed width) + `<main>` content area
+  - Also: `apps/dashboard/app/globals.css` (Tailwind directives)
+  - Outcome: All pages share consistent nav and font
+
+- [ ] **Task 2.11**: Create `apps/dashboard/components/sidebar.tsx`
+  - Nav items: Alerts, Signals, Markets, Wallets, Health (lucide-react icons)
+  - Active state: `slate-100` background, `blue-600` text
+  - Outcome: Navigation works across all 5 pages
+
+- [ ] **Task 2.12**: Create `apps/dashboard/app/page.tsx` — root redirect
+  - `redirect('/alerts')` via `next/navigation`
+  - Outcome: Visiting `/` → `/alerts`
+
+- [ ] **Task 2.13**: Create `apps/dashboard/components/stat-card.tsx`
+  - Props: `title`, `value`, `subtitle?`, `className?`
+  - White card, 1px `slate-200` border, subtle shadow
+  - Outcome: Reusable KPI card
 
 ---
 
-### Chunk 9 — Documentation
+### Chunk 3: Alerts Page
 
-**Task 9.1 — Update `CLAUDE.md`**
-- Add Phase 4+5 status block (target test count, coverage)
-- Add `src/neg-risk/` and `src/analytics/` to project structure
-- Add `NegRiskEngine`, `GroupResolver`, `ArbDetector` to Key Components
-- Add `pnpm leaderboard`, `pnpm dashboard`, `pnpm heatmap` to How to Run
-- Add 6 new env vars to Environment Variables table
-- Update "Not yet built" section: remove Phase 4 entry
+- [ ] **Task 3.1**: Create `apps/dashboard/app/api/alerts/route.ts`
+  - Query params: `limit` (default 100, max 500), `offset` (≥0), `hours` (1–168, default 24)
+  - SQL: Uses `ALERT_TRADE_JOIN_SQL` from `lib/alert-hydration.ts` (full-tuple join per LAW-MAJOR-1)
+    ```sql
+    SELECT
+      wa.*,
+      t.side,
+      t.proxy_wallet,
+      m.question,
+      m.slug
+    FROM whale_alerts wa
+    <ALERT_TRADE_JOIN_SQL>
+    LEFT JOIN markets m ON m.token_id = wa.token_id
+    WHERE wa.alerted_at >= NOW() - $hours * INTERVAL '1 hour'
+    ORDER BY wa.alerted_at DESC
+    LIMIT $limit OFFSET $offset
+    ```
+  - Also runs a `COUNT(*)` query with same WHERE for `total`
+  - Returns: `{ alerts: AlertRow[], total: number }`
+  - `AlertRow` type: all `whale_alerts` columns + `side: string | null`, `proxyWallet: string | null`, `question: string`, `slug: string | null`
+  - Input validation: invalid `hours` or `limit` → 400
+  - Error handling: 500 with `{ error: string }` on DB failure
+  - Test guidance: mock `db.execute()`. Tests: default params, hours filter, full-tuple join SQL used (not partial), empty result `{ alerts: [], total: 0 }`, malformed hours → 400
 
-**Task 9.2 — Update `README.md`**
-- Architecture diagram: add NegRiskEngine path
-- Phase 4+5 feature descriptions
-- Config table additions
+- [ ] **Task 3.2**: Create `apps/dashboard/components/alerts-table.tsx`
+  - SWR polls `/api/alerts` every 5s
+  - Columns: Time | Market | Side | Value (USDC) | Wallet | σ above mean | % daily vol | Enriched?
+  - Side badge: green "BUY" / red "SELL"
+  - Value: `formatUSDC()`, green for BUY, red for SELL
+  - Wallet: `formatAddress()`, links to `/wallets?wallet={address}`
+  - Gate badge: derive from `sigmasAboveMean` and `pctOfDailyVolume` — `SIGMA` (blue, σ≥3), `PCT_VOL` (amber, pct≥0.02), `BOTH` (green, both met)
+  - Enriched: ✅ if `enrichedAt` set, ⏳ if null
+  - Loading: Skeleton rows
+  - Empty state: "No whale alerts yet — pipeline may still be warming up"
+  - Outcome: Live auto-refreshing alerts table
+
+- [ ] **Task 3.3**: Create `apps/dashboard/app/alerts/page.tsx`
+  - 4 stat cards (derived from SWR data): Total alerts 24h | Largest alert | Avg size | Most active market
+  - Renders `<AlertsTable />`
+  - Outcome: Complete /alerts page
+
+---
+
+### Chunk 4: Signals Page
+
+- [ ] **Task 4.1**: Create `apps/dashboard/app/api/signals/route.ts`
+  - Query params: `types` (comma-sep), `minConfidence` (0–1), `hours` (default 24), `tokenId`
+  - SQL: SELECT from `signals s` LEFT JOIN `markets m` on `s.token_id = m.token_id`
+    WHERE clause applies all filters; ORDER BY `s.created_at DESC` LIMIT 200
+  - Validate `types` against `SIGNAL_TYPES = ['WHALE_TRADE','BOOK_IMBALANCE','PRICE_IMPACT_ANOMALY','SENTIMENT_VELOCITY','NEG_RISK_ARB','NEG_RISK_OUTLIER']`; unknown type → 400
+  - Returns: `{ signals: SignalRow[] }` — include `payload` as-is
+  - Test guidance: default params, valid/invalid types filter, minConfidence clamp, tokenId filter, default 200 limit
+
+- [ ] **Task 4.2**: Create `apps/dashboard/app/api/signals/volume/route.ts`
+  - *(New route — per LAW-MAJOR-3)*
+  - Query params: `hours` (default 24, max 168)
+  - SQL:
+    ```sql
+    SELECT
+      date_trunc('hour', created_at) AS hour,
+      signal_type AS type,
+      COUNT(*)::integer AS count
+    FROM signals
+    WHERE created_at >= NOW() - $hours * INTERVAL '1 hour'
+    GROUP BY hour, signal_type
+    ORDER BY hour ASC
+    ```
+  - Returns: `{ buckets: { hour: string, type: string, count: number }[] }`
+  - Test guidance: correct grouping, empty window → `{ buckets: [] }`, hours clamping
+
+- [ ] **Task 4.3**: Create `apps/dashboard/components/signal-sparkline-inner.tsx`
+  - Recharts `BarChart` — stacked bars, one series per signal type, colored per spec
+  - Accepts `data: { hour: string, type: string, count: number }[]`
+  - Pivots data client-side into `{ hour, WHALE_TRADE, BOOK_IMBALANCE, ... }[]` for stacked bar chart
+  - Signal type colors: `WHALE_TRADE` purple, `BOOK_IMBALANCE` blue, `PRICE_IMPACT_ANOMALY` orange, `SENTIMENT_VELOCITY` teal, `NEG_RISK_ARB` indigo, `NEG_RISK_OUTLIER` violet
+  - Outcome: Client-side Recharts chart (no SSR)
+
+- [ ] **Task 4.4**: Create `apps/dashboard/components/signal-sparkline.tsx`
+  - Wrapper: `dynamic(() => import('./signal-sparkline-inner'), { ssr: false })`
+  - SWR fetch from `/api/signals/volume?hours=24` (separate from table data)
+  - Outcome: Correctly loaded sparkline at top of /signals page
+
+- [ ] **Task 4.5**: Create `apps/dashboard/components/signals-table.tsx`
+  - SWR polls `/api/signals` every 5s with current filter state
+  - Filter bar: Signal Type (multi-select), Min Confidence (Slider 0–100), Last N hours (Select)
+  - Columns: Time | Market | Signal Type | Direction | Confidence | Strength | Composite Score
+  - Signal type badges: per-color spec
+  - Direction: ▲ BULL (green) / ▼ BEAR (red) / — NEUTRAL
+  - Confidence: Progress bar 0–100%
+  - Composite score: read `payload.compositeScore` — show ⭐ + value if present
+  - Loading skeleton
+  - Outcome: Full-featured signal browser
+
+- [ ] **Task 4.6**: Create `apps/dashboard/app/signals/page.tsx`
+  - `<SignalSparkline />` at top + `<SignalsTable />`
+  - Outcome: Complete /signals page
+
+---
+
+### Chunk 5: Markets Page
+
+- [ ] **Task 5.1**: Create `apps/dashboard/app/api/markets/route.ts`
+  - Query params: `hours` (default 24, max 168)
+  - SQL in two parts:
+    1. Outer: top-20 markets by signal count in window, JOIN `markets` + `market_stats`
+    2. `topSignalType` via `DISTINCT ON` with deterministic tie-breaking (LAW-MINOR-4):
+       ```sql
+       SELECT DISTINCT ON (s.token_id)
+         s.token_id,
+         s.signal_type AS top_signal_type
+       FROM signals s
+       WHERE s.created_at >= NOW() - $hours * INTERVAL '1 hour'
+         AND s.token_id = ANY($top20TokenIds)
+       GROUP BY s.token_id, s.signal_type
+       ORDER BY s.token_id,
+                COUNT(*) DESC,
+                MAX(s.confidence) DESC NULLS LAST,
+                s.signal_type ASC
+       ```
+  - Returns: `{ markets: MarketRow[] }` — fields: `tokenId`, `question`, `slug`, `signalCount`, `whaleCount`, `topSignalType`, `volume24h`
+  - Test guidance: hours filter, empty (0 signals → `{ markets: [] }`), JOIN with no matching market row (null question → omit), **tie-breaking test** — fixture with equal counts, assert lexically-later type loses
+
+- [ ] **Task 5.2**: Create `apps/dashboard/components/markets-heatmap.tsx`
+  - SWR polls `/api/markets` every 30s
+  - CSS grid (4 cols responsive): each card shows `question`, signal count badge, whale count, `topSignalType` badge, 24h volume
+  - Card background: `opacity` scales with signal density relative to max in result set:
+    - lowest → `bg-blue-50`
+    - mid → `bg-blue-200`
+    - highest → `bg-blue-500 text-white`
+  - Click: `router.push('/signals?tokenId={tokenId}')`
+  - Loading: Skeleton cards
+  - Empty state: "No signal activity in the last {hours} hours"
+  - Outcome: Visual market heat map with click-through
+
+- [ ] **Task 5.3**: Create `apps/dashboard/app/markets/page.tsx`
+  - Renders `<MarketsHeatmap />`
+  - Outcome: Complete /markets page
+
+---
+
+### Chunk 6: Wallets Page
+
+- [ ] **Task 6.1**: Create `apps/dashboard/app/api/wallets/route.ts`
+  - Query params: `minTrades` (default 3), `minVolume` (default 0), `limit` (default 50, max 200)
+  - SQL (LAW-MAJOR-2 fix — `resolved_trade_count`, not `trade_count`):
+    ```sql
+    SELECT *
+    FROM wallet_profiles
+    WHERE resolved_trade_count >= $minTrades
+      AND total_volume_usdc >= $minVolume
+    ORDER BY win_ratio DESC NULLS LAST
+    LIMIT $limit
+    ```
+  - Returns: `{ wallets: WalletRow[] }` with all `wallet_profiles` columns
+  - Test guidance: default sort on `win_ratio`, `resolved_trade_count` filter (not `trade_count`), `minVolume` filter, empty result
+
+- [ ] **Task 6.2**: Create `apps/dashboard/app/api/wallets/[address]/alerts/route.ts`
+  - Dynamic route: `address` path param
+  - Returns last 20 whale alerts for a wallet:
+    ```sql
+    SELECT wa.*, t.side, m.question, m.slug
+    FROM whale_alerts wa
+    <ALERT_TRADE_JOIN_SQL>
+    LEFT JOIN markets m ON m.token_id = wa.token_id
+    WHERE t.proxy_wallet = $address
+    ORDER BY wa.alerted_at DESC
+    LIMIT 20
+    ```
+  - Returns: `{ alerts: AlertRow[] }` — empty array (not 404) for unknown address
+  - Test guidance: valid address with data, unknown address → `{ alerts: [] }`
+
+- [ ] **Task 6.3**: Create `apps/dashboard/components/wallets-table.tsx`
+  - SWR polls `/api/wallets` every 30s
+  - Columns: Rank | Wallet | Total Vol | Trades | Win Rate | Whale Trades | Last Seen
+    - Note: **Trades** shows `trade_count` (total), but filter uses `resolved_trade_count`
+  - Win rate colored: green >60%, amber 40–60%, red <40%
+  - Wallet: `formatAddress()`, click opens Sheet side panel
+  - Filter inputs: min volume ($), min trades (debounced, 300ms)
+  - Side panel (Sheet): SWR fetch of `/api/wallets/{address}/alerts`; shows last 20 alerts table
+  - Outcome: Full wallet leaderboard with side panel drill-down
+
+- [ ] **Task 6.4**: Create `apps/dashboard/app/wallets/page.tsx`
+  - Renders `<WalletsTable />`
+  - Reads `?wallet=0x...` query param to pre-open side panel on mount
+  - Outcome: Complete /wallets page
+
+---
+
+### Chunk 7: Health Page
+
+- [ ] **Task 7.1**: Create `apps/dashboard/app/api/health/route.ts`
+  - No query params
+  - 6 SQL queries (separate, non-transactional):
+    1. `SELECT MAX(traded_at) FROM trades` → `lastTradeAt`
+    2. `SELECT MAX(captured_at) FROM order_book_snapshots` → `lastSnapshotAt`
+    3. `SELECT MAX(refreshed_at) FROM market_stats` → `lastMarketRefreshAt`
+    4. `SELECT COUNT(*) FROM trades WHERE traded_at >= NOW() - INTERVAL '5 minutes'` → `tradesLast5Min`
+    5. `SELECT COUNT(*) FROM markets WHERE active = true AND watchlisted = true` → `marketsTracked`
+    6. `SELECT COUNT(*) FROM markets WHERE neg_risk = true AND active = true` → `negRiskMarketsTracked`
+  - Returns per spec (shardsConnected always null)
+  - Test guidance: mock all 6 queries, null MAX (no data → null timestamps), full response shape
+
+- [ ] **Task 7.2**: Create `apps/dashboard/components/health-panel.tsx`
+  - SWR polls `/api/health` every 10s
+  - 4 status cards:
+    - **LiveDataWs**: status from `lastTradeAt` — green <30s, amber 30–120s, red >120s
+    - **ClobWsPool**: status from `lastSnapshotAt` — same thresholds; shards shown as "Unknown"
+    - **GammaPoller**: status from `lastMarketRefreshAt`; shows `marketsTracked` count
+    - **DB**: status from `lastTradeAt`; shows `tradesLast5Min` rate
+  - Status: colored dot (green/amber/red) + `timeAgo()` timestamp
+  - Outcome: Visual pipeline health dashboard
+
+- [ ] **Task 7.3**: Create `apps/dashboard/app/health/page.tsx`
+  - Renders `<HealthPanel />`
+  - Outcome: Complete /health page
+
+---
+
+### Chunk 8: Tests
+
+- [ ] **Task 8.1**: Create `apps/dashboard/vitest.config.ts`
+  - Include: `["__tests__/**/*.test.ts"]`
+  - Environment: `node`
+  - Outcome: `pnpm test` in dashboard runs only dashboard tests
+
+- [ ] **Task 8.2**: Create `apps/dashboard/__tests__/utils.test.ts`
+  - `formatUSDC`: `127400 → "$127,400"`, `500.50 → "$500.50"`, `0 → "$0.00"`, `null → "—"`, `undefined → "—"`
+  - `formatAddress`: `"0xABCDEF1234567890abcdef1234" → "0xABCD…f1234"` (first 6, last 4 without 0x prefix, or adjust to spec), short address (≤12 chars) → unchanged, `null → "—"`
+  - `timeAgo`: now → "just now", 90s ago → "1 min ago", 2.5h ago → "2h ago", 2d ago → "2d ago", `null → "—"`
+  - Outcome: 100% coverage on `lib/utils.ts`
+
+- [ ] **Task 8.3**: Create `apps/dashboard/__tests__/alert-hydration.test.ts`
+  - Parse `ALERT_TRADE_JOIN_SQL`: assert it contains all 6 split_part fields
+  - Assert `split_part(wa.trade_lookup_key, '|', 3)` (proxy_wallet) is present — not the 2-field join
+  - Outcome: Regression guard on LAW-MAJOR-1 fix — any future edit that drops join fields fails here
+
+- [ ] **Task 8.4**: Create `apps/dashboard/__tests__/api-alerts.test.ts`
+  - Mock `db.execute()` to return fixture AlertRow data
+  - Tests: default params (limit=100, hours=24), hours filter applied to WHERE, empty result → `{ alerts: [], total: 0 }`, invalid hours → 400, limit > 500 → clamped
+  - Critical test: SQL string passed to `db.execute()` contains `split_part(..., '|', 3)` (full join)
+  - Outcome: Route handler tested in isolation
+
+- [ ] **Task 8.5**: Create `apps/dashboard/__tests__/api-signals.test.ts`
+  - Mock Drizzle query chain
+  - Tests: types filter (valid/invalid type → 400), minConfidence clamped, tokenId filter, default 200 limit
+  - Outcome: Route handler tested in isolation
+
+- [ ] **Task 8.6**: Create `apps/dashboard/__tests__/api-signals-volume.test.ts`
+  - Mock `db.execute()` for bucketed query
+  - Tests: correct `date_trunc('hour', ...)` grouping, empty window → `{ buckets: [] }`, hours param passed through, hours > 168 → clamped
+  - Outcome: Volume route tested in isolation
+
+- [ ] **Task 8.7**: Create `apps/dashboard/__tests__/api-markets.test.ts`
+  - Tests: hours filter, empty signals → `{ markets: [] }`, JOIN with no matching market row, **tie-breaking** — fixture with two types at equal count, assert lower lexical order wins
+  - Outcome: Route handler tested; tie-breaking behavior locked
+
+- [ ] **Task 8.8**: Create `apps/dashboard/__tests__/api-wallets.test.ts`
+  - Tests: default sort by `win_ratio DESC`, filter uses `resolved_trade_count` (not `trade_count`) — assert SQL string, `minVolume` filter, wallet-specific alerts route (valid address / unknown address → `[]`)
+  - Critical test: `resolved_trade_count` must appear in WHERE clause (not `trade_count`)
+  - Outcome: LAW-MAJOR-2 fix locked in; route handler tested
+
+- [ ] **Task 8.9**: Create `apps/dashboard/__tests__/api-health.test.ts`
+  - Tests: all 6 DB queries fired, response shape matches spec, null MAX → null in response, shardsConnected always null
+  - Outcome: Route handler tested in isolation
+
+---
+
+### Chunk 9: Documentation
+
+- [ ] **Task 9.1**: Update `CLAUDE.md`
+  - Add Phase 6 row: dashboard, test counts, branch `feat/dashboard`
+  - Add `apps/dashboard/` to project structure
+  - Outcome: CLAUDE.md reflects current state
+
+- [ ] **Task 9.2**: Update `README.md`
+  - Add dashboard section: `pnpm dashboard:dev`, pages overview, env vars, screenshot placeholder
+  - Outcome: README accurate for new contributors
+
+- [ ] **Task 9.3**: Update `PROGRESS.md`
+  - Append Phase 6 entry per standard format
+  - Outcome: Crew has continuity context
 
 ---
 
 ## Execution Order
 
 ```
-Chunk 1 (1.1 → 1.2)   ← types + config, no deps
-Chunk 2 (2.1 → 2.3)   ← DB query extensions (concurrent with Chunk 1)
-    ↓
-Chunk 3 (3.1 → 3.4)   ← neg-risk module (depends on Chunk 1 types + Chunk 2 queries)
-    ↓
-Chunk 4 (4.1 → 4.3)   ← pipeline changes (depends on Chunk 3)
-Chunk 5 (5.1)          ← WebhookEmitter extension (depends on Chunk 1 types; concurrent with Chunk 4)
-Chunk 6 (6.1 → 6.5)   ← analytics CLIs (depends on Chunk 1 config; concurrent with Chunk 4)
-    ↓
-Chunk 7 (7.1 → 7.3)   ← Phase 4 tests (depends on Chunks 3+4+5)
-Chunk 8 (8.1 → 8.3)   ← Phase 5 tests (depends on Chunk 6)
-    ↓
-Chunk 9 (9.1 → 9.2)   ← docs
-```
-
-Commit strategy (per spec):
-```
-feat: Phase 4 type system (NEG_RISK_ARB, NEG_RISK_OUTLIER signal types + config)
-feat: Phase 4 neg-risk group-resolver + arb-detector
-feat: Phase 4 neg-risk-engine + pipeline integration
-feat: Phase 5 analytics CLIs (leaderboard, dashboard, heatmap)
-test: Phase 4 neg-risk tests
-test: Phase 5 analytics tests
-chore: update docs for Phase 4+5
+1.1 → 1.2 → 1.3                          # Monorepo setup (independent)
+2.1 → 2.2 → 2.3 → 2.4                    # Package + config files (sequential)
+2.5 → 2.6 → 2.7 → 2.8                    # Env + lib (2.6/2.7/2.8 depend on 2.2)
+2.9                                        # Vendor shadcn/ui components (independent of lib)
+2.10 → 2.11 → 2.12 → 2.13                # Layout + nav (depends on 2.2, 2.8, 2.9)
+3.1 → 3.2 → 3.3                          # Alerts (3.1 depends on 2.7; 3.2 depends on 2.8, 3.1)
+4.1 → 4.2 → 4.3 → 4.4 → 4.5 → 4.6      # Signals (4.1/4.2 independent of each other)
+5.1 → 5.2 → 5.3                          # Markets
+6.1 → 6.2 → 6.3 → 6.4                   # Wallets (6.3 depends on 6.1+6.2)
+7.1 → 7.2 → 7.3                          # Health
+8.1 → 8.2 → 8.3 → 8.4 → 8.5 → 8.6 → 8.7 → 8.8 → 8.9  # Tests (deps on API routes + utils)
+9.1 → 9.2 → 9.3                          # Docs last
 ```
 
 ---
 
-## Risks & Mitigations (Final, post-Law review)
+## Commit Sequence
 
-| Risk | Mitigation |
-|---|---|
-| Neg-risk trade persistence accidentally skipped | Early-return placed AFTER `tradeBatch.push(trade)` — persistence always runs (LAW-MAJOR-1) |
-| Outlier fires BULLISH for overpriced token | Directional `underpricedDev` / `overpricedDev` split — correct direction per token (LAW-MAJOR-2) |
-| Dust quotes trigger false arb signals | Walk ask/bid ladder for first level with `size ≥ MIN_NEG_RISK_SIZE` (10.0) (LAW-MAJOR-3) |
-| New neg-risk markets silently missed post-startup | `addTokenIds()` wired to `markets_updated` event; debounced refresh + `clobWsPool.addTokenIds()` (LAW-MAJOR-4) |
-| SQL interval interpolation — injection / type error | All CLIs compute JS `Date` cutoff, validate args as finite positive integers, pass as bound params (LAW-MAJOR-5) |
-| `sumAsk > 1.20` (egregiously broken book) accepted as valid | Upper bound `sumAsk <= 1.20` in validity check (LAW-MINOR-3) |
-| `handleBookUpdate` throws on missing group (startup race) | Guard: if group not in cache → log debug + return (LAW-MINOR-4) |
-| Leaderboard join on whale_alerts impractical | Use `wallet_profiles` only (enriched by WalletEnricher) — documented in output and README (LAW-MINOR-5) |
-| WebhookEmitter falls back to JSON for neg-risk signals | Explicit `buildDiscordNegRiskEmbed` / `buildSlackNegRiskPayload` added (LAW-NIT-1) |
-| `ZSignalType` in signals.ts rejects new types | `SIGNAL_TYPES` in types.ts updated → `ZSignalType` auto-extends (Task 1.1) |
-| SignalAggregator rejects neg-risk types from bus | NegRiskEngine bypasses bus/aggregator entirely — inserts directly (LAW-MINOR-2) |
-| Pipeline misses neg-risk tokens in ClobWsPool | `getAllWatchlistedTokenIds()` returns all watchlisted including neg-risk (Task 2.2) |
+After each chunk is type-checked and working:
+
+1. `git add pnpm-workspace.yaml package.json .env.example && git commit -m "feat: monorepo setup (pnpm-workspace.yaml, root scripts)"`
+2. `git commit -m "feat: dashboard scaffold (Next.js 14, Tailwind, shadcn, layout+nav)"`
+3. `git commit -m "feat: alerts page + API route"`
+4. `git commit -m "feat: signals page + API route + volume sparkline endpoint"`
+5. `git commit -m "feat: markets page + API route"`
+6. `git commit -m "feat: wallets page + API route"`
+7. `git commit -m "feat: health page + API route"`
+8. `git commit -m "feat: vitest tests for API routes + utils"`
+9. `git commit -m "chore: update docs for dashboard"`
+10. `git push origin feat/dashboard && gh pr create --base main --title "feat: Phase 6 — Next.js dashboard" --body "..."`
 
 ---
 
-## TODO (implementation checklist for Zoro)
+## Verification Checklist (before PR)
 
-### Chunk 1 — Foundation
-- [ ] Task 1.1 — extend `src/events/types.ts` (NegRiskSignal, 6-way union, SIGNAL_TYPES, PipelineConfig)
-- [ ] Task 1.2 — extend `src/config.ts` + `.env.example` (6 new vars)
+- [ ] `cd apps/dashboard && pnpm typecheck` — 0 errors
+- [ ] `cd apps/dashboard && pnpm test` — all tests pass
+- [ ] `pnpm test` at repo root — still 480 tests passing (no regressions)
+- [ ] `pnpm dashboard:dev` starts Next.js dev server without errors
+- [ ] All 5 pages render in browser (no JS console errors)
+- [ ] SWR polling visible in Network tab (5s/10s/30s intervals)
+- [ ] `/api/alerts` SQL uses full 6-part join (not 2-part)
+- [ ] `/api/wallets` SQL filters on `resolved_trade_count` (not `trade_count`)
+- [ ] `/api/signals/volume` returns bucketed time-series (separate from flat list)
+- [ ] `/api/markets` `topSignalType` tie-breaking test passes
 
-### Chunk 2 — DB Queries
-- [ ] Task 2.1 — `getNegRiskMarketsByCondition()` in `src/db/queries/markets.ts`
-- [ ] Task 2.2 — `getAllWatchlistedTokenIds()` in `src/db/queries/markets.ts`
-- [ ] Task 2.3 — `getTokenPriceHistory24h()` in `src/db/queries/price-history.ts`
+---
 
-### Chunk 3 — Neg-Risk Module
-- [ ] Task 3.1 — `src/neg-risk/group-resolver.ts` (size-aware, bounded validity)
-- [ ] Task 3.2 — `src/neg-risk/arb-detector.ts` (directional outlier, shared cooldown)
-- [ ] Task 3.3 — `src/neg-risk/neg-risk-engine.ts` (addTokenIds, debounce, startup guard)
-- [ ] Task 3.4 — `src/neg-risk/index.ts` (barrel)
+## Risk Register (Law findings addressed)
 
-### Chunk 4 — Pipeline Integration
-- [ ] Task 4.1 — `src/sources/gamma-poller.ts` (neg-risk watchlisted=true, negRiskSet maintained)
-- [ ] Task 4.2 — `src/sources/live-data-ws-client.ts` (remove neg-risk filter)
-- [ ] Task 4.3 — `src/pipeline.ts` (tradeHandler guards, NegRiskEngine wiring, markets_updated)
+| ID | Law Finding | Severity | Resolution | Task |
+|----|-------------|----------|------------|------|
+| LAW-MAJOR-1 | whale_alerts → trades join non-unique on tx_hash | MAJOR | Full 6-tuple join via `split_part` on all lookup key fields; DRY via `alert-hydration.ts` | 2.7, 3.1, 6.2 |
+| LAW-MAJOR-2 | wallets filter on `trade_count` instead of `resolved_trade_count` | MAJOR | Filter changed to `resolved_trade_count >= $minTrades`; test asserts column name | 6.1, 8.8 |
+| LAW-MAJOR-3 | signals sparkline derived from truncated flat list | MAJOR | New `/api/signals/volume` route with proper `date_trunc` GROUP BY; sparkline SWR uses this route | 4.2, 4.4, 8.6 |
+| LAW-MINOR-4 | topSignalType nondeterministic on ties | MINOR | Deterministic rule: COUNT DESC → MAX(confidence) DESC → signal_type ASC; locked in test | 5.1, 8.7 |
+| LAW-MINOR-5 | shadcn deps placeholder, component sourcing unresolved | MINOR | Exact pinned versions; vendor component files directly (no `npx shadcn-ui init`) | 2.1, 2.9 |
 
-### Chunk 5 — WebhookEmitter
-- [ ] Task 5.1 — `src/alerts/webhook-emitter.ts` (purple neg-risk embeds)
+---
 
-### Chunk 6 — Analytics CLIs
-- [ ] Task 6.1 — `src/analytics/leaderboard.ts` (wallet_profiles only, bound params, --json)
-- [ ] Task 6.2 — `src/analytics/signal-dashboard.ts` (cutoff as bound Date param, --once)
-- [ ] Task 6.3 — `src/analytics/heat-map.ts` (bar proportional, cutoff as bound Date param)
-- [ ] Task 6.4 — `package.json` scripts (tsc && node dist/... pattern)
-- [ ] Task 6.5 — `analytics-results/.gitkeep`
+## TODO
 
-### Chunk 7 — Phase 4 Tests
-- [ ] Task 7.1 — `src/neg-risk/group-resolver.test.ts` (≥8 tests incl. dust/bounds)
-- [ ] Task 7.2 — `src/neg-risk/arb-detector.test.ts` (≥10 tests incl. directional outlier)
-- [ ] Task 7.3 — `src/neg-risk/neg-risk-engine.test.ts` (≥7 tests incl. startup race + addTokenIds)
-
-### Chunk 8 — Phase 5 Tests
-- [ ] Task 8.1 — `src/analytics/leaderboard.test.ts` (≥6 tests incl. arg validation)
-- [ ] Task 8.2 — `src/analytics/signal-dashboard.test.ts` (≥4 tests incl. bound param cutoff)
-- [ ] Task 8.3 — `src/analytics/heat-map.test.ts` (≥4 tests incl. arg validation)
-
-### Chunk 9 — Docs
-- [ ] Task 9.1 — `CLAUDE.md`
-- [ ] Task 9.2 — `README.md`
+- [ ] Task 1.1: Create `pnpm-workspace.yaml`
+- [ ] Task 1.2: Add dashboard scripts to root `package.json`
+- [ ] Task 1.3: Add `NEXT_PUBLIC_DASHBOARD_POLL_INTERVAL_MS` to `.env.example`
+- [ ] Task 2.1: Create `apps/dashboard/package.json` (pinned versions)
+- [ ] Task 2.2: Create `apps/dashboard/tsconfig.json`
+- [ ] Task 2.3: Create `apps/dashboard/next.config.ts`
+- [ ] Task 2.4: Create `apps/dashboard/tailwind.config.ts`
+- [ ] Task 2.5: Create `apps/dashboard/.env.local.example`
+- [ ] Task 2.6: Create `apps/dashboard/lib/db.ts`
+- [ ] Task 2.7: Create `apps/dashboard/lib/alert-hydration.ts` ← NEW (LAW-MAJOR-1)
+- [ ] Task 2.8: Create `apps/dashboard/lib/utils.ts`
+- [ ] Task 2.9: Vendor shadcn/ui components into `components/ui/` (LAW-MINOR-5)
+- [ ] Task 2.10: Create root layout `apps/dashboard/app/layout.tsx`
+- [ ] Task 2.11: Create `apps/dashboard/components/sidebar.tsx`
+- [ ] Task 2.12: Create `apps/dashboard/app/page.tsx`
+- [ ] Task 2.13: Create `apps/dashboard/components/stat-card.tsx`
+- [ ] Task 3.1: Create `apps/dashboard/app/api/alerts/route.ts`
+- [ ] Task 3.2: Create `apps/dashboard/components/alerts-table.tsx`
+- [ ] Task 3.3: Create `apps/dashboard/app/alerts/page.tsx`
+- [ ] Task 4.1: Create `apps/dashboard/app/api/signals/route.ts`
+- [ ] Task 4.2: Create `apps/dashboard/app/api/signals/volume/route.ts` ← NEW (LAW-MAJOR-3)
+- [ ] Task 4.3: Create `apps/dashboard/components/signal-sparkline-inner.tsx`
+- [ ] Task 4.4: Create `apps/dashboard/components/signal-sparkline.tsx`
+- [ ] Task 4.5: Create `apps/dashboard/components/signals-table.tsx`
+- [ ] Task 4.6: Create `apps/dashboard/app/signals/page.tsx`
+- [ ] Task 5.1: Create `apps/dashboard/app/api/markets/route.ts` (deterministic topSignalType)
+- [ ] Task 5.2: Create `apps/dashboard/components/markets-heatmap.tsx`
+- [ ] Task 5.3: Create `apps/dashboard/app/markets/page.tsx`
+- [ ] Task 6.1: Create `apps/dashboard/app/api/wallets/route.ts` (resolved_trade_count)
+- [ ] Task 6.2: Create `apps/dashboard/app/api/wallets/[address]/alerts/route.ts`
+- [ ] Task 6.3: Create `apps/dashboard/components/wallets-table.tsx`
+- [ ] Task 6.4: Create `apps/dashboard/app/wallets/page.tsx`
+- [ ] Task 7.1: Create `apps/dashboard/app/api/health/route.ts`
+- [ ] Task 7.2: Create `apps/dashboard/components/health-panel.tsx`
+- [ ] Task 7.3: Create `apps/dashboard/app/health/page.tsx`
+- [ ] Task 8.1: Create `apps/dashboard/vitest.config.ts`
+- [ ] Task 8.2: Create `apps/dashboard/__tests__/utils.test.ts`
+- [ ] Task 8.3: Create `apps/dashboard/__tests__/alert-hydration.test.ts` ← NEW (LAW-MAJOR-1 regression guard)
+- [ ] Task 8.4: Create `apps/dashboard/__tests__/api-alerts.test.ts`
+- [ ] Task 8.5: Create `apps/dashboard/__tests__/api-signals.test.ts`
+- [ ] Task 8.6: Create `apps/dashboard/__tests__/api-signals-volume.test.ts` ← NEW (LAW-MAJOR-3)
+- [ ] Task 8.7: Create `apps/dashboard/__tests__/api-markets.test.ts`
+- [ ] Task 8.8: Create `apps/dashboard/__tests__/api-wallets.test.ts` (resolved_trade_count assertion)
+- [ ] Task 8.9: Create `apps/dashboard/__tests__/api-health.test.ts`
+- [ ] Task 9.1: Update `CLAUDE.md`
+- [ ] Task 9.2: Update `README.md`
+- [ ] Task 9.3: Update `PROGRESS.md`

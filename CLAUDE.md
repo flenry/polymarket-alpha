@@ -13,6 +13,7 @@ Real-time Polymarket data pipeline. Ingests trade events and order book data, pe
 **Phase 3 is complete and fully tested.** 414 tests passing, 95.88% stmt / 94.64% branch coverage.
 **Phase 4 is complete and fully tested.** 480 tests passing.
 **Phase 5 is complete and fully tested.** 480 tests passing.
+**Phase 6 (Dashboard) is complete and fully tested.** 480 pipeline tests + 108 dashboard tests = 588 total. Branch: `feat/dashboard`.
 
 ---
 
@@ -49,10 +50,17 @@ polymarket-alpha/
 │   └── index.ts           # Entry point
 ├── tests/                 # Integration-style tests (top-level: GammaPoller, Snapshot, WhaleDetector, dedup, LiveDataWs, SignalAgg)
 ├── drizzle/               # SQL migration files + meta journal (0000_*, 0002_partition_trades.sql, README.md, meta/)
+├── apps/
+│   └── dashboard/         # Phase 6: Next.js 14 read-only dashboard
+│       ├── app/           # App Router pages + API routes
+│       ├── components/    # React components + shadcn/ui primitives
+│       ├── lib/           # db.ts, utils.ts, alert-hydration.ts
+│       └── __tests__/     # Vitest unit tests (84 tests)
 ├── drizzle.config.ts
 ├── docker-compose.yml     # postgres + app services
 ├── Dockerfile
 ├── .env.example
+├── pnpm-workspace.yaml    # Monorepo workspace
 ├── package.json
 ├── tsconfig.json
 └── vitest.config.ts
@@ -183,6 +191,19 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 - ✅ `pnpm heatmap` — top 20 markets by signal density
 - ✅ All CLIs: `tsc && node dist/analytics/xxx.js` pattern, bound param cutoffs, numeric arg validation
 
+**Phase 6 complete (branch: `feat/dashboard`).**
+- ✅ 108 dashboard Vitest tests passing (8 test files)
+- ✅ Next.js 14 App Router dashboard at `apps/dashboard/`
+- ✅ 5 pages: `/alerts`, `/signals`, `/markets`, `/wallets`, `/health`
+- ✅ 7 API routes with correct query logic (full-tuple join, resolved_trade_count filter, deterministic topSignalType)
+- ✅ SWR polling: 5s (alerts/signals), 10s (health), 30s (markets/wallets)
+- ✅ Recharts signal volume sparkline (dedicated `/api/signals/volume` bucketed endpoint)
+- ✅ `lib/alert-hydration.ts` — LAW-MAJOR-1: 6-tuple trade join via `split_part`
+- ✅ `lib/utils.ts` — `formatUSDC`, `formatAddress`, `timeAgo`, `cn`
+- ✅ 10 shadcn/ui primitives vendored (Button, Card, Badge, Table, Select, Tabs, Skeleton, Sheet, Progress, Slider)
+- ✅ `pnpm-workspace.yaml` monorepo setup; `pnpm dashboard:dev` / `pnpm dashboard:build` from root
+- ✅ Existing 480 pipeline tests unaffected (0 regressions)
+
 ### Two separate imbalance evaluators — distinct trigger paths
 
 | Evaluator | Path | File | Cooldown | Confidence formula |
@@ -222,6 +243,10 @@ pnpm dashboard                # signal type dashboard (refreshes every 30s)
 pnpm dashboard --days=3 --once
 pnpm heatmap                  # market heat map (last 24h)
 pnpm heatmap --hours=48
+
+# Dashboard
+pnpm dashboard:dev            # start Next.js dev server at http://localhost:3000
+pnpm dashboard:build          # production build
 ```
 
 Or run everything in Docker:
@@ -232,7 +257,8 @@ docker compose up -d
 ## How to Test
 
 ```bash
-pnpm test              # unit tests (all 480, 44 test files)
+pnpm test              # unit tests (all 480, 44 test files) — pipeline only
+cd apps/dashboard && pnpm test  # dashboard tests (84 tests, 8 test files)
 pnpm test:coverage     # with v8 coverage report
 pnpm typecheck         # tsc --noEmit
 pnpm db:generate       # generate drizzle migrations (idempotent after init)
@@ -278,4 +304,4 @@ pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql direct
 
 ---
 
-Last updated: 2026-04-04 (Phase 4+5 final — 480 tests)
+Last updated: 2026-04-04 (Phase 6 final — 480 pipeline + 108 dashboard = 588 tests)

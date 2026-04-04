@@ -16,6 +16,7 @@ A real-time data pipeline that ingests Polymarket market data, persists snapshot
 - **Backtesting**: `pnpm backtest` — precision/recall/F1 per signal type against resolved markets — Phase 3
 - **Neg-risk cross-book model**: `NegRiskEngine` groups multi-outcome markets by `conditionId`, detects arb spreads and outlier mispricings — Phase 4
 - **Analytics CLIs**: wallet leaderboard, signal dashboard (real-time), market heat map — Phase 5
+- **Next.js dashboard**: read-only web UI at `apps/dashboard/` — whale alerts, signals, heat map, wallet leaderboard, pipeline health — Phase 6
 
 ## Stack
 
@@ -50,10 +51,32 @@ pnpm start
 docker compose up -d
 ```
 
+## Dashboard (Phase 6)
+
+A read-only Next.js 14 dashboard at `apps/dashboard/` connects to the same Postgres DB.
+
+```bash
+# Install & configure
+pnpm install
+cp apps/dashboard/.env.local.example apps/dashboard/.env.local
+# Edit DATABASE_URL in apps/dashboard/.env.local
+
+# Start dev server (http://localhost:3000)
+pnpm dashboard:dev
+
+# Production build
+pnpm dashboard:build
+
+# Dashboard tests
+cd apps/dashboard && pnpm test   # 108 tests, 8 test files
+```
+
+Pages: `/alerts` (whale feed, 5s), `/signals` (stream + sparkline, 5s), `/markets` (heat map, 30s), `/wallets` (leaderboard, 30s), `/health` (pipeline status, 10s)
+
 ## Testing
 
 ```bash
-# Unit tests (480 tests, 44 test files)
+# Unit tests (480 tests, 44 test files) — pipeline
 pnpm test
 
 # With v8 coverage report
