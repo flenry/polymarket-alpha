@@ -56,9 +56,15 @@ export async function GET() {
     return NextResponse.json(response);
   } catch (err) {
     console.error("[api/health] DB error:", err);
-    return NextResponse.json(
-      { error: "Failed to fetch health metrics" },
-      { status: 500 }
-    );
+    const fallback: HealthResponse = {
+      lastTradeAt: null,
+      lastSnapshotAt: null,
+      lastMarketRefreshAt: null,
+      tradesLast5Min: 0,
+      marketsTracked: 0,
+      negRiskMarketsTracked: 0,
+      shardsConnected: null,
+    };
+    return NextResponse.json(fallback);
   }
 }

@@ -41,9 +41,6 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ buckets });
   } catch (err) {
     console.error("[api/signals/volume] DB error:", err);
-    return NextResponse.json(
-      { error: "Failed to fetch signal volume" },
-      { status: 500 }
-    );
+    return NextResponse.json({ buckets: [] });
   }
 }

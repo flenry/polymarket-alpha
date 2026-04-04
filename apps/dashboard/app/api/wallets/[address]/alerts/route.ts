@@ -31,9 +31,6 @@ export async function GET(
     return NextResponse.json({ alerts: result.rows as AlertRow[] });
   } catch (err) {
     console.error("[api/wallets/[address]/alerts] DB error:", err);
-    return NextResponse.json(
-      { error: "Failed to fetch wallet alerts" },
-      { status: 500 }
-    );
+    return NextResponse.json({ alerts: [] });
   }
 }

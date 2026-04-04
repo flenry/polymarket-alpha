@@ -97,9 +97,6 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ signals: result.rows as SignalRow[] });
   } catch (err) {
     console.error("[api/signals] DB error:", err);
-    return NextResponse.json(
-      { error: "Failed to fetch signals" },
-      { status: 500 }
-    );
+    return NextResponse.json({ signals: [] });
   }
 }
