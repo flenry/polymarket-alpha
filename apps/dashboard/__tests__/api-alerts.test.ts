@@ -124,8 +124,20 @@ describe("GET /api/alerts", () => {
     expect(res.status).toBe(400);
   });
 
+  it("returns 400 for non-numeric limit", async () => {
+    const req = makeRequest({ limit: "abc" });
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+  });
+
   it("returns 400 for negative offset", async () => {
     const req = makeRequest({ offset: "-1" });
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for non-numeric offset", async () => {
+    const req = makeRequest({ offset: "abc" });
     const res = await GET(req);
     expect(res.status).toBe(400);
   });
