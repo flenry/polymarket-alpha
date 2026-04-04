@@ -25,9 +25,9 @@ export function Sidebar() {
   return (
     <aside className="w-56 min-h-screen bg-white border-r border-slate-200 flex flex-col">
       <div className="px-4 py-5 border-b border-slate-200">
-        <h1 className="text-sm font-semibold text-slate-900 tracking-tight">
+        <p className="text-sm font-semibold text-slate-900 tracking-tight">
           Polymarket Alpha
-        </h1>
+        </p>
         <p className="text-xs text-slate-500 mt-0.5">Dashboard</p>
       </div>
       <nav className="flex-1 p-2">
