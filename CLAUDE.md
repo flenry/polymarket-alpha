@@ -14,6 +14,7 @@ Real-time Polymarket data pipeline. Ingests trade events and order book data, pe
 **Phase 4 is complete and fully tested.** 480 tests passing.
 **Phase 5 is complete and fully tested.** 480 tests passing.
 **Phase 6 (Dashboard) is complete and fully tested.** 480 pipeline tests + 108 dashboard tests = 588 total. Branch: `feat/dashboard`.
+**E2E tests added.** 49 Playwright E2E tests covering all 5 pages. Branch: `feat/dashboard-e2e`.
 
 ---
 
@@ -55,7 +56,8 @@ polymarket-alpha/
 │       ├── app/           # App Router pages + API routes
 │       ├── components/    # React components + shadcn/ui primitives
 │       ├── lib/           # db.ts, utils.ts, alert-hydration.ts
-│       └── __tests__/     # Vitest unit tests (84 tests)
+│       │   └── __tests__/     # Vitest unit tests (108 tests)
+    │   └── e2e/           # Playwright E2E tests (49 tests)
 ├── drizzle.config.ts
 ├── docker-compose.yml     # postgres + app services
 ├── Dockerfile
@@ -304,4 +306,4 @@ pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql direct
 
 ---
 
-Last updated: 2026-04-04 (Phase 6 final — 480 pipeline + 108 dashboard = 588 tests)
+Last updated: 2026-04-04 (E2E — 480 pipeline + 108 dashboard unit + 49 Playwright E2E = 637 total)
