@@ -8,11 +8,12 @@ A real-time data pipeline that ingests Polymarket market data, persists snapshot
 - **Market catalog**: Gamma REST API polled every 60s; neg-risk markets explicitly excluded
 - **Order book snapshots**: CLOB REST batch polling + CLOB WebSocket pool (`ClobWsPool`, sharded, Phase 2)
 - **Whale detection**: Dual-threshold (absolute $10k + 3σ above mean OR 2% of daily volume)
-- **Signal engine**: 4 signal types: `WHALE_TRADE`, `ORDER_BOOK_IMBALANCE`, `PRICE_IMPACT_ANOMALY`, `SENTIMENT_VELOCITY`
+- **Signal engine**: 4 signal types: `WHALE_TRADE`, `ORDER_BOOK_IMBALANCE`, `PRICE_IMPACT_ANOMALY`, `SENTIMENT_VELOCITY`; composite confidence scoring across co-occurring signals
 - **Deduplication**: DB-enforced unique index on `(tx_hash, token_id, proxy_wallet, traded_at, price_usdc, size_tokens)`
 - **Partitioning**: Daily partitions on `trades` and `order_book_snapshots` from day 1
 - **Webhook alerts**: Discord + Slack delivery via `WebhookEmitter` (5 req/s, 429 retry) — Phase 2
 - **Wallet enrichment**: Async wallet profiling from data-api, 24h recency guard, upserts `wallet_profiles` — Phase 2
+- **Backtesting**: `pnpm backtest` — precision/recall/F1 per signal type against resolved markets — Phase 3
 
 ## Stack
 
@@ -50,14 +51,18 @@ docker compose up -d
 ## Testing
 
 ```bash
-# Unit tests (357 tests, 34 test files)
+# Unit tests (414 tests, 38 test files)
 pnpm test
 
-# With v8 coverage report (97.33% stmt, 95.91% branch)
+# With v8 coverage report (95.88% stmt, 94.64% branch)
 pnpm test:coverage
 
 # Type-check only
 pnpm typecheck
+
+# Backtest signals against resolved markets
+pnpm backtest --start 2025-01-01 --end 2025-04-01
+pnpm backtest --start 2025-01-01 --end 2025-04-01 --signal-types WHALE_TRADE,PRICE_IMPACT_ANOMALY --min-confidence 0.6
 ```
 
 ## Architecture
@@ -83,6 +88,16 @@ Processors:
   SnapshotWriter              → order_book_snapshots table
   PriceHistoryWriter          → price_history table
   SignalAggregator            → signals + whale_alerts tables; fires onWhaleInserted
+                                 composite scoring: co-occurring signals enriched with compositeScore in payload
+
+Signals (Phase 3):
+  PriceImpactSignalEvaluator  → in-memory, no hot-path DB reads; BUY→askDepth, SELL→bidDepth; 60s stale snapshot guard
+  SentimentVelocityEvaluator  → rolling price+trade buffers; warm-up suppression; DB bootstrap on startup
+
+Backtesting (Phase 3):
+  BacktestRunner              → queries signals + markets, joins resolutions, calls evaluator
+  BacktestEvaluator           → precision/recall/F1 per signal type + overall
+  BacktestReport              → stdout table + backtest-results/{start}_{end}.json
 
 Alerts & Enrichment:
   AlertEmitter                → stdout JSON + optional WebhookEmitter
@@ -96,8 +111,8 @@ Alerts & Enrichment:
 |--------|---------|
 | `WHALE_TRADE` | `valueUsdc >= $10k` AND (`sigmas >= 3` OR `pct >= 2%`) |
 | `ORDER_BOOK_IMBALANCE` | bid/ask depth ratio > 3:1 or < 1:3 |
-| `PRICE_IMPACT_ANOMALY` | Mid price moves > 2% in 60s |
-| `SENTIMENT_VELOCITY` | 60-min return z-score > 2σ vs 24h baseline |
+| `PRICE_IMPACT_ANOMALY` | actual price impact / expected book-depth impact > threshold (default 2.5×) |
+| `SENTIMENT_VELOCITY` | \|price velocity\| > 0.5%/min AND trade count velocity > 1.5× prior window |
 
 ## Configuration
 
@@ -121,6 +136,13 @@ See `.env.example` for all configurable parameters.
 | `WALLET_ENRICHMENT_TIMEOUT_MS` | 5000 | Wallet fetch timeout |
 | `WALLET_ENRICHMENT_RATE_LIMIT_RPS` | 2 | data-api calls per second |
 | `WALLET_ENRICHMENT_RECENCY_HOURS` | 24 | Skip re-enrichment if profile < N hours old |
+| `PRICE_IMPACT_ANOMALY_THRESHOLD` | 2.5 | Anomaly score multiplier to fire price-impact signal |
+| `PRICE_IMPACT_COOLDOWN_MS` | 30000 | Per-token cooldown for price-impact signal (ms) |
+| `VELOCITY_WINDOW_SECONDS` | 300 | Rolling window for sentiment velocity (seconds) |
+| `VELOCITY_PRICE_THRESHOLD` | 0.005 | Price velocity threshold (% per minute, 0.5%) |
+| `VELOCITY_TRADE_COUNT_MULTIPLIER` | 1.5 | Trade count velocity multiplier vs prior window |
+| `VELOCITY_COOLDOWN_MS` | 120000 | Per-token cooldown for velocity signal (ms) |
+| `COMPOSITE_WINDOW_MS` | 60000 | Window for composite confidence scoring across co-occurring signals |
 
 ## Developer Reference
 
