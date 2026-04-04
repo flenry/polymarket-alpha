@@ -4,3 +4,4 @@ dist/
 *.js.map
 coverage/
 backtest-results/*.json
+analytics-results/*.json
