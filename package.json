@@ -19,7 +19,9 @@
     "backtest": "tsc && node dist/backtest/runner.js",
     "leaderboard": "tsc && node dist/analytics/leaderboard.js",
     "dashboard": "tsc && node dist/analytics/signal-dashboard.js",
-    "heatmap": "tsc && node dist/analytics/heat-map.js"
+    "heatmap": "tsc && node dist/analytics/heat-map.js",
+    "dashboard:dev": "pnpm --filter dashboard dev",
+    "dashboard:build": "pnpm --filter dashboard build"
   },
   "dependencies": {
     "drizzle-orm": "^0.40.0",
