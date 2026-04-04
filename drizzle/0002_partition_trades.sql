@@ -7,6 +7,14 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 -- TRADES: convert to PARTITION BY RANGE (traded_at)
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Drop indexes from 0000 migration before renaming (they keep their names on rename)
+DROP INDEX IF EXISTS trades_tx_hash_idx;
+DROP INDEX IF EXISTS trades_token_time_idx;
+DROP INDEX IF EXISTS trades_condition_time_idx;
+DROP INDEX IF EXISTS trades_wallet_idx;
+DROP INDEX IF EXISTS trades_value_idx;
+DROP INDEX IF EXISTS trades_time_idx;
+
 ALTER TABLE trades RENAME TO trades_legacy;
 
 CREATE TABLE trades (
@@ -61,6 +69,10 @@ DROP TABLE trades_legacy;
 -- ─────────────────────────────────────────────────────────────────────────────
 -- ORDER_BOOK_SNAPSHOTS: convert to PARTITION BY RANGE (captured_at)
 -- ─────────────────────────────────────────────────────────────────────────────
+DROP INDEX IF EXISTS obs_token_time_idx;
+DROP INDEX IF EXISTS obs_condition_idx;
+DROP INDEX IF EXISTS obs_imbalance_idx;
+
 ALTER TABLE order_book_snapshots RENAME TO order_book_snapshots_legacy;
 
 CREATE TABLE order_book_snapshots (
