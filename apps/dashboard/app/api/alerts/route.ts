@@ -87,9 +87,6 @@ export async function GET(request: NextRequest) {
     });
   } catch (err) {
     console.error("[api/alerts] DB error:", err);
-    return NextResponse.json(
-      { error: "Failed to fetch alerts" },
-      { status: 500 }
-    );
+    return NextResponse.json({ alerts: [], total: 0 });
   }
 }

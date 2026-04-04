@@ -179,12 +179,13 @@ describe("GET /api/wallets", () => {
     expect(res.status).toBe(400);
   });
 
-  it("returns 500 on DB error", async () => {
+  it("returns empty wallets on DB error (graceful degradation)", async () => {
     mockQuery.mockRejectedValue(new Error("DB down"));
 
     const req = makeRequest();
     const res = await getWallets(req);
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(200);
+    expect((res.body as unknown as { wallets: unknown[] }).wallets).toEqual([]);
   });
 });
 
@@ -277,7 +278,7 @@ describe("GET /api/wallets/[address]/alerts", () => {
     expect(callQuery).toContain("LIMIT 20");
   });
 
-  it("returns 500 on DB error", async () => {
+  it("returns empty alerts on DB error (graceful degradation)", async () => {
     mockQuery.mockRejectedValue(new Error("DB down"));
 
     const req = makeRequest(
@@ -287,7 +288,7 @@ describe("GET /api/wallets/[address]/alerts", () => {
     const params = { params: { address: "0x1234" } };
 
     const res = await getWalletAlerts(req, params as { params: { address: string } });
-    expect(res.status).toBe(500);
-    expect((res.body as unknown as { error: string }).error).toBeTruthy();
+    expect(res.status).toBe(200);
+    expect((res.body as unknown as { alerts: unknown[] }).alerts).toEqual([]);
   });
 });

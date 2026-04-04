@@ -67,9 +67,6 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ wallets: result.rows as WalletRow[] });
   } catch (err) {
     console.error("[api/wallets] DB error:", err);
-    return NextResponse.json(
-      { error: "Failed to fetch wallets" },
-      { status: 500 }
-    );
+    return NextResponse.json({ wallets: [] });
   }
 }

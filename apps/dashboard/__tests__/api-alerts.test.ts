@@ -179,13 +179,14 @@ describe("GET /api/alerts", () => {
     expect(callParams[2]).toBe(50); // offset is third param
   });
 
-  it("returns 500 on DB error", async () => {
+  it("returns empty data on DB error (graceful degradation)", async () => {
     mockQuery.mockRejectedValue(new Error("DB down"));
 
     const req = makeRequest();
     const res = await GET(req);
-    expect(res.status).toBe(500);
-    expect((res.body as unknown as { error: string }).error).toBeTruthy();
+    expect(res.status).toBe(200);
+    expect((res.body as unknown as { alerts: unknown[]; total: number }).alerts).toEqual([]);
+    expect((res.body as unknown as { alerts: unknown[]; total: number }).total).toBe(0);
   });
 
   it("count query uses same hours param", async () => {

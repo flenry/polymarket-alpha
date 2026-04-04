@@ -21,7 +21,8 @@
     "dashboard": "tsc && node dist/analytics/signal-dashboard.js",
     "heatmap": "tsc && node dist/analytics/heat-map.js",
     "dashboard:dev": "pnpm --filter dashboard dev",
-    "dashboard:build": "pnpm --filter dashboard build"
+    "dashboard:build": "pnpm --filter dashboard build",
+    "dashboard:test:e2e": "pnpm --filter dashboard test:e2e"
   },
   "dependencies": {
     "drizzle-orm": "^0.40.0",

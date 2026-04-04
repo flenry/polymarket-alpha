@@ -94,9 +94,6 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ markets });
   } catch (err) {
     console.error("[api/markets] DB error:", err);
-    return NextResponse.json(
-      { error: "Failed to fetch markets" },
-      { status: 500 }
-    );
+    return NextResponse.json({ markets: [] });
   }
 }
