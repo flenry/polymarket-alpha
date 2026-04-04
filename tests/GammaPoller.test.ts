@@ -25,7 +25,7 @@ function makeFetch(markets: object[]) {
 }
 
 describe("GammaPoller (fixture-based)", () => {
-  it("neg_risk markets stored with watchlisted=false", async () => {
+  it("neg_risk markets stored with watchlisted=true (Phase 4: NegRiskEngine handles them)", async () => {
     const poller = new GammaPoller({
       db: makeDb(),
       pollIntervalMs: 60000,
@@ -36,13 +36,13 @@ describe("GammaPoller (fixture-based)", () => {
     await poller.start();
     poller.stop();
 
-    // neg_risk tokens should be in negRisk set, not watchlist
+    // Phase 4: neg-risk tokens are in BOTH watchlistSet and negRiskSet
     const negRiskIds = poller.getNegRiskIds();
     const watchlist = poller.getWatchlist();
 
     expect(negRiskIds.length).toBeGreaterThan(0);
     for (const id of negRiskIds) {
-      expect(watchlist).not.toContain(id);
+      expect(watchlist).toContain(id);
     }
   });
 

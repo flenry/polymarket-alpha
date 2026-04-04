@@ -76,7 +76,7 @@ describe("LiveDataWsClient", () => {
     expect(trade.valueUsdc).toBeCloseTo(65, 1); // 100 * 0.65
   });
 
-  it("neg_risk token ID filtered — no event emitted", () => {
+  it("neg_risk token ID NOT filtered — trade event emitted (Phase 4: neg-risk trades flow through)", () => {
     const negRiskSet = new Set(["tok-neg"]);
     const { client, bus } = makeClient({ negRiskSet });
     const received: unknown[] = [];
@@ -88,7 +88,8 @@ describe("LiveDataWsClient", () => {
     ws.emit("open");
     ws.emit("message", Buffer.from(JSON.stringify(validTrade("tok-neg"))));
 
-    expect(received).toHaveLength(0);
+    // Phase 4: neg-risk filter removed — trade events flow through for persistence
+    expect(received).toHaveLength(1);
   });
 
   it("malformed JSON payload: logs error, does not crash, continues", () => {

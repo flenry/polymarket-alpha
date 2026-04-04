@@ -57,7 +57,7 @@ describe("LiveDataWsClient (fixture-based)", () => {
     client.disconnect();
   });
 
-  it("neg_risk filter at ingestion: no trade event emitted", () => {
+  it("neg_risk trade flows through (Phase 4: filter removed, NegRiskEngine handles routing)", () => {
     const negRiskSet = new Set([tradeFixture.asset]);
     const { client, bus } = makeClient(negRiskSet);
     const received: unknown[] = [];
@@ -69,7 +69,8 @@ describe("LiveDataWsClient (fixture-based)", () => {
     ws.emit("open");
     ws.emit("message", Buffer.from(JSON.stringify(tradeFixture)));
 
-    expect(received).toHaveLength(0);
+    // Phase 4: neg-risk trades are no longer filtered at ingestion
+    expect(received).toHaveLength(1);
     client.disconnect();
   });
 

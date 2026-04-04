@@ -152,6 +152,48 @@ export async function markMarketClosed(db: Db, tokenId: TokenId): Promise<void> 
     .where(eq(markets.tokenId, tokenId));
 }
 
+export interface NegRiskMarketRow {
+  tokenId: string;
+  conditionId: string;
+  question: string;
+  slug: string | null;
+}
+
+/**
+ * Returns all open neg-risk markets (negRisk=true, closed=false).
+ * Caller groups by conditionId in application layer.
+ */
+export async function getNegRiskMarketsByCondition(db: Db): Promise<NegRiskMarketRow[]> {
+  const rows = await db
+    .select({
+      tokenId: markets.tokenId,
+      conditionId: markets.conditionId,
+      question: markets.question,
+      slug: markets.slug,
+    })
+    .from(markets)
+    .where(and(eq(markets.negRisk, true), eq(markets.closed, false)));
+  return rows.map((r) => ({
+    tokenId: r.tokenId,
+    conditionId: r.conditionId,
+    question: r.question,
+    slug: r.slug ?? null,
+  }));
+}
+
+/**
+ * Returns all watchlisted tokenIds including neg-risk tokens.
+ * Distinct from getWatchlistedTokenIds which excludes neg-risk.
+ * Used to subscribe all watchlisted tokens (including neg-risk) to ClobWsPool.
+ */
+export async function getAllWatchlistedTokenIds(db: Db): Promise<TokenId[]> {
+  const rows = await db
+    .select({ tokenId: markets.tokenId })
+    .from(markets)
+    .where(eq(markets.watchlisted, true));
+  return rows.map((r) => r.tokenId);
+}
+
 export async function getMarketStats(db: Db, tokenId: TokenId) {
   const rows = await db
     .select()

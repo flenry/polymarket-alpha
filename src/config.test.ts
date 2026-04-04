@@ -93,6 +93,32 @@ describe("config", () => {
     expect(typeof config.compositeWindowMs).toBe("number");
   });
 
+  it("Phase 4+5 fields have correct defaults", async () => {
+    delete process.env.NEG_RISK_REFRESH_INTERVAL_MS;
+    delete process.env.NEG_RISK_ARB_THRESHOLD;
+    delete process.env.NEG_RISK_COOLDOWN_MS;
+    delete process.env.DASHBOARD_REFRESH_MS;
+    delete process.env.LEADERBOARD_MIN_TRADES;
+    delete process.env.LEADERBOARD_TOP_N;
+    const { config } = await import("./config.js");
+    expect(config.negRiskRefreshIntervalMs).toBe(120_000);
+    expect(config.negRiskArbThreshold).toBe(-0.02);
+    expect(config.negRiskCooldownMs).toBe(60_000);
+    expect(config.dashboardRefreshMs).toBe(30_000);
+    expect(config.leaderboardMinTrades).toBe(5);
+    expect(config.leaderboardTopN).toBe(20);
+  });
+
+  it("Phase 4+5 fields are correct types", async () => {
+    const { config } = await import("./config.js");
+    expect(typeof config.negRiskRefreshIntervalMs).toBe("number");
+    expect(typeof config.negRiskArbThreshold).toBe("number");
+    expect(typeof config.negRiskCooldownMs).toBe("number");
+    expect(typeof config.dashboardRefreshMs).toBe("number");
+    expect(typeof config.leaderboardMinTrades).toBe("number");
+    expect(typeof config.leaderboardTopN).toBe("number");
+  });
+
   it("legacy Phase 1 vars no longer exist on config object", async () => {
     const { config } = await import("./config.js");
     expect((config as Record<string, unknown>)["priceImpactWindowSec"]).toBeUndefined();

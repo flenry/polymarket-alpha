@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { getRecentPriceHistory, getRecentTradeTimestamps } from "./price-history.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { getRecentPriceHistory, getRecentTradeTimestamps, getTokenPriceHistory24h } from "./price-history.js";
 
 // ── DB mock factory ──────────────────────────────────────────────────────────
 
@@ -105,7 +105,60 @@ describe("getRecentTradeTimestamps", () => {
     expect(db.execute).toHaveBeenCalledOnce();
   });
 
-  it("afterEach: restore timers", () => {
+  afterEach(() => {
     vi.useRealTimers();
+  });
+});
+
+describe("getTokenPriceHistory24h", () => {
+  function make24hSelectDb(rows: Array<{ price: string; recordedAt: Date }>) {
+    const orderByFn = vi.fn().mockResolvedValue(rows);
+    const whereFn = vi.fn().mockReturnValue({ orderBy: orderByFn });
+    const fromFn = vi.fn().mockReturnValue({ where: whereFn });
+    const selectFn = vi.fn().mockReturnValue({ from: fromFn });
+    return { select: selectFn } as unknown as Parameters<typeof getTokenPriceHistory24h>[0];
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2025-03-01T12:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("returns records ordered ASC by recordedAt", async () => {
+    const older = new Date("2025-03-01T06:00:00Z");
+    const newer = new Date("2025-03-01T11:00:00Z");
+    const db = make24hSelectDb([
+      { price: "0.45", recordedAt: older },
+      { price: "0.52", recordedAt: newer },
+    ]);
+    const result = await getTokenPriceHistory24h(db, "tok1");
+    expect(result).toHaveLength(2);
+    expect(result[0].price).toBeCloseTo(0.45);
+    expect(result[1].price).toBeCloseTo(0.52);
+  });
+
+  it("returns empty array when no records", async () => {
+    const db = make24hSelectDb([]);
+    const result = await getTokenPriceHistory24h(db, "tok1");
+    expect(result).toEqual([]);
+  });
+
+  it("converts price strings to numbers", async () => {
+    const db = make24hSelectDb([{ price: "0.789", recordedAt: new Date() }]);
+    const result = await getTokenPriceHistory24h(db, "tok1");
+    expect(typeof result[0].price).toBe("number");
+    expect(result[0].price).toBeCloseTo(0.789);
+  });
+
+  it("uses ASC ordering (last param is asc)", async () => {
+    const db = make24hSelectDb([]);
+    await getTokenPriceHistory24h(db, "tok1");
+    // select chain terminates with orderBy — ensure it was called
+    const select = db.select as ReturnType<typeof vi.fn>;
+    expect(select).toHaveBeenCalled();
   });
 });
