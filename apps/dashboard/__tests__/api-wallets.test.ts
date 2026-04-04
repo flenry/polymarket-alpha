@@ -129,6 +129,32 @@ describe("GET /api/wallets", () => {
     expect(callParams[2]).toBe(200);
   });
 
+  it("returns 400 for negative minTrades", async () => {
+    const req = makeRequest({ minTrades: "-1" });
+    const res = await getWallets(req);
+    expect(res.status).toBe(400);
+    expect((res.body as unknown as { error: string }).error).toContain("minTrades");
+  });
+
+  it("returns 400 for non-numeric minTrades", async () => {
+    const req = makeRequest({ minTrades: "abc" });
+    const res = await getWallets(req);
+    expect(res.status).toBe(400);
+  });
+
+  it("returns 400 for non-numeric minVolume (NaN guard)", async () => {
+    const req = makeRequest({ minVolume: "notanumber" });
+    const res = await getWallets(req);
+    expect(res.status).toBe(400);
+    expect((res.body as unknown as { error: string }).error).toContain("minVolume");
+  });
+
+  it("returns 400 for negative minVolume", async () => {
+    const req = makeRequest({ minVolume: "-500" });
+    const res = await getWallets(req);
+    expect(res.status).toBe(400);
+  });
+
   it("returns 500 on DB error", async () => {
     mockQuery.mockRejectedValue(new Error("DB down"));
 
@@ -180,6 +206,23 @@ describe("GET /api/wallets/[address]/alerts", () => {
     expect((res.body as unknown as { alerts: unknown[] }).alerts).toHaveLength(0);
   });
 
+  it("uses split_part(trade_lookup_key, '|', 3) for wallet filter (partition-safe)", async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    const req = makeRequest(
+      {},
+      "http://localhost/api/wallets/0x1234/alerts"
+    ) as Parameters<typeof getWalletAlerts>[0];
+    const params = { params: { address: "0x1234" } };
+
+    await getWalletAlerts(req, params as { params: { address: string } });
+
+    const callQuery = mockQuery.mock.calls[0][0] as string;
+    // Must filter on split_part, NOT on t.proxy_wallet (which is NULL when partition dropped)
+    expect(callQuery).toContain("split_part(wa.trade_lookup_key, '|', 3)");
+    expect(callQuery).not.toContain("WHERE t.proxy_wallet");
+  });
+
   it("uses ALERT_TRADE_JOIN_SQL (full-tuple join)", async () => {
     mockQuery.mockResolvedValueOnce({ rows: [] });
 
@@ -208,5 +251,19 @@ describe("GET /api/wallets/[address]/alerts", () => {
 
     const callQuery = mockQuery.mock.calls[0][0] as string;
     expect(callQuery).toContain("LIMIT 20");
+  });
+
+  it("returns 500 on DB error", async () => {
+    mockQuery.mockRejectedValue(new Error("DB down"));
+
+    const req = makeRequest(
+      {},
+      "http://localhost/api/wallets/0x1234/alerts"
+    ) as Parameters<typeof getWalletAlerts>[0];
+    const params = { params: { address: "0x1234" } };
+
+    const res = await getWalletAlerts(req, params as { params: { address: string } });
+    expect(res.status).toBe(500);
+    expect((res.body as unknown as { error: string }).error).toBeTruthy();
   });
 });

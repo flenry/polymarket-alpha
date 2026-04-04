@@ -34,7 +34,7 @@ const SIGNAL_TYPE_CONFIG: Record<
   { label: string; variant: "purple" | "blue" | "orange" | "teal" | "indigo" | "violet" }
 > = {
   WHALE_TRADE: { label: "WHALE_TRADE", variant: "purple" },
-  BOOK_IMBALANCE: { label: "BOOK_IMBALANCE", variant: "blue" },
+  ORDER_BOOK_IMBALANCE: { label: "ORDER_BOOK_IMBALANCE", variant: "blue" },
   PRICE_IMPACT_ANOMALY: { label: "PRICE_IMPACT_ANOMALY", variant: "orange" },
   SENTIMENT_VELOCITY: { label: "SENTIMENT_VELOCITY", variant: "teal" },
   NEG_RISK_ARB: { label: "NEG_RISK_ARB", variant: "indigo" },
@@ -43,7 +43,7 @@ const SIGNAL_TYPE_CONFIG: Record<
 
 const ALL_TYPES: SignalType[] = [
   "WHALE_TRADE",
-  "BOOK_IMBALANCE",
+  "ORDER_BOOK_IMBALANCE",
   "PRICE_IMPACT_ANOMALY",
   "SENTIMENT_VELOCITY",
   "NEG_RISK_ARB",
@@ -106,7 +106,7 @@ export function SignalsTable({ initialTokenId }: Props) {
                     : "bg-white text-slate-600 border-slate-200 hover:bg-slate-50"
                 }`}
               >
-                {cfg.label}
+                {cfg?.label ?? type}
               </button>
             );
           })}
@@ -174,7 +174,7 @@ export function SignalsTable({ initialTokenId }: Props) {
                 signals.map((sig, idx) => {
                   const cfg = SIGNAL_TYPE_CONFIG[sig.signal_type] ?? {
                     label: sig.signal_type,
-                    variant: "blue",
+                    variant: "blue" as const,
                   };
                   const conf = Math.round(parseFloat(sig.confidence) * 100);
                   const payload = sig.payload as Record<string, unknown> | null;

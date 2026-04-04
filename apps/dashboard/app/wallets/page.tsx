@@ -1,12 +1,7 @@
-"use client";
-
-import { useSearchParams } from "next/navigation";
-import { WalletsTable } from "@/components/wallets-table";
+import { Suspense } from "react";
+import { WalletsPageClient } from "./page-client";
 
 export default function WalletsPage() {
-  const searchParams = useSearchParams();
-  const wallet = searchParams.get("wallet") ?? undefined;
-
   return (
     <div className="p-6 space-y-6">
       <div>
@@ -18,7 +13,9 @@ export default function WalletsPage() {
         </p>
       </div>
 
-      <WalletsTable initialWallet={wallet} />
+      <Suspense fallback={null}>
+        <WalletsPageClient />
+      </Suspense>
     </div>
   );
 }

@@ -12,12 +12,12 @@ import {
 import type { VolumeBucket } from "@/app/api/signals/volume/route";
 
 const SIGNAL_COLORS: Record<string, string> = {
-  WHALE_TRADE: "#7c3aed",        // purple
-  BOOK_IMBALANCE: "#2563eb",     // blue
-  PRICE_IMPACT_ANOMALY: "#ea580c", // orange
-  SENTIMENT_VELOCITY: "#0d9488", // teal
-  NEG_RISK_ARB: "#4f46e5",       // indigo
-  NEG_RISK_OUTLIER: "#8b5cf6",   // violet-500 (distinct from WHALE_TRADE purple-700)
+  WHALE_TRADE: "#7c3aed",           // purple-700
+  ORDER_BOOK_IMBALANCE: "#2563eb",  // blue-600
+  PRICE_IMPACT_ANOMALY: "#ea580c",  // orange-600
+  SENTIMENT_VELOCITY: "#0d9488",    // teal-600
+  NEG_RISK_ARB: "#4f46e5",          // indigo-600
+  NEG_RISK_OUTLIER: "#8b5cf6",      // violet-500 (distinct from WHALE_TRADE purple-700)
 };
 
 const SIGNAL_TYPES = Object.keys(SIGNAL_COLORS);
@@ -27,7 +27,7 @@ interface Props {
 }
 
 export default function SignalSparklineInner({ data }: Props) {
-  // Pivot: [{ hour, WHALE_TRADE: n, BOOK_IMBALANCE: n, ... }]
+  // Pivot: [{ hour, WHALE_TRADE: n, ORDER_BOOK_IMBALANCE: n, ... }]
   const pivotMap = new Map<string, Record<string, number>>();
   for (const bucket of data) {
     const key = bucket.hour;

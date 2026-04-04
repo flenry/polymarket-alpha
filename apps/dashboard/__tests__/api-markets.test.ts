@@ -69,7 +69,7 @@ describe("GET /api/markets", () => {
       .mockResolvedValueOnce({
         rows: [
           { token_id: "token1", top_signal_type: "WHALE_TRADE" },
-          { token_id: "token2", top_signal_type: "BOOK_IMBALANCE" },
+          { token_id: "token2", top_signal_type: "ORDER_BOOK_IMBALANCE" },
         ],
       }); // topType
 
@@ -82,7 +82,7 @@ describe("GET /api/markets", () => {
     };
     expect(markets).toHaveLength(2);
     expect(markets[0].top_signal_type).toBe("WHALE_TRADE");
-    expect(markets[1].top_signal_type).toBe("BOOK_IMBALANCE");
+    expect(markets[1].top_signal_type).toBe("ORDER_BOOK_IMBALANCE");
   });
 
   it("handles market with no matching top_signal_type (null)", async () => {
@@ -121,9 +121,9 @@ describe("GET /api/markets", () => {
 
   it("tie-breaking: same count, lower lexical signal_type wins", async () => {
     // Two signal types with equal count for same token
-    // Lexical order: BOOK_IMBALANCE < WHALE_TRADE
+    // Lexical order: ORDER_BOOK_IMBALANCE < WHALE_TRADE
     // The deterministic rule (COUNT DESC → MAX(confidence) DESC → signal_type ASC)
-    // means BOOK_IMBALANCE (lexically first) wins when count and confidence are tied
+    // means ORDER_BOOK_IMBALANCE (lexically first) wins when count and confidence are tied
     //
     // In this test, we simulate what the DB returns based on the ORDER BY
     mockQuery
@@ -131,14 +131,14 @@ describe("GET /api/markets", () => {
         rows: [{ token_id: "tokenTie", signal_count: 3, whale_count: 0, question: null, slug: null, volume_24h: null }],
       })
       .mockResolvedValueOnce({
-        rows: [{ token_id: "tokenTie", top_signal_type: "BOOK_IMBALANCE" }],
-      }); // DB returns BOOK_IMBALANCE (lexically first) for tied count
+        rows: [{ token_id: "tokenTie", top_signal_type: "ORDER_BOOK_IMBALANCE" }],
+      }); // DB returns ORDER_BOOK_IMBALANCE (lexically first) for tied count
 
     const req = makeRequest();
     const res = await GET(req);
     const { markets } = res.body as unknown as { markets: { top_signal_type: string | null }[] };
     // The API correctly returns whatever the DB returns from deterministic ORDER BY
-    expect(markets[0].top_signal_type).toBe("BOOK_IMBALANCE");
+    expect(markets[0].top_signal_type).toBe("ORDER_BOOK_IMBALANCE");
   });
 
   it("uses DISTINCT ON for top signal type query", async () => {

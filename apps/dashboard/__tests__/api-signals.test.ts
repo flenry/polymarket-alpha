@@ -78,7 +78,7 @@ describe("GET /api/signals", () => {
   it("accepts valid signal types filter", async () => {
     mockQuery.mockResolvedValueOnce({ rows: [] });
 
-    const req = makeRequest({ types: "WHALE_TRADE,BOOK_IMBALANCE" });
+    const req = makeRequest({ types: "WHALE_TRADE,ORDER_BOOK_IMBALANCE" });
     const res = await GET(req);
     expect(res.status).toBe(200);
   });

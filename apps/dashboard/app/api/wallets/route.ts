@@ -35,6 +35,13 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  if (isNaN(minVolume) || minVolume < 0) {
+    return NextResponse.json(
+      { error: "Invalid minVolume parameter" },
+      { status: 400 }
+    );
+  }
+
   // LAW-MAJOR-2: filter on resolved_trade_count, not trade_count
   const query = `
     SELECT *

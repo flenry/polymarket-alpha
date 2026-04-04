@@ -13,12 +13,15 @@ export async function GET(
     return NextResponse.json({ alerts: [] });
   }
 
+  // Filter on split_part(trade_lookup_key, '|', 3) directly so results are
+  // returned even when the trades partition has been dropped (>90 days old)
+  // and the LEFT JOIN produces NULL for t.proxy_wallet.
   const query = `
     SELECT wa.*, t.side, t.proxy_wallet, m.question, m.slug
     FROM whale_alerts wa
     ${ALERT_TRADE_JOIN_SQL}
     LEFT JOIN markets m ON m.token_id = wa.token_id
-    WHERE t.proxy_wallet = $1
+    WHERE split_part(wa.trade_lookup_key, '|', 3) = $1
     ORDER BY wa.alerted_at DESC
     LIMIT 20
   `;

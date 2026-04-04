@@ -12,7 +12,7 @@ const SIGNAL_TYPE_VARIANTS: Record<
   "purple" | "blue" | "orange" | "teal" | "indigo" | "violet"
 > = {
   WHALE_TRADE: "purple",
-  BOOK_IMBALANCE: "blue",
+  ORDER_BOOK_IMBALANCE: "blue",
   PRICE_IMPACT_ANOMALY: "orange",
   SENTIMENT_VELOCITY: "teal",
   NEG_RISK_ARB: "indigo",

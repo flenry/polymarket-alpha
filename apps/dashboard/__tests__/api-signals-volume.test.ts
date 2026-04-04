@@ -47,7 +47,7 @@ describe("GET /api/signals/volume", () => {
   it("returns correctly shaped buckets", async () => {
     const dbRows = [
       { hour: new Date("2024-01-01T10:00:00Z"), type: "WHALE_TRADE", count: 3 },
-      { hour: new Date("2024-01-01T11:00:00Z"), type: "BOOK_IMBALANCE", count: 5 },
+      { hour: new Date("2024-01-01T11:00:00Z"), type: "ORDER_BOOK_IMBALANCE", count: 5 },
     ];
     mockQuery.mockResolvedValueOnce({ rows: dbRows });
 
