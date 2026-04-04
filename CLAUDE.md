@@ -11,6 +11,8 @@ Real-time Polymarket data pipeline. Ingests trade events and order book data, pe
 **Phase 1 MVP is complete and fully tested.** 256 tests passing, 92%+ coverage.
 **Phase 2 is complete and fully tested.** 357 tests passing, 97.33% stmt / 95.91% branch coverage.
 **Phase 3 is complete and fully tested.** 414 tests passing, 95.88% stmt / 94.64% branch coverage.
+**Phase 4 is complete and fully tested.** 480 tests passing.
+**Phase 5 is complete and fully tested.** 480 tests passing.
 
 ---
 
@@ -38,6 +40,8 @@ polymarket-alpha/
 │   ├── alerts/            # AlertEmitter (stdout JSON, <1s latency)
 │   ├── events/            # TypedEventBus + event types
 │   ├── db/                # schema.ts, client.ts, partition-manager.ts, queries/
+│   ├── neg-risk/          # Phase 4: GroupResolver, ArbDetector, NegRiskEngine
+│   ├── analytics/         # Phase 5: leaderboard.ts, signal-dashboard.ts, heat-map.ts
 │   ├── validation/        # Zod schemas for external API responses
 │   ├── config.ts          # Env-var config with Zod validation
 │   ├── logger.ts          # Pino logger
@@ -61,7 +65,7 @@ polymarket-alpha/
 ### Sources
 | Component | Role |
 |---|---|
-| `GammaPoller` | Polls `gamma-api.polymarket.com/markets` every 60s. Separates neg_risk markets (`watchlisted=false`) from live markets. |
+| `GammaPoller` | Polls `gamma-api.polymarket.com/markets` every 60s. Phase 4: neg-risk markets now get `watchlisted=true`; all tokens subscribed to ClobWsPool. |
 | `ClobRestClient` | Batch-fetches order books via `POST /books` on `clob.polymarket.com`. |
 | `LiveDataWsClient` | Connects to `wss://ws-live-data.polymarket.com`, subscribes `{topic:"activity", type:"trades"}`, auto-reconnects with exponential backoff (base 1s, cap 30s). |
 | `ClobWsPool` | Sharded WebSocket pool to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. Shards watchlisted tokens (non-neg-risk) into batches of `CLOB_WS_SHARD_SIZE` (default 150). Per-shard reconnect with jitter backoff. Handles `market_resolved` → `markMarketClosed`. Phase 2. |
@@ -111,17 +115,24 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 
 ## Key Conventions
 
-- **Neg-risk filter**: applied at ingestion (LiveDataWsClient) AND at catalog level (GammaPoller). Never process neg-risk token IDs.
+- **Neg-risk routing (Phase 4)**: neg-risk trades persist to DB but skip WhaleDetector + signal evaluators. NegRiskEngine processes them independently via ClobWsPool book updates.
 - **Dedup**: composite unique index enforced in DB; app layer uses `ON CONFLICT DO NOTHING`.
 - **Config**: all env vars validated via Zod in `src/config.ts`. No bare `process.env` access elsewhere.
 - **Logging**: Pino structured JSON. `LOG_LEVEL` env var controls verbosity.
 - **Tests**: all unit tests use mocked DB clients and HTTP/WS — no real network calls. Fixtures live in `tests/fixtures/`.
 - **Test colocatio**: processor/signal/source tests live next to source files (`src/**/*.test.ts`). Integration-style tests live in `tests/`.
 - **Phase 2 fully wired**: `ClobWsPool`, `WsBookImbalanceEvaluator`, `WebhookEmitter`, and `WalletEnricher` are all live in `pipeline.ts`.
+**Phase 4 fully wired**: `NegRiskEngine` is live in `pipeline.ts` with `markets_updated` listener and `book_update` routing.
 
 ---
 
 ## Current State
+
+**Phase 4+5 complete (branch: `feat/phase-4-5`).**
+- ✅ 480 tests passing (44 test files)
+- ✅ `NegRiskEngine`, `GroupResolver`, `ArbDetector`, 3 analytics CLIs
+- ✅ 6 new env vars (Phase 4+5)
+- ✅ Config: `negRiskRefreshIntervalMs`, `negRiskArbThreshold`, `negRiskCooldownMs`, `dashboardRefreshMs`, `leaderboardMinTrades`, `leaderboardTopN`
 
 **Phase 1 complete.**
 - ✅ All 256 tests passing (30 test files)
@@ -157,8 +168,20 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 - ✅ Pipeline rewired: `PriceImpactSignalEvaluator` + `SentimentVelocityEvaluator` wired per sequencing contract
 - ✅ `backtest-results/` directory created; `pnpm backtest` script added
 
-**Not yet built (Phase 4+):**
-- Neg-risk signal generation (Phase 4)
+**Phase 4 complete (branch: `feat/phase-4-5`).**
+- ✅ `NegRiskEngine` — orchestrates GroupResolver + ArbDetector
+- ✅ `GroupResolver` — size-aware top-of-book pricing, bounded validity (0.95 ≤ sumAsk ≤ 1.20)
+- ✅ `ArbDetector` — arb signal when spread < -0.02, directional outlier signal at >3σ deviation
+- ✅ `NEG_RISK_ARB` and `NEG_RISK_OUTLIER` signal types added to `SIGNAL_TYPES` and `Signal` union
+- ✅ Neg-risk markets: `watchlisted=true`, trades persist (skip signal evaluation only)
+- ✅ `WebhookEmitter` extended with purple embed builders for neg-risk signals
+- ✅ Dynamic membership: `markets_updated` → `negRiskEngine.addTokenIds()` + `clobWsPool.addTokenIds()`
+
+**Phase 5 complete (branch: `feat/phase-4-5`).**
+- ✅ `pnpm leaderboard` — wallet win-rate ranking from `wallet_profiles`
+- ✅ `pnpm dashboard` — real-time signal type counts + whale stats (refresh every 30s)
+- ✅ `pnpm heatmap` — top 20 markets by signal density
+- ✅ All CLIs: `tsc && node dist/analytics/xxx.js` pattern, bound param cutoffs, numeric arg validation
 
 ### Two separate imbalance evaluators — distinct trigger paths
 
@@ -191,6 +214,14 @@ pnpm db:migrate:partitions        # psql $DATABASE_URL -f drizzle/0002_partition
 
 # 5. Start pipeline
 pnpm start
+
+# Analytics CLIs
+pnpm leaderboard              # wallet win-rate leaderboard
+pnpm leaderboard --min-trades=10 --top=10 --json
+pnpm dashboard                # signal type dashboard (refreshes every 30s)
+pnpm dashboard --days=3 --once
+pnpm heatmap                  # market heat map (last 24h)
+pnpm heatmap --hours=48
 ```
 
 Or run everything in Docker:
@@ -201,8 +232,8 @@ docker compose up -d
 ## How to Test
 
 ```bash
-pnpm test              # unit tests (all 414, 38 test files)
-pnpm test:coverage     # with v8 coverage report (95.88% stmt, 94.64% branch)
+pnpm test              # unit tests (all 480, 44 test files)
+pnpm test:coverage     # with v8 coverage report
 pnpm typecheck         # tsc --noEmit
 pnpm db:generate       # generate drizzle migrations (idempotent after init)
 pnpm db:migrate        # apply all tracked migrations (0000 + 0002)
@@ -232,6 +263,12 @@ pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql direct
 | `WALLET_ENRICHMENT_TIMEOUT_MS` | 5000 | Fetch timeout for wallet enrichment |
 | `WALLET_ENRICHMENT_RATE_LIMIT_RPS` | 2 | Max data-api calls per second |
 | `WALLET_ENRICHMENT_RECENCY_HOURS` | 24 | Skip re-enrichment if profile < 24h old |
+| `NEG_RISK_REFRESH_INTERVAL_MS` | 120000 | How often NegRiskEngine refreshes groups |
+| `NEG_RISK_ARB_THRESHOLD` | -0.02 | Fire arb signal when sumAsk - 1.0 < this |
+| `NEG_RISK_COOLDOWN_MS` | 60000 | Per-conditionId cooldown for neg-risk signals |
+| `DASHBOARD_REFRESH_MS` | 30000 | Dashboard refresh interval |
+| `LEADERBOARD_MIN_TRADES` | 5 | Default min trades for leaderboard |
+| `LEADERBOARD_TOP_N` | 20 | Default top N for leaderboard |
 
 ---
 
@@ -241,4 +278,4 @@ pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql direct
 
 ---
 
-Last updated: 2026-04-04 (Phase 3 final — 414 tests, 95.88% stmt / 94.64% branch coverage)
+Last updated: 2026-04-04 (Phase 4+5 final — 480 tests)
