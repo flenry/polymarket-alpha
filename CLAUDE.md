@@ -10,6 +10,7 @@ Real-time Polymarket data pipeline. Ingests trade events and order book data, pe
 
 **Phase 1 MVP is complete and fully tested.** 256 tests passing, 92%+ coverage.
 **Phase 2 is complete and fully tested.** 357 tests passing, 97.33% stmt / 95.91% branch coverage.
+**Phase 3 is complete and fully tested.** 411 tests passing, ≥97% stmt coverage.
 
 ---
 
@@ -144,9 +145,20 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 - ✅ `src/db/queries/whales.ts` — `walletFirstSeenAt` field added to `enrichWhaleAlert`
 - ✅ Config: 8 new Phase 2 env vars with defaults
 
-**Not yet built (Phase 3+):**
+**Phase 3 complete (branch: `feat/phase-3`).**
+- ✅ All 411 tests passing (38 test files, +54 tests over Phase 2)
+- ✅ `PriceImpactSignalEvaluator` v2 — in-memory, no hot-path DB reads, corrected depth mapping (BUY→askDepth, SELL→bidDepth)
+- ✅ `SentimentVelocityEvaluator` v2 — rolling price+trade buffers, warm-up suppression, DB bootstrap
+- ✅ `SignalAggregator` composite scoring — insert-then-update, `COMPOSITE_WINDOW_MS` window, logs `[COMPOSITE]`
+- ✅ Backtesting module: `runner.ts`, `evaluator.ts`, `report.ts`, `types.ts` — `pnpm backtest --start ... --end ...`
+- ✅ `src/db/queries/price-history.ts` — `getRecentPriceHistory`, `getRecentTradeTimestamps`
+- ✅ `src/db/queries/signals.ts` — `updateSignalPayloads` for composite payload patching
+- ✅ Config: 7 new Phase 3 env vars, 3 legacy Phase 1 vars removed
+- ✅ Pipeline rewired: `PriceImpactSignalEvaluator` + `SentimentVelocityEvaluator` wired per sequencing contract
+- ✅ `backtest-results/` directory created; `pnpm backtest` script added
+
+**Not yet built (Phase 4+):**
 - Neg-risk signal generation (Phase 4)
-- Backtesting (Phase 3+)
 
 ### Two separate imbalance evaluators — distinct trigger paths
 
@@ -229,4 +241,4 @@ pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql direct
 
 ---
 
-Last updated: 2026-04-03 (Phase 2 final — 357 tests, 97.33% coverage)
+Last updated: 2026-04-04 (Phase 3 final — 411 tests, ≥97% stmt coverage)

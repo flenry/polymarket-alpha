@@ -64,6 +64,42 @@ describe("config", () => {
     expect(config.walletEnrichmentRecencyHours).toBe(24);
   });
 
+  it("Phase 3 fields have correct defaults", async () => {
+    delete process.env.PRICE_IMPACT_ANOMALY_THRESHOLD;
+    delete process.env.PRICE_IMPACT_COOLDOWN_MS;
+    delete process.env.VELOCITY_WINDOW_SECONDS;
+    delete process.env.VELOCITY_PRICE_THRESHOLD;
+    delete process.env.VELOCITY_TRADE_COUNT_MULTIPLIER;
+    delete process.env.VELOCITY_COOLDOWN_MS;
+    delete process.env.COMPOSITE_WINDOW_MS;
+    const { config } = await import("./config.js");
+    expect(config.priceImpactAnomalyThreshold).toBe(2.5);
+    expect(config.priceImpactCooldownMs).toBe(30_000);
+    expect(config.velocityWindowSeconds).toBe(300);
+    expect(config.velocityPriceThreshold).toBe(0.005);
+    expect(config.velocityTradeCountMultiplier).toBe(1.5);
+    expect(config.velocityCooldownMs).toBe(120_000);
+    expect(config.compositeWindowMs).toBe(60_000);
+  });
+
+  it("Phase 3 fields are all numeric types", async () => {
+    const { config } = await import("./config.js");
+    expect(typeof config.priceImpactAnomalyThreshold).toBe("number");
+    expect(typeof config.priceImpactCooldownMs).toBe("number");
+    expect(typeof config.velocityWindowSeconds).toBe("number");
+    expect(typeof config.velocityPriceThreshold).toBe("number");
+    expect(typeof config.velocityTradeCountMultiplier).toBe("number");
+    expect(typeof config.velocityCooldownMs).toBe("number");
+    expect(typeof config.compositeWindowMs).toBe("number");
+  });
+
+  it("legacy Phase 1 vars no longer exist on config object", async () => {
+    const { config } = await import("./config.js");
+    expect((config as Record<string, unknown>)["priceImpactWindowSec"]).toBeUndefined();
+    expect((config as Record<string, unknown>)["priceImpactMinChangePct"]).toBeUndefined();
+    expect((config as Record<string, unknown>)["velocityZScoreThreshold"]).toBeUndefined();
+  });
+
 });
 
 describe("envNumber", () => {
