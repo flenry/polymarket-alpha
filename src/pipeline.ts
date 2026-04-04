@@ -16,10 +16,11 @@ import { ClobWsPool } from "./sources/clob-ws-pool.js";
 import { WalletEnricher } from "./enrichment/wallet-enricher.js";
 import { PriceHistoryWriter } from "./processors/price-history-writer.js";
 import { insertTrade } from "./db/queries/trades.js";
-import { getMarketStats, getWatchlistedTokenIds } from "./db/queries/markets.js";
+import { getMarketStats, getWatchlistedTokenIds, getAllWatchlistedTokenIds } from "./db/queries/markets.js";
 import { RollingStatsBuffer } from "./sources/stats-bootstrap.js";
 import { PriceImpactSignalEvaluator } from "./signals/price-impact-signal.js";
 import { SentimentVelocityEvaluator } from "./signals/velocity-signal.js";
+import { NegRiskEngine } from "./neg-risk/index.js";
 import type { MarketStats, TradeEvent, OrderBook, TokenId, BookUpdateEvent, PriceChangeEvent, BestBidAskEvent, LastTradePriceEvent, Signal } from "./events/types.js";
 import { logger } from "./logger.js";
 
@@ -167,6 +168,13 @@ export async function startPipeline(): Promise<() => Promise<void>> {
         }
       : null;
 
+    // Phase 4: neg-risk trades are persisted but skip signal evaluation
+    tradeBatch.push(trade);
+    if (tradeBatch.length >= config.tradeBatchSize) {
+      await flushTradeBatch();
+    }
+    if (negRiskSet.has(trade.tokenId)) return;
+
     // Step 3: record new price in velocity evaluator
     velocityEvaluator.recordPrice(trade.tokenId, trade.priceUsdc);
 
@@ -174,12 +182,6 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     velocityEvaluator.recordTrade(trade.tokenId);
 
     rollingBuffer.addTrade(trade.tokenId, trade.valueUsdc, trade.tradedAt);
-
-    // Step 5: batch for DB persistence
-    tradeBatch.push(trade);
-    if (tradeBatch.length >= config.tradeBatchSize) {
-      await flushTradeBatch();
-    }
 
     // Step 6: fire-and-forget price impact evaluation
     priceImpactEvaluator
@@ -214,6 +216,8 @@ export async function startPipeline(): Promise<() => Promise<void>> {
 
   // Trade listener #2: whale detection (separate listener so ordering is clear)
   const tradeHandler2 = async (trade: TradeEvent): Promise<void> => {
+    // Phase 4: neg-risk trades skip whale detection
+    if (negRiskSet.has(trade.tokenId)) return;
     const book = snapshotWriter.getLatestBook(trade.tokenId)?.book ?? null;
     const rollingStats = rollingBuffer.getStats(trade.tokenId);
     let stats = statsCache.get(trade.tokenId);
@@ -308,11 +312,33 @@ export async function startPipeline(): Promise<() => Promise<void>> {
   };
   bus.on("signal", imbalanceWebhookHandler);
 
-  // Start ClobWsPool after watchlisted tokens are available
-  const watchlistedTokenIds = await getWatchlistedTokenIds(db).catch(() => [] as TokenId[]);
+  // Start ClobWsPool with ALL watchlisted tokens (including neg-risk for book updates)
+  const watchlistedTokenIds = await getAllWatchlistedTokenIds(db).catch(() => [] as TokenId[]);
   clobWsPool.connect(watchlistedTokenIds).catch((err) =>
     logger.error({ err }, "Pipeline: ClobWsPool connect failed")
   );
+
+  // Phase 4: NegRiskEngine
+  const negRiskEngine = new NegRiskEngine(
+    db,
+    clobClient,
+    alertEmitter,
+    webhookEmitter,
+    { refreshIntervalMs: config.negRiskRefreshIntervalMs }
+  );
+  negRiskEngine.start(gammaPoller.getNegRiskIds());
+
+  // Wire book_update → NegRiskEngine
+  const negRiskBookHandler = (evt: BookUpdateEvent) => negRiskEngine.handleBookUpdate(evt);
+  bus.on("book_update", negRiskBookHandler);
+
+  // Dynamic neg-risk membership: markets_updated → NegRiskEngine + ClobWsPool
+  gammaPoller.on("markets_updated", (_newTokenIds: TokenId[], newNegRiskIds: TokenId[]) => {
+    if (newNegRiskIds.length > 0) {
+      negRiskEngine.addTokenIds(newNegRiskIds);
+      clobWsPool.addTokenIds(newNegRiskIds);
+    }
+  });
 
   // 9. SignalAggregator
   const signalAggregator = new SignalAggregator(
@@ -350,7 +376,9 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     bus.off("best_bid_ask", bidAskHandler);
     bus.off("last_trade_price", lastTradeHandler);
     bus.off("book_update", bookUpdateHandler);
+    bus.off("book_update", negRiskBookHandler);
     bus.off("signal", imbalanceWebhookHandler);
+    negRiskEngine.stop();
     clobWsPool.off("book", clobBookHandler);
     clobWsPool.off("price_change", clobPriceChangeHandler);
     clobWsPool.off("best_bid_ask", clobBestBidAskHandler);
