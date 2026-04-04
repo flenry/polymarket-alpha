@@ -17,7 +17,7 @@ const SIGNAL_COLORS: Record<string, string> = {
   PRICE_IMPACT_ANOMALY: "#ea580c", // orange
   SENTIMENT_VELOCITY: "#0d9488", // teal
   NEG_RISK_ARB: "#4f46e5",       // indigo
-  NEG_RISK_OUTLIER: "#7c3aed",   // violet (using same as WHALE_TRADE — slight overlap)
+  NEG_RISK_OUTLIER: "#8b5cf6",   // violet-500 (distinct from WHALE_TRADE purple-700)
 };
 
 const SIGNAL_TYPES = Object.keys(SIGNAL_COLORS);
