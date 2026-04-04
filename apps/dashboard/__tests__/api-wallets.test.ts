@@ -124,7 +124,7 @@ describe("GET /api/wallets", () => {
     const req = makeRequest({ limit: "abc" });
     await getWallets(req);
 
-    // parseInt('abc') = NaN, NaN || 50 = 50
+    // parseInt('abc') = NaN → isNaN(NaN) so defaults to 50
     const callParams = mockQuery.mock.calls[0][1] as unknown[];
     expect(callParams[2]).toBe(50);
   });
@@ -137,6 +137,20 @@ describe("GET /api/wallets", () => {
 
     const callParams = mockQuery.mock.calls[0][1] as unknown[];
     expect(callParams[2]).toBe(200);
+  });
+
+
+  it("returns 400 for negative limit", async () => {
+    const req = makeRequest({ limit: "-1" });
+    const res = await getWallets(req);
+    expect(res.status).toBe(400);
+    expect((res.body as unknown as { error: string }).error).toContain("limit");
+  });
+
+  it("returns 400 for limit=0", async () => {
+    const req = makeRequest({ limit: "0" });
+    const res = await getWallets(req);
+    expect(res.status).toBe(400);
   });
 
   it("returns 400 for negative minTrades", async () => {

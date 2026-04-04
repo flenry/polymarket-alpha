@@ -26,7 +26,7 @@ export async function GET(request: NextRequest) {
 
   const minTrades = parseInt(rawMinTrades, 10);
   const minVolume = parseFloat(rawMinVolume);
-  const limit = Math.min(parseInt(rawLimit, 10) || 50, 200);
+  const parsedLimit = parseInt(rawLimit, 10);
 
   if (isNaN(minTrades) || minTrades < 0) {
     return NextResponse.json(
@@ -41,6 +41,16 @@ export async function GET(request: NextRequest) {
       { status: 400 }
     );
   }
+
+  // Guard negative or non-numeric limit — PostgreSQL rejects LIMIT < 0 at runtime.
+  // NaN (non-numeric) silently defaults to 50; negative values must be rejected.
+  if (!isNaN(parsedLimit) && parsedLimit < 1) {
+    return NextResponse.json(
+      { error: "Invalid limit parameter" },
+      { status: 400 }
+    );
+  }
+  const limit = Math.min(isNaN(parsedLimit) ? 50 : parsedLimit, 200);
 
   // LAW-MAJOR-2: filter on resolved_trade_count, not trade_count
   const query = `
