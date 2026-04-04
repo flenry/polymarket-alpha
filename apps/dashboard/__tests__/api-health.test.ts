@@ -81,12 +81,17 @@ describe("GET /api/health", () => {
     expect(body.tradesLast5Min).toBe(0);
   });
 
-  it("returns 500 on DB error", async () => {
+  it("returns null-filled HealthResponse on DB error (graceful degradation)", async () => {
     mockQuery.mockRejectedValue(new Error("DB down"));
 
     const res = await GET();
-    expect(res.status).toBe(500);
-    expect((res.body as unknown as { error: string }).error).toBeTruthy();
+    expect(res.status).toBe(200);
+    const body = res.body as unknown as Record<string, unknown>;
+    expect(body.lastTradeAt).toBeNull();
+    expect(body.lastSnapshotAt).toBeNull();
+    expect(body.lastMarketRefreshAt).toBeNull();
+    expect(body.tradesLast5Min).toBe(0);
+    expect(body.marketsTracked).toBe(0);
   });
 
   it("queries MAX(traded_at) from trades", async () => {

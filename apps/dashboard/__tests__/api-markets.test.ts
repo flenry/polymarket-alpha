@@ -178,11 +178,12 @@ describe("GET /api/markets", () => {
     expect(callQuery).toContain("signal_type ASC");
   });
 
-  it("returns 500 on DB error", async () => {
+  it("returns empty markets on DB error (graceful degradation)", async () => {
     mockQuery.mockRejectedValue(new Error("DB down"));
 
     const req = makeRequest();
     const res = await GET(req);
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(200);
+    expect((res.body as unknown as { markets: unknown[] }).markets).toEqual([]);
   });
 });
