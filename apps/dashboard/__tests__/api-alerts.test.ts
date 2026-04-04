@@ -188,6 +188,19 @@ describe("GET /api/alerts", () => {
     expect((res.body as unknown as { error: string }).error).toBeTruthy();
   });
 
+  it("count query uses same hours param", async () => {
+    mockQuery
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [{ total: "0" }] });
+
+    const req = makeRequest({ hours: "12" });
+    await GET(req);
+
+    // Second call is the count query
+    const countParams = mockQuery.mock.calls[1]![1] as unknown[];
+    expect(countParams[0]).toBe(12);
+  });
+
   it("ALERT_TRADE_JOIN_SQL is used in query (not partial join)", () => {
     // Structural test: confirm the SQL constant contains the expected join parts
     // This guarantees full-tuple join is in place
