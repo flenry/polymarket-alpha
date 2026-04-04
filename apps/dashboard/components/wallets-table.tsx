@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import useSWR from "swr";
 import {
   Table,
@@ -114,11 +114,16 @@ export function WalletsTable({ initialWallet }: Props) {
 
   const wallets = data?.wallets ?? [];
 
+  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const handleDebouncedChange = useCallback(
     (setter: (v: string) => void) =>
       (e: React.ChangeEvent<HTMLInputElement>) => {
         const val = e.target.value;
-        setTimeout(() => setter(val), 300);
+        if (debounceTimerRef.current !== null) {
+          clearTimeout(debounceTimerRef.current);
+        }
+        debounceTimerRef.current = setTimeout(() => setter(val), 300);
       },
     []
   );
