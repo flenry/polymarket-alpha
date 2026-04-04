@@ -108,6 +108,12 @@ describe("GET /api/signals/volume", () => {
     expect(res.status).toBe(400);
   });
 
+  it("returns 400 for non-numeric hours", async () => {
+    const req = makeRequest({ hours: "abc" });
+    const res = await GET(req);
+    expect(res.status).toBe(400);
+  });
+
   it("converts Date objects from pg to ISO strings", async () => {
     const rows = [
       { hour: new Date("2024-01-01T10:00:00Z"), type: "WHALE_TRADE", count: 2 },
