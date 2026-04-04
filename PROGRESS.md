@@ -41,3 +41,10 @@
 - Branch `feat/dashboard` ready for Zoro
 
 **Next steps:** Vegapunk/Law answer board questions, Zoro implements per PLAN.md
+
+## 2026-04-04 — Law: Phase 6 (Dashboard) strategic review complete
+
+**Workflow**: Board analysis / plan stress-test
+**Status**: CHANGES REQUIRED ⚠️
+
+**Assessment:** Feasible overall, but the current plan has several implementation risks: the whale alert join can duplicate rows because `transaction_hash + token_id` is not unique, the wallets API filter does not match the spec's resolved-trade requirement, and the markets page plan assumes a top-signal-type aggregate without pinning down a portable query shape. Recommended before implementation: tighten the alerts join to the full `trade_lookup_key` tuple, change wallet ranking to `resolved_trade_count >= minTrades`, and specify deterministic market aggregation + sparkline data sourcing.
