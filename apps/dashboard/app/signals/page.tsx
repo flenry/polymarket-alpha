@@ -1,7 +1,12 @@
 import { SignalSparkline } from "@/components/signal-sparkline";
 import { SignalsTable } from "@/components/signals-table";
 
-export default function SignalsPage() {
+interface Props {
+  searchParams?: { tokenId?: string };
+}
+
+export default function SignalsPage({ searchParams }: Props) {
+  const initialTokenId = searchParams?.tokenId ?? undefined;
   return (
     <div className="p-6 space-y-6">
       <div>
@@ -10,7 +15,7 @@ export default function SignalsPage() {
       </div>
 
       <SignalSparkline />
-      <SignalsTable />
+      <SignalsTable initialTokenId={initialTokenId} />
     </div>
   );
 }
