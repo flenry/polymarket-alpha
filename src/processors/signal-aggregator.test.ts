@@ -262,3 +262,83 @@ describe("SignalAggregator.stop()", () => {
     expect(callsAfter).toBe(callsBefore); // no new calls
   });
 });
+
+describe("SignalAggregator — onWhaleInserted callback", () => {
+  it("onWhaleInserted called with (alert, id) after successful whale insert", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb();
+    const onWhaleInserted = vi.fn();
+    const aggregator = new SignalAggregator(bus, db, onWhaleInserted);
+    aggregator.start();
+
+    const alert = makeAlert(true);
+    bus.emit("whale_alert", alert);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(onWhaleInserted).toHaveBeenCalledOnce();
+    const [callAlert, callId] = onWhaleInserted.mock.calls[0];
+    expect(callAlert).toBe(alert);
+    expect(typeof callId).toBe("bigint");
+
+    aggregator.stop();
+  });
+
+  it("onWhaleInserted NOT called when emitSignal=false", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb(null); // null → insertWhaleAlert returns null (emitSignal=false)
+    const onWhaleInserted = vi.fn();
+    const aggregator = new SignalAggregator(bus, db, onWhaleInserted);
+    aggregator.start();
+
+    bus.emit("whale_alert", makeAlert(false));
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(onWhaleInserted).not.toHaveBeenCalled();
+    aggregator.stop();
+  });
+
+  it("no onWhaleInserted provided: backward compatible, no error", async () => {
+    const bus = new TypedEventBus();
+    const db = makeDb();
+    const aggregator = new SignalAggregator(bus, db); // no callback
+    aggregator.start();
+
+    expect(() => bus.emit("whale_alert", makeAlert(true))).not.toThrow();
+    await new Promise((r) => setTimeout(r, 50));
+
+    aggregator.stop();
+  });
+
+  it("onWhaleInserted called via transaction path (db.transaction present)", async () => {
+    // Covers line 64: `if (insertedId !== null) this.onWhaleInserted?.(alert, insertedId)` — transaction branch
+    const bus = new TypedEventBus();
+    const onWhaleInserted = vi.fn();
+
+    // Mock tx that returns a whale alert id
+    const txMock = {
+      execute: vi.fn().mockResolvedValue({ rows: [{ id: "77" }] }),
+    };
+    const transactionFn = vi.fn().mockImplementation(async (fn: (tx: typeof txMock) => Promise<void>) => {
+      await fn(txMock);
+    });
+    const db = {
+      ...makeDb(),
+      transaction: transactionFn,
+    } as unknown as ConstructorParameters<typeof SignalAggregator>[1];
+
+    const aggregator = new SignalAggregator(bus, db, onWhaleInserted);
+    aggregator.start();
+
+    const alert = makeAlert(true);
+    bus.emit("whale_alert", alert);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // onWhaleInserted should be called after the transaction completes
+    expect(onWhaleInserted).toHaveBeenCalledOnce();
+    const [callAlert, callId] = onWhaleInserted.mock.calls[0];
+    expect(callAlert).toBe(alert);
+    expect(typeof callId).toBe("bigint");
+
+    aggregator.stop();
+  });
+});

@@ -8,15 +8,19 @@ import { ClobRestClient } from "./sources/clob-rest-client.js";
 import { SnapshotWriter } from "./processors/snapshot-writer.js";
 import { WhaleDetector } from "./processors/whale-detector.js";
 import { AlertEmitter } from "./alerts/alert-emitter.js";
+import { WebhookEmitter } from "./alerts/webhook-emitter.js";
 import { SignalAggregator } from "./processors/signal-aggregator.js";
 import { OrderBookImbalanceEngine } from "./processors/book-imbalance-engine.js";
+import { WsBookImbalanceEvaluator } from "./processors/ws-book-imbalance-evaluator.js";
+import { ClobWsPool } from "./sources/clob-ws-pool.js";
+import { WalletEnricher } from "./enrichment/wallet-enricher.js";
 import { PriceHistoryWriter } from "./processors/price-history-writer.js";
 import { insertTrade } from "./db/queries/trades.js";
-import { getMarketStats } from "./db/queries/markets.js";
+import { getMarketStats, getWatchlistedTokenIds } from "./db/queries/markets.js";
 import { RollingStatsBuffer } from "./sources/stats-bootstrap.js";
 import { evaluatePriceImpact } from "./signals/price-impact-signal.js";
 import { evaluateVelocity } from "./signals/velocity-signal.js";
-import type { MarketStats, TradeEvent, OrderBook, TokenId } from "./events/types.js";
+import type { MarketStats, TradeEvent, OrderBook, TokenId, BookUpdateEvent, PriceChangeEvent, BestBidAskEvent, LastTradePriceEvent, Signal } from "./events/types.js";
 import { logger } from "./logger.js";
 
 const PRICE_WINDOW_MS = 120_000; // keep 2 min of recent price history per token
@@ -149,7 +153,12 @@ export async function startPipeline(): Promise<() => Promise<void>> {
   // 6. Start ClobRestClient + SnapshotWriter
   const clobClient = new ClobRestClient();
   const detector = new WhaleDetector();
-  const alertEmitter = new AlertEmitter(bus);
+
+  // Phase 2: WebhookEmitter, WalletEnricher
+  const webhookEmitter = new WebhookEmitter();
+  const walletEnricher = new WalletEnricher(db);
+
+  const alertEmitter = new AlertEmitter(bus, webhookEmitter);
   alertEmitter.start();
 
   // 7. OrderBookImbalanceEngine + PriceImpactSignal — triggered after each snapshot
@@ -249,8 +258,49 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     }
   });
 
+  // Phase 2: ClobWsPool + WsBookImbalanceEvaluator
+  const clobWsPool = new ClobWsPool({
+    url: config.clobWsUrl,
+    shardSize: config.clobWsShardSize,
+    reconnectBaseMs: config.reconnectBaseMs,
+    reconnectMaxMs: config.clobWsMaxReconnectDelayMs,
+    db,
+  });
+  const wsImbalanceEvaluator = new WsBookImbalanceEvaluator(bus, db);
+
+  // Wire ClobWsPool local events → bus
+  const clobBookHandler = (evt: BookUpdateEvent) => bus.emit("book_update", evt);
+  const clobPriceChangeHandler = (evt: PriceChangeEvent) => bus.emit("price_change", evt);
+  const clobBestBidAskHandler = (evt: BestBidAskEvent) => bus.emit("best_bid_ask", evt);
+  const clobLastTradePriceHandler = (evt: LastTradePriceEvent) => bus.emit("last_trade_price", evt);
+
+  clobWsPool.on("book", clobBookHandler);
+  clobWsPool.on("price_change", clobPriceChangeHandler);
+  clobWsPool.on("best_bid_ask", clobBestBidAskHandler);
+  clobWsPool.on("last_trade_price", clobLastTradePriceHandler);
+
+  // Wire book_update → WsBookImbalanceEvaluator
+  const bookUpdateHandler = (evt: BookUpdateEvent) => wsImbalanceEvaluator.evaluate(evt.book);
+  bus.on("book_update", bookUpdateHandler);
+
+  // Wire ORDER_BOOK_IMBALANCE signals → WebhookEmitter
+  const imbalanceWebhookHandler = (signal: Signal) => {
+    if (signal.signalType === "ORDER_BOOK_IMBALANCE") webhookEmitter.send(signal);
+  };
+  bus.on("signal", imbalanceWebhookHandler);
+
+  // Start ClobWsPool after watchlisted tokens are available
+  const watchlistedTokenIds = await getWatchlistedTokenIds(db).catch(() => [] as TokenId[]);
+  clobWsPool.connect(watchlistedTokenIds).catch((err) =>
+    logger.error({ err }, "Pipeline: ClobWsPool connect failed")
+  );
+
   // 8. SignalAggregator
-  const signalAggregator = new SignalAggregator(bus, db);
+  const signalAggregator = new SignalAggregator(
+    bus,
+    db,
+    (alert, id) => walletEnricher.enrich(alert, id)
+  );
   signalAggregator.start();
 
   // 9. PriceHistoryWriter
@@ -282,6 +332,7 @@ export async function startPipeline(): Promise<() => Promise<void>> {
 
     // 1. Stop ingestion
     liveDataWs.disconnect();
+    clobWsPool.disconnect();
 
     // 2. Stop timers
     if (velocityTimer) { clearInterval(velocityTimer); velocityTimer = null; }
@@ -297,6 +348,12 @@ export async function startPipeline(): Promise<() => Promise<void>> {
     bus.off("trade", tradeHandler2);
     bus.off("best_bid_ask", bidAskHandler);
     bus.off("last_trade_price", lastTradeHandler);
+    bus.off("book_update", bookUpdateHandler);
+    bus.off("signal", imbalanceWebhookHandler);
+    clobWsPool.off("book", clobBookHandler);
+    clobWsPool.off("price_change", clobPriceChangeHandler);
+    clobWsPool.off("best_bid_ask", clobBestBidAskHandler);
+    clobWsPool.off("last_trade_price", clobLastTradePriceHandler);
 
     // 5. Clear in-memory price state
     recentPrices.clear();

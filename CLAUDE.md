@@ -9,6 +9,7 @@ Quick-reference context for returning sessions. Read this first on every visit.
 Real-time Polymarket data pipeline. Ingests trade events and order book data, persists to PostgreSQL, and runs a signal engine that surfaces alpha opportunities — specifically whale trades caught before price adjusts.
 
 **Phase 1 MVP is complete and fully tested.** 256 tests passing, 92%+ coverage.
+**Phase 2 is complete and fully tested.** 357 tests passing, 97.33% stmt / 95.91% branch coverage.
 
 ---
 
@@ -62,6 +63,7 @@ polymarket-alpha/
 | `GammaPoller` | Polls `gamma-api.polymarket.com/markets` every 60s. Separates neg_risk markets (`watchlisted=false`) from live markets. |
 | `ClobRestClient` | Batch-fetches order books via `POST /books` on `clob.polymarket.com`. |
 | `LiveDataWsClient` | Connects to `wss://ws-live-data.polymarket.com`, subscribes `{topic:"activity", type:"trades"}`, auto-reconnects with exponential backoff (base 1s, cap 30s). |
+| `ClobWsPool` | Sharded WebSocket pool to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. Shards watchlisted tokens (non-neg-risk) into batches of `CLOB_WS_SHARD_SIZE` (default 150). Per-shard reconnect with jitter backoff. Handles `market_resolved` → `markMarketClosed`. Phase 2. |
 | `StatsBootstrap` | Seeds `market_stats` from Gamma volume data on startup. |
 
 ### Processors
@@ -69,9 +71,17 @@ polymarket-alpha/
 |---|---|
 | `WhaleDetector` | Dual-threshold: Gate 1 `valueUsdc >= absoluteMinUsdc` ($10k default); Gate 2 `sigmas >= 3` OR `pct_of_daily_volume >= 2%`. Reads per-market stats for calibration. |
 | `SnapshotWriter` | REST-timer (30s), writes `order_book_snapshots`. |
-| `SignalAggregator` | Writes `signals` + `whale_alerts` for 4 signal types. |
-| `BookImbalanceEngine` | Detects bid/ask depth imbalance > 3:1. |
+| `SignalAggregator` | Writes `signals` + `whale_alerts` for 4 signal types. Optional `onWhaleInserted` callback for post-insert enrichment. Phase 2: fires callback with `(alert, alertId)` for `WalletEnricher`. |
+| `OrderBookImbalanceEngine` | REST-timer path (Phase 1, frozen): detects bid/ask depth imbalance > 3:1 from snapshot REST data. 5-min debounce. |
+| `WsBookImbalanceEvaluator` | WS-path (Phase 2): lightweight evaluator for `BookUpdateEvent` from ClobWsPool. Confidence = `min(1.0, (ratio - threshold)/threshold)`, strength = total depth, 60s cooldown. Inserts `ws_event` snapshot on every evaluate call. |
 | `PriceHistoryWriter` | Persists `last_trade_price` and `best_bid_ask` events. |
+
+### Alerts & Enrichment
+| Component | Role |
+|---|---|
+| `AlertEmitter` | Emits whale alerts to stdout JSON + human-readable format. Phase 2: optionally fires `WebhookEmitter.send()` fire-and-forget. |
+| `WebhookEmitter` | Discord + Slack webhook delivery. Token-bucket 5 req/s. 429 retry once. No-op when URLs empty. Phase 2. |
+| `WalletEnricher` | Async wallet profiling via `data-api.polymarket.com/activity`. 24h recency guard (skips fetch if profile updated within 24h). 2 req/s token-bucket. 5s timeout with AbortController. Upserts `wallet_profiles`, enriches `whale_alerts` row. Phase 2. |
 
 ### Event Bus
 Typed in-process `TypedEventBus` (extends Node EventEmitter). Events:
@@ -106,7 +116,7 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 - **Logging**: Pino structured JSON. `LOG_LEVEL` env var controls verbosity.
 - **Tests**: all unit tests use mocked DB clients and HTTP/WS — no real network calls. Fixtures live in `tests/fixtures/`.
 - **Test colocatio**: processor/signal/source tests live next to source files (`src/**/*.test.ts`). Integration-style tests live in `tests/`.
-- **No Phase 2 code yet**: `ClobWsPool` stub exists but is not wired into the pipeline.
+- **Phase 2 fully wired**: `ClobWsPool`, `WsBookImbalanceEvaluator`, `WebhookEmitter`, and `WalletEnricher` are all live in `pipeline.ts`.
 
 ---
 
@@ -115,21 +125,37 @@ Partitions are created/dropped by `PartitionManager` (daily cron, midnight UTC).
 **Phase 1 complete.**
 - ✅ All 256 tests passing (30 test files)
 - ✅ 92.3% statement coverage (100% on all processors, signals, events, alerts, queries)
-- ✅ Sources coverage lower (79.7%) — real WS/HTTP code not network-testable
 - ✅ Migration SQL generated and committed (`drizzle/`)
 - ✅ `drizzle/meta/_journal.json` registers two entries: `0000_misty_thaddeus_ross` (idx 0) and `0002_partition_trades` (idx 1)
-- ✅ `pnpm db:generate` is idempotent — reports no schema changes after migrations applied
-- ✅ `pnpm db:migrate:partitions` fallback script added to `package.json` (runs `0002` via `psql` directly)
-- ✅ `drizzle/README.md` documents migration chain and missing `0001_snapshot.json` quirk
 - ✅ Docker Compose configured
 - ✅ Pushed to `main` on `git@github.com:flenry/polymarket-alpha.git`
 
-**Not yet built (Phase 2+):**
-- ClobWsPool (sharded WS connections to CLOB order book feed)
-- Discord/Slack webhook alerts
-- Wallet enrichment / whale profiling
+**Phase 2 complete (branch: `feat/phase-2`).**
+- ✅ All 357 tests passing (34 test files, +101 tests over Phase 1)
+- ✅ `ClobWsPool` — url option, jitter reconnect, `market_resolved` → `markMarketClosed` DB update
+- ✅ `WsBookImbalanceEvaluator` — WS-path evaluator with spec-correct confidence formula, snapshot insert on every evaluate
+- ✅ `WebhookEmitter` — Discord + Slack webhooks, 5 req/s token-bucket, 429 retry, network error swallow
+- ✅ `WalletEnricher` — async wallet profiling, 24h recency guard, 2 req/s bucket, 5s timeout
+- ✅ `SignalAggregator` — `onWhaleInserted` callback for WalletEnricher alertId handoff
+- ✅ `AlertEmitter` — optional `WebhookEmitter` parameter (backward-compatible)
+- ✅ Pipeline wired: ClobWsPool + WsBookImbalanceEvaluator + WebhookEmitter + WalletEnricher
+- ✅ `src/db/queries/wallets.ts` — `upsertWalletProfile`, `getWalletProfile`
+- ✅ `src/db/queries/markets.ts` — `markMarketClosed` added
+- ✅ `src/db/queries/whales.ts` — `walletFirstSeenAt` field added to `enrichWhaleAlert`
+- ✅ Config: 8 new Phase 2 env vars with defaults
+
+**Not yet built (Phase 3+):**
 - Neg-risk signal generation (Phase 4)
 - Backtesting (Phase 3+)
+
+### Two separate imbalance evaluators — distinct trigger paths
+
+| Evaluator | Path | File | Cooldown | Confidence formula |
+|---|---|---|---|---|
+| `OrderBookImbalanceEngine` | REST timer (30s) | `book-imbalance-engine.ts` | 5 min debounce | Phase 1 formula |
+| `WsBookImbalanceEvaluator` | WS `BookUpdateEvent` | `ws-book-imbalance-evaluator.ts` | 60s per-token | `min(1.0, (ratio-threshold)/threshold)` |
+
+They have **separate `lastEmits` maps** — no shared cooldown state. REST path never suppresses WS signals.
 
 ---
 
@@ -163,8 +189,8 @@ docker compose up -d
 ## How to Test
 
 ```bash
-pnpm test              # unit tests (all 256, 30 test files)
-pnpm test:coverage     # with v8 coverage report (~92%)
+pnpm test              # unit tests (all 357, 34 test files)
+pnpm test:coverage     # with v8 coverage report (97.33% stmt, 95.91% branch)
 pnpm typecheck         # tsc --noEmit
 pnpm db:generate       # generate drizzle migrations (idempotent after init)
 pnpm db:migrate        # apply all tracked migrations (0000 + 0002)
@@ -184,6 +210,16 @@ pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql direct
 | `SNAPSHOT_INTERVAL_MS` | 30000 | Order book snapshot frequency |
 | `GAMMA_POLL_INTERVAL_MS` | 60000 | Market catalog refresh frequency |
 | `LOG_LEVEL` | info | Pino log level |
+| `CLOB_WS_URL` | wss://ws-subscriptions-clob... | ClobWsPool WebSocket URL |
+| `CLOB_WS_SHARD_SIZE` | 150 | Tokens per WS shard |
+| `CLOB_WS_MAX_RECONNECT_DELAY_MS` | 30000 | Max reconnect backoff (ms) |
+| `IMBALANCE_RATIO_THRESHOLD` | 3.0 | Bid/ask ratio trigger for WS imbalance |
+| `IMBALANCE_COOLDOWN_MS` | 60000 | Per-token cooldown for WS imbalance signal |
+| `DISCORD_WEBHOOK_URL` | "" | Discord webhook URL (empty = disabled) |
+| `SLACK_WEBHOOK_URL` | "" | Slack webhook URL (empty = disabled) |
+| `WALLET_ENRICHMENT_TIMEOUT_MS` | 5000 | Fetch timeout for wallet enrichment |
+| `WALLET_ENRICHMENT_RATE_LIMIT_RPS` | 2 | Max data-api calls per second |
+| `WALLET_ENRICHMENT_RECENCY_HOURS` | 24 | Skip re-enrichment if profile < 24h old |
 
 ---
 
@@ -193,4 +229,4 @@ pnpm db:migrate:partitions  # fallback: apply 0002 partition DDL via psql direct
 
 ---
 
-Last updated: 2026-04-03
+Last updated: 2026-04-03 (Phase 2 final — 357 tests, 97.33% coverage)

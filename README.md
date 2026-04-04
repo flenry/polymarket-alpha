@@ -6,11 +6,13 @@ A real-time data pipeline that ingests Polymarket market data, persists snapshot
 
 - **Trade ingestion**: Live-Data WebSocket (`wss://ws-live-data.polymarket.com`) for real-time trades
 - **Market catalog**: Gamma REST API polled every 60s; neg-risk markets explicitly excluded
-- **Order book snapshots**: CLOB REST batch polling (Phase 1), CLOB WebSocket pool (Phase 3)
+- **Order book snapshots**: CLOB REST batch polling + CLOB WebSocket pool (`ClobWsPool`, sharded, Phase 2)
 - **Whale detection**: Dual-threshold (absolute $10k + 3σ above mean OR 2% of daily volume)
 - **Signal engine**: 4 signal types: `WHALE_TRADE`, `ORDER_BOOK_IMBALANCE`, `PRICE_IMPACT_ANOMALY`, `SENTIMENT_VELOCITY`
 - **Deduplication**: DB-enforced unique index on `(tx_hash, token_id, proxy_wallet, traded_at, price_usdc, size_tokens)`
 - **Partitioning**: Daily partitions on `trades` and `order_book_snapshots` from day 1
+- **Webhook alerts**: Discord + Slack delivery via `WebhookEmitter` (5 req/s, 429 retry) — Phase 2
+- **Wallet enrichment**: Async wallet profiling from data-api, 24h recency guard, upserts `wallet_profiles` — Phase 2
 
 ## Stack
 
@@ -48,10 +50,10 @@ docker compose up -d
 ## Testing
 
 ```bash
-# Unit tests (256 tests, 30 test files)
+# Unit tests (357 tests, 34 test files)
 pnpm test
 
-# With v8 coverage report (~92% overall, 100% on processors/signals/alerts)
+# With v8 coverage report (97.33% stmt, 95.91% branch)
 pnpm test:coverage
 
 # Type-check only
@@ -62,23 +64,30 @@ pnpm typecheck
 
 ```
 Sources:
-  GammaPoller (60s REST) → market catalog, neg_risk filter
-  LiveDataWsClient (WS)  → trade events
-  ClobRestClient (REST)  → batch order book snapshots
-  ClobWsPool (WS)        → real-time book events (Phase 3)
+  GammaPoller (60s REST)  → market catalog, neg_risk filter
+  LiveDataWsClient (WS)   → trade events
+  ClobRestClient (REST)   → batch order book snapshots
+  ClobWsPool (WS sharded) → real-time book events, market_resolved handling
 
 Event Bus (TypedEventBus):
-  "trade" → insertTrade (dedup), WhaleDetector
-  "whale_alert" → AlertEmitter (stdout <1s), SignalAggregator
-  "signal" → SignalAggregator → signals table
+  "trade"                       → insertTrade (dedup), WhaleDetector
+  "whale_alert"                 → AlertEmitter (stdout + webhooks <1s), SignalAggregator
+  "signal"                      → SignalAggregator → signals table
+  "book_update" (BookUpdateEvent)→ WsBookImbalanceEvaluator
   "last_trade_price" / "best_bid_ask" → PriceHistoryWriter
 
 Processors:
-  WhaleDetector          → dual-threshold, per-market calibrated
-  OrderBookImbalanceEngine → bid/ask depth ratio > 3:1
-  SnapshotWriter         → order_book_snapshots table
-  PriceHistoryWriter     → price_history table
-  SignalAggregator       → signals + whale_alerts tables
+  WhaleDetector               → dual-threshold, per-market calibrated
+  OrderBookImbalanceEngine    → REST-path: bid/ask depth ratio > 3:1, 5-min debounce
+  WsBookImbalanceEvaluator    → WS-path: real-time ratio, 60s per-token cooldown
+  SnapshotWriter              → order_book_snapshots table
+  PriceHistoryWriter          → price_history table
+  SignalAggregator            → signals + whale_alerts tables; fires onWhaleInserted
+
+Alerts & Enrichment:
+  AlertEmitter                → stdout JSON + optional WebhookEmitter
+  WebhookEmitter              → Discord + Slack, 5 req/s token-bucket, 429 retry
+  WalletEnricher              → data-api profiling, 2 req/s, 24h recency guard
 ```
 
 ## Signal Types
@@ -102,6 +111,16 @@ See `.env.example` for all configurable parameters.
 | `WHALE_PCT_VOLUME_THRESHOLD` | 0.02 | % of daily volume threshold |
 | `SNAPSHOT_INTERVAL_MS` | 30000 | Order book snapshot interval |
 | `GAMMA_POLL_INTERVAL_MS` | 60000 | Market catalog poll interval |
+| `CLOB_WS_URL` | wss://ws-subscriptions-clob.polymarket.com/ws/market | ClobWsPool endpoint |
+| `CLOB_WS_SHARD_SIZE` | 150 | Tokens per WS shard |
+| `CLOB_WS_MAX_RECONNECT_DELAY_MS` | 30000 | Max reconnect backoff (ms) |
+| `IMBALANCE_RATIO_THRESHOLD` | 3.0 | Bid/ask ratio trigger (WS path) |
+| `IMBALANCE_COOLDOWN_MS` | 60000 | Per-token WS imbalance cooldown |
+| `DISCORD_WEBHOOK_URL` | "" | Discord webhook (empty = disabled) |
+| `SLACK_WEBHOOK_URL` | "" | Slack webhook (empty = disabled) |
+| `WALLET_ENRICHMENT_TIMEOUT_MS` | 5000 | Wallet fetch timeout |
+| `WALLET_ENRICHMENT_RATE_LIMIT_RPS` | 2 | data-api calls per second |
+| `WALLET_ENRICHMENT_RECENCY_HOURS` | 24 | Skip re-enrichment if profile < N hours old |
 
 ## Developer Reference
 

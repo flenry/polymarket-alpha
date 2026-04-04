@@ -214,3 +214,20 @@ describe("insertWhaleAlert — branch coverage", () => {
     expect(qs).toContain("15000");
   });
 });
+
+describe("enrichWhaleAlert — walletFirstSeenAt extension", () => {
+  it("passes walletFirstSeenAt through to db.update when provided", async () => {
+    const db = makeDb();
+    const firstSeenAt = new Date("2026-01-01T00:00:00.000Z");
+    await enrichWhaleAlert(db, 99n, { walletFirstSeenAt: firstSeenAt });
+    const setCall = (db.update as ReturnType<typeof vi.fn>)().set.mock.calls[0][0];
+    expect(setCall.walletFirstSeenAt).toEqual(firstSeenAt);
+  });
+
+  it("uses null for walletFirstSeenAt when omitted", async () => {
+    const db = makeDb();
+    await enrichWhaleAlert(db, 99n, { walletTotalVolumeUsdc: 1000 });
+    const setCall = (db.update as ReturnType<typeof vi.fn>)().set.mock.calls[0][0];
+    expect(setCall.walletFirstSeenAt).toBeNull();
+  });
+});

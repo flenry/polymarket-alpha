@@ -43,6 +43,27 @@ describe("config", () => {
     const { config } = await import("./config.js");
     expect(Object.isFrozen(config)).toBe(true);
   });
+
+  it("Phase 2 fields have correct defaults", async () => {
+    delete process.env.CLOB_WS_URL;
+    delete process.env.CLOB_WS_MAX_RECONNECT_DELAY_MS;
+    delete process.env.IMBALANCE_COOLDOWN_MS;
+    delete process.env.DISCORD_WEBHOOK_URL;
+    delete process.env.SLACK_WEBHOOK_URL;
+    delete process.env.WALLET_ENRICHMENT_TIMEOUT_MS;
+    delete process.env.WALLET_ENRICHMENT_RATE_LIMIT_RPS;
+    delete process.env.WALLET_ENRICHMENT_RECENCY_HOURS;
+    const { config } = await import("./config.js");
+    expect(config.clobWsUrl).toBe("wss://ws-subscriptions-clob.polymarket.com/ws/market");
+    expect(config.clobWsMaxReconnectDelayMs).toBe(30_000);
+    expect(config.imbalanceCooldownMs).toBe(60_000);
+    expect(config.discordWebhookUrl).toBe("");
+    expect(config.slackWebhookUrl).toBe("");
+    expect(config.walletEnrichmentTimeoutMs).toBe(5_000);
+    expect(config.walletEnrichmentRateLimitRps).toBe(2);
+    expect(config.walletEnrichmentRecencyHours).toBe(24);
+  });
+
 });
 
 describe("envNumber", () => {
