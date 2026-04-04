@@ -5,3 +5,6 @@ dist/
 coverage/
 backtest-results/*.json
 analytics-results/*.json
+apps/dashboard/.next/
+apps/dashboard/next-env.d.ts
+apps/dashboard/tsconfig.tsbuildinfo
